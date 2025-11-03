@@ -5,17 +5,17 @@ import {
   Link as IconLink
 } from '@vicons/tabler'
 import { computed } from 'vue'
+import { IconURL } from '@/utils/icon'
+import AptServerStats from './AptServerStats.vue'
+import { EndpointTag } from '../../data/endpoints-tags'
+import CopyButton from './CopyButton.vue'
+import { RouterLink } from 'vue-router'
 
 const props = defineProps<{ endpoint: Endpoint }>()
 
 const cardStyle = computed(() => {
-  if (!props.endpoint.icon) {
-    return {}
-  }
-  const iconUrl = `https://cdn.jsdelivr.net/gh/selfhst/icons/svg/${props.endpoint.icon}.svg`
-  return {
-    '--bg-image': `url('${iconUrl}')`
-  }
+  if (!props.endpoint.brand) return {}
+  return { '--bg-image': `url('${IconURL(props.endpoint.brand)}')` }
 })
 </script>
 
@@ -35,13 +35,24 @@ const cardStyle = computed(() => {
       </NSpace>
     </template>
     <p class="text-gray-600">{{ endpoint.description }}</p>
+    <AptServerStats v-if="endpoint.tags?.includes(EndpointTag.APT)" :endpoint="endpoint" class="mt-4" />
     <template #action>
       <NSpace justify="space-between" align="center">
         <NSpace>
           <NButton v-if="endpoint.link" tag="a" :href="endpoint.link" target="_blank" type="primary" ghost>
-            <template #icon><IconLink /></template>
+            <template #icon>
+              <IconLink />
+            </template>
             Official Site
           </NButton>
+          <RouterLink :to="{ path: '/servers', query: { endpoint: endpoint.name.toLowerCase() } }">
+            <NButton type="primary" ghost>
+              Servers
+            </NButton>
+          </RouterLink>
+        </NSpace>
+        <NSpace>
+          <CopyButton :content="endpoint.id" label="Copy ID" />
         </NSpace>
       </NSpace>
     </template>

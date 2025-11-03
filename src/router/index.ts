@@ -1,6 +1,7 @@
 import { createRouter, createWebHistory } from "vue-router";
 import HomeView from "../views/HomeView.vue";
 import EndpointList from "../views/EndpointList.vue";
+import ServerList from "../views/ServerList.vue";
 
 const router = createRouter({
   history: createWebHistory(import.meta.env.BASE_URL),
@@ -14,6 +15,11 @@ const router = createRouter({
       path: "/endpoints",
       name: "endpoints",
       component: EndpointList,
+    },
+    {
+      path: "/servers",
+      name: "servers",
+      component: ServerList,
     },
   ],
 });

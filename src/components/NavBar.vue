@@ -8,7 +8,7 @@
         <span class="text-xl font-semibold dark:text-white">MirrorDB</span>
       </a>
     </div>
-    <div class="flex items-center gap-2 ml-4">
+    <div class="flex items-center gap-5 ml-6">
       <RouterLink v-for="menu in menus" :key="menu.key" :to="menu.to" v-slot="{ navigate }" custom>
         <NButton @click="navigate" text>
           {{ menu.label }}
@@ -35,6 +35,11 @@ const menus = [
     label: 'Endpoints',
     key: "endpoints",
     to: "/endpoints",
+  },
+  {
+    label: 'Servers',
+    key: "servers",
+    to: "/servers",
   },
 ]
 </script>
