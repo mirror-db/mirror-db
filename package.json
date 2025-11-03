@@ -16,6 +16,13 @@
 		"cf-typegen": "wrangler types"
 	},
 	"dependencies": {
+		"@tailwindcss/vite": "^4.1.16",
+		"@vicons/tabler": "^0.13.0",
+		"@vicons/utils": "^0.1.4",
+		"@vueuse/core": "^14.0.0",
+		"naive-ui": "^2.43.1",
+		"tailwindcss": "^4.1.16",
+		"vfonts": "^0.0.3",
 		"vue": "^3.5.22",
 		"vue-router": "^4.6.3"
 	},

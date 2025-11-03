@@ -6,6 +6,7 @@ export class Endpoint {
   domain?: string;
   path?: string;
   tags?: EndpointTag[];
+  icon?: string;
   description?: string;
   link?: string;
   health_check_path?: string;
@@ -24,6 +25,7 @@ Endpoints.push({
   domain: "",
   path: "/debian/",
   tags: [EndpointTag.APT, EndpointTag.Debian],
+  icon: "debian",
   description: "Debian APT Repository",
   link: "http://deb.debian.org/debian/",
   health_check_path: "dists/bullseye/InRelease",
