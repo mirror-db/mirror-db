@@ -6,7 +6,7 @@ export class Server {
   url: string = "";
   tier: number = 0;
   host?: string;
-  tags: ServerTag[] = [];
+  tags: string[] = [];
   remark?: string;
 
   constructor(options: Server) {
@@ -26,16 +26,6 @@ _add({
   host: "",
   tags: [ServerTag.Origin],
   remark: "Debian Official Repository",
-});
-
-_add({
-  id: "8fb3bfcf-c71f-4287-8ffe-8732b3b355c6",
-  endpoint_name: "ubuntu",
-  url: "https://mirrors.aliyun.com/ubuntu/",
-  tier: 2,
-  host: "",
-  tags: [],
-  remark: "Aliyun Mirrors - /ubuntu/",
 });
 
 _add({

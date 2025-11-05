@@ -1,12 +1,13 @@
 import { Hono } from "hono";
 import { cache } from "hono/cache";
 import type { Context } from "hono";
-import { EndpointTag, EndpointTagList } from "../data/endpoints-tags";
-import { Endpoint, EndpointsList } from "../data/endpoints";
-import { ServerTag, ServerTagList } from "../data/servers-tags";
-import { Server, ServerList } from "../data/servers";
+import { EndpointTagList } from "@data/endpoints-tags";
+import { Endpoint, EndpointsList } from "@data/endpoints";
+import { ServerTag } from "@data/servers-tags";
+import { ServerList } from "@data/servers";
 
 import { StatServer } from "./server-analytics/api";
+import { RadarList } from "./server-radar/radar";
 
 const app = new Hono();
 
@@ -61,6 +62,26 @@ app.get("/api/servers/:id/stats", scache(), async (c) => {
   if (!server) return c.json({ error: "Server not found" }, 404);
   const result = await StatServer(server, c.req.query("detailed") === "true");
   return result ? c.json(result) : c.json({ error: result }, 400);
+});
+
+app.get("/api/radars", async (c) => c.json(RadarList));
+app.get("/api/radars/:id", async (c) => {
+  const radar = RadarList.find((r) => r.id === c.req.param("id"));
+  return radar ? c.json(radar) : c.json({ error: "Radar not found" }, 404);
+});
+app.get("/api/endpoints/:id_name/radars", async (c) => {
+  const ep = epByIdName(c);
+  if (!ep) return c.json({ error: "Endpoint not found" }, 404);
+  const radars = RadarList.filter((r) => r.endpoints.includes(ep.name));
+  return radars.length > 0
+    ? c.json(radars)
+    : c.json({ error: "No radars found for this endpoint" }, 404);
+});
+app.get("/api/radars/:id/scan", scache(), async (c) => {
+  const radar = RadarList.find((r) => r.id === c.req.param("id"));
+  if (!radar) return c.json({ error: "Radar not found" }, 404);
+  const servers = await radar.scan();
+  return c.json(servers);
 });
 
 export default app;

@@ -1,13 +1,13 @@
 <script setup lang="ts">
-import type { Endpoint } from '../../data/endpoints'
-import { useFetch } from '@vueuse/core'
-import type { ServerStatResult } from '../../server/server-analytics/api'
-import { NSpin, NAlert, NCollapse, NCollapseItem, NSpace } from 'naive-ui'
-import SuiteTag from './SuiteTag.vue'
-import FileSetStats from './FileSetStats.vue'
-import type { Release } from 'apt-parser'
 import { computed } from 'vue'
-import type { Server } from '../../data/servers'
+import type { Release } from 'apt-parser'
+import { useFetch } from '@vueuse/core'
+import { NSpin, NAlert, NCollapse, NCollapseItem, NSpace } from 'naive-ui'
+import type { Server } from '@data/servers'
+import type { Endpoint } from '@data/endpoints'
+import type { ServerStatResult } from '@server/server-analytics/api'
+import AptSuiteTag from '@/components/data/AptSuiteTag.vue'
+import FileSetStats from '@/components/data/FileSetStats.vue'
 
 const props = defineProps<{
   endpoint?: Endpoint,
@@ -61,7 +61,7 @@ const suitesByCodename = computed(() => {
           <NSpace vertical :size="12" class="p-2">
             <NSpace v-for="(suites, codename) in suitesByCodename" :key="codename" align="center">
               <span class="font-semibold text-sm">{{ codename }}:</span>
-              <SuiteTag v-for="suite in suites" :key="suite.suite" :suite="suite"
+              <AptSuiteTag v-for="suite in suites" :key="suite.suite" :suite="suite"
                 :stats="data.suitesStats[suite.suite || '']" />
             </NSpace>
           </NSpace>
@@ -70,5 +70,3 @@ const suitesByCodename = computed(() => {
     </div>
   </div>
 </template>
-
-<style scoped></style>

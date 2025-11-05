@@ -1,22 +1,20 @@
 <script setup lang="ts">
 import { NIcon } from 'naive-ui'
-import type { CollectionStats } from '../../server/server-analytics/utils'
-import { filesize } from 'filesize'
+import type { CollectionStats } from '@server/server-analytics/utils'
+import bytes from 'bytes'
 import { Database as IconDatabase, FileText as IconFile } from '@vicons/tabler'
 
-defineProps<{
-  stats: CollectionStats
-}>()
+defineProps<{ stats: CollectionStats }>()
 </script>
 
 <template>
   <div class="flex items-center gap-3">
     <div class="flex items-center gap-1.5">
       <NIcon :component="IconDatabase" class="w-5 h-5 text-blue-500" />
-      <span title="Total Size" class="font-medium">{{ filesize(stats.size) }}</span>
+      <span title="Total Size" class="font-medium">{{ bytes(stats.size) }}</span>
       <span v-if="stats.deduplicatedSize !== stats.size" title="Total Size after deduplication by hash"
         class="text-gray-500">
-        ({{ filesize(stats.deduplicatedSize) }})
+        ({{ bytes(stats.deduplicatedSize) }})
       </span>
     </div>
     <div class="flex items-center gap-1.5">
@@ -29,5 +27,3 @@ defineProps<{
     </div>
   </div>
 </template>
-
-<style scoped></style>

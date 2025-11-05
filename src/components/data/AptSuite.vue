@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import type { Release } from 'apt-parser'
 import { NDescriptions, NDescriptionsItem, NTag, NSpace } from 'naive-ui'
-import type { CollectionStats } from '../../server/server-analytics/utils'
-import FileSetStats from './FileSetStats.vue'
+import type { CollectionStats } from '@server/server-analytics/utils'
+import FileSetStats from '@/components/data/FileSetStats.vue'
 
 defineProps<{
   suite: Release
@@ -39,5 +39,3 @@ const kv_keys: (keyof Release)[] = [
     </NDescriptionsItem>
   </NDescriptions>
 </template>
-
-<style scoped></style>

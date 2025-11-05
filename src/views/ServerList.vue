@@ -1,32 +1,48 @@
 <template>
-  <h1 class="text-2xl font-bold mb-8">Servers for {{ endpoint || 'All Endpoints' }}</h1>
+  <h1 class="text-2xl font-bold mb-8">Servers for {{ _endpointName || 'All Endpoints' }}</h1>
   <NSpace vertical :size="12" v-if="filteredServers.length > 0">
     <ServerCard v-for="server in filteredServers" :key="server.id" :server="server" />
   </NSpace>
-  <NResult v-else status="404" title="No Servers Found" description="No servers were found for this endpoint.">
-  </NResult>
+  <NEmpty v-else description="No Servers Found" />
+  <NSpace vertical :size="12" v-if="radars && radars.length > 0" class="mt-8">
+    <ServerRadarCard v-for="radar in radars" :key="radar.id" :radar="radar" />
+  </NSpace>
 </template>
 
 <script setup lang="ts">
-import { computed } from 'vue';
+import { computed, watch } from 'vue';
 import { useRoute } from 'vue-router';
-import { ServerList } from '../../data/servers';
-import ServerCard from '../components/ServerCard.vue';
-import { NSpace, NResult } from 'naive-ui';
+import { useFetch } from '@vueuse/core';
+import { NSpace, NEmpty } from 'naive-ui';
+import { ServerList } from '@data/servers';
+import { EndpointsList } from '@data/endpoints';
+import type { RadarInfo } from '@server/server-radar/radar';
+import ServerCard from '@/components/data/ServerCard.vue';
+import ServerRadarCard from '@/components/data/ServerRadarCard.vue';
 
 const route = useRoute();
-const endpoint = computed(() => route.query.endpoint as string);
+const _endpointName = computed(() => route.query.endpoint as string);
 
 const filteredServers = computed(() => {
-  if (!endpoint.value) {
+  if (!_endpointName.value) {
     return ServerList;
   }
-  return ServerList.filter(server => server.endpoint_name === endpoint.value);
+  return ServerList.filter(server => server.endpoint_name === _endpointName.value);
 });
-</script>
 
-<style scoped>
-.server-list {
-  padding: 16px;
-}
-</style>
+const endpoint = computed(() => EndpointsList.find(e => e.name === _endpointName.value));
+
+const { data: radars, execute, abort } = useFetch(
+  () => `/api/endpoints/${endpoint.value?.id}/radars`,
+  { immediate: false, refetch: true, initialData: [] }
+).json<RadarInfo[]>()
+
+watch(endpoint, () => {
+  if (endpoint.value) {
+    abort()
+    execute()
+  } else {
+    radars.value = []
+  }
+}, { immediate: true })
+</script>

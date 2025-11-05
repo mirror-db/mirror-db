@@ -1,10 +1,10 @@
 <script setup lang="ts">
-import { Server } from '../../data/servers'
-import { NCard, NTag, NSpace } from 'naive-ui'
-import CopyButton from './CopyButton.vue'
-import AptServerStats from './AptServerStats.vue'
-import { EndpointsList } from '../../data/endpoints'
 import { computed } from 'vue'
+import { NCard, NTag, NSpace } from 'naive-ui'
+import { Server } from '@data/servers'
+import { EndpointsList } from '@data/endpoints'
+import BtnCopy from '@/components/common/BtnCopy.vue'
+import ServerStatsApt from '@/components/data/ServerStatsApt.vue';
 
 const props = defineProps<{ server: Server }>()
 
@@ -18,7 +18,7 @@ const endpoint = computed(() => {
     <template #header>
       <NSpace align="center">
         <h2 class="text-lg font-bold">{{ server.url }}</h2>
-        <CopyButton :content="server.url" icon text />
+        <BtnCopy :content="server.url" icon text />
       </NSpace>
     </template>
     <template #header-extra>
@@ -31,33 +31,12 @@ const endpoint = computed(() => {
     </template>
     <p class="text-gray-600" v-if="server.host">Host: {{ server.host }}</p>
     <p class="text-gray-600" v-if="server.remark">{{ server.remark }}</p>
-    <AptServerStats :server="server" class="mt-4" />
+    <ServerStatsApt :server="server" class="mt-4" />
 
     <template #action>
       <NSpace justify="end" align="center">
-        <CopyButton :content="server.id" icon label="Copy ID" />
+        <BtnCopy :content="server.id" icon label="Copy ID" />
       </NSpace>
     </template>
   </NCard>
 </template>
-
-<style scoped>
-.server-card {
-  border: 1px solid #ccc;
-  border-radius: 8px;
-  padding: 16px;
-  margin: 8px;
-}
-
-.tags {
-  margin-top: 8px;
-}
-
-.tag {
-  display: inline-block;
-  background-color: #eee;
-  border-radius: 4px;
-  padding: 2px 6px;
-  margin-right: 4px;
-}
-</style>

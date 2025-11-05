@@ -1,6 +1,6 @@
-import { Server } from "../../data/servers";
-import { Endpoint, EndpointsList } from "../../data/endpoints";
-import { EndpointTag } from "../../data/endpoints-tags";
+import { Server } from "@data/servers";
+import { Endpoint, EndpointsList } from "@data/endpoints";
+import { EndpointTag } from "@data/endpoints-tags";
 import { ResolveAptRepo, AnalyzeAptRepo } from "./apt";
 import type { CollectionStats } from "./utils";
 import type { Release } from "apt-parser";

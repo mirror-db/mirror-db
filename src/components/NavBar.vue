@@ -9,10 +9,8 @@
       </a>
     </div>
     <div class="flex items-center gap-5 ml-6">
-      <RouterLink v-for="menu in menus" :key="menu.key" :to="menu.to" v-slot="{ navigate }" custom>
-        <NButton @click="navigate" text>
-          {{ menu.label }}
-        </NButton>
+      <RouterLink v-for="menu in menus" :key="menu.key" :to="menu.to">
+        <NButton text>{{ menu.label }}</NButton>
       </RouterLink>
     </div>
     <div class="flex flex-1"></div>

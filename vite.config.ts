@@ -1,23 +1,20 @@
-import { fileURLToPath, URL } from 'node:url'
+import { fileURLToPath, URL } from "node:url";
 
-import { defineConfig } from 'vite'
-import vue from '@vitejs/plugin-vue'
-import vueDevTools from 'vite-plugin-vue-devtools'
+import { defineConfig } from "vite";
+import vue from "@vitejs/plugin-vue";
+import vueDevTools from "vite-plugin-vue-devtools";
 
-import { cloudflare } from "@cloudflare/vite-plugin"
-import tailwindcss from '@tailwindcss/vite'
+import { cloudflare } from "@cloudflare/vite-plugin";
+import tailwindcss from "@tailwindcss/vite";
 
 // https://vite.dev/config/
 export default defineConfig({
-	plugins: [
-		vue(),
-		vueDevTools(),
-		cloudflare(),
-    tailwindcss()
-	],
-	resolve: {
-		alias: {
-			'@': fileURLToPath(new URL('./src', import.meta.url))
-		},
-	},
-})
+  plugins: [vue(), vueDevTools(), cloudflare(), tailwindcss()],
+  resolve: {
+    alias: {
+      "@": fileURLToPath(new URL("./src", import.meta.url)),
+      "@data": fileURLToPath(new URL("./data", import.meta.url)),
+      "@server": fileURLToPath(new URL("./server", import.meta.url)),
+    },
+  },
+});

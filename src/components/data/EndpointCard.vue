@@ -1,15 +1,13 @@
 <script setup lang="ts">
-import { Endpoint } from '../../data/endpoints'
-import { NCard, NTag, NButton, NSpace, NIcon } from 'naive-ui'
-import {
-  Link as IconLink
-} from '@vicons/tabler'
 import { computed } from 'vue'
+import { NCard, NTag, NSpace } from 'naive-ui'
 import { IconURL } from '@/utils/icon'
-import AptServerStats from './AptServerStats.vue'
-import { EndpointTag } from '../../data/endpoints-tags'
-import CopyButton from './CopyButton.vue'
-import { RouterLink } from 'vue-router'
+import { Endpoint } from '@data/endpoints'
+import { EndpointTag } from '@data/endpoints-tags'
+import BtnCopy from '@/components/common/BtnCopy.vue'
+import BtnLink from '@/components/common/BtnLink.vue'
+import BtnRoute from '@/components/common/BtnRoute.vue'
+import AptServerStats from '@/components/data/ServerStatsApt.vue'
 
 const props = defineProps<{ endpoint: Endpoint }>()
 
@@ -25,6 +23,7 @@ const cardStyle = computed(() => {
       <NSpace align="center">
         <h2 class="text-lg font-bold">{{ endpoint.name }}</h2>
         <p class="text-sm text-gray-500">{{ endpoint.path }}</p>
+        <BtnLink v-if="endpoint.link" :href="endpoint.link" text icon ghost />
       </NSpace>
     </template>
     <template #header-extra>
@@ -39,20 +38,11 @@ const cardStyle = computed(() => {
     <template #action>
       <NSpace justify="space-between" align="center">
         <NSpace>
-          <NButton v-if="endpoint.link" tag="a" :href="endpoint.link" target="_blank" type="primary" ghost>
-            <template #icon>
-              <IconLink />
-            </template>
-            Official Site
-          </NButton>
-          <RouterLink :to="{ path: '/servers', query: { endpoint: endpoint.name.toLowerCase() } }">
-            <NButton type="primary" ghost>
-              Servers
-            </NButton>
-          </RouterLink>
+          <BtnRoute label="Servers" :to="{ path: '/servers', query: { endpoint: endpoint.name.toLowerCase() } }"
+            type="primary" ghost />
         </NSpace>
         <NSpace>
-          <CopyButton :content="endpoint.id" label="Copy ID" />
+          <BtnCopy :content="endpoint.id" label="Copy ID" />
         </NSpace>
       </NSpace>
     </template>
