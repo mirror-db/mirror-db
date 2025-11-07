@@ -26,19 +26,46 @@ const url = computed(() => {
 
 const { data, isFetching, error, statusCode } = useFetch(url, { refetch: true }).json<ServerStatResult>()
 
-const suitesByCodename = computed(() => {
+const groupedSuites = computed(() => {
   if (!data.value?.suites) {
     return {}
   }
-  return data.value.suites.reduce(
+
+  const prefixes: string[] = data.value.suites.map(s => s.codename)
+    .filter(i => i !== undefined)
+    .map(i => {
+      const match = i.match(/^[a-zA-Z0-9]+$/)
+      if (!match) return false
+      return match[0]
+    })
+    .filter(i => i !== false)
+
+  const grouped = data.value.suites.reduce(
     (acc, suite) => {
-      const codename = suite.codename || 'unknown'
-      acc[codename] ??= []
-      acc[codename].push(suite)
+      let groupName = ""
+      for (const prefix of prefixes) {
+        if (suite.codename?.startsWith(prefix)) {
+          groupName = prefix
+          break
+        }
+      }
+      acc[groupName] ??= []
+      acc[groupName]!.push(suite)
       return acc
     },
     {} as Record<string, Release[]>,
   )
+
+  for (const key of Object.keys(grouped)) {
+    const group = grouped[key] as Release[]
+    if (group.length === 1) {
+      grouped["others"] ??= []
+      grouped["others"]!.push(...group)
+      delete grouped[key]
+    }
+  }
+
+  return grouped
 })
 </script>
 
@@ -58,13 +85,19 @@ const suitesByCodename = computed(() => {
           <template #header>
             <FileSetStats :stats="data.stats" />
           </template>
-          <NSpace vertical :size="12" class="p-2">
-            <NSpace v-for="(suites, codename) in suitesByCodename" :key="codename" align="center">
-              <span class="font-semibold text-sm">{{ codename }}:</span>
-              <AptSuiteTag v-for="suite in suites" :key="suite.suite" :suite="suite"
-                :stats="data.suitesStats[suite.suite || '']" />
-            </NSpace>
-          </NSpace>
+          <table class="w-full border-separate border-spacing-y-2">
+            <tbody>
+              <tr v-for="(suites, groupName) in groupedSuites" :key="groupName" class="border-0 hover:bg-gray-200/5">
+                <td class="fit-content align-top">
+                  <p class="text-bold whitespace-nowrap">{{ groupName }}</p>
+                </td>
+                <td class="flex flex-wrap gap-2 ml-4">
+                  <AptSuiteTag v-for="suite in suites" :key="suite.suite" :suite="suite"
+                    :stats="data.suitesStats[suite.suite || '']" />
+                </td>
+              </tr>
+            </tbody>
+          </table>
         </NCollapseItem>
       </NCollapse>
     </div>

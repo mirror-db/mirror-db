@@ -33,7 +33,9 @@ export async function ResolveAptRepo(url: string) {
       throw new Error(
         `Failed to fetch ${response.url}: ${response.statusText}`
       );
-    suites.push(new Release(await response.text()));
+    const release = new Release(await response.text());
+    if (release.suite != suite) continue;
+    suites.push(release);
   }
 
   return suites;
