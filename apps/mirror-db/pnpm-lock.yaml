@@ -6,7 +6,7 @@ settings:
 
 importers:
 
-  apps/mirror-db:
+  .:
     dependencies:
       '@tailwindcss/vite':
         specifier: ^4.1.16
@@ -26,12 +26,6 @@ importers:
       bytes:
         specifier: ^3.1.2
         version: 3.1.2
-      mirror-data:
-        specifier: workspace:../../packages/mirror-data
-        version: link:../../packages/mirror-data
-      mirror-types:
-        specifier: workspace:../../packages/mirror-types
-        version: link:../../packages/mirror-types
       naive-ui:
         specifier: ^2.43.1
         version: 2.43.1(vue@3.5.22(typescript@5.9.3))
@@ -96,10 +90,6 @@ importers:
       wrangler:
         specifier: ^4.45.3
         version: 4.45.3
-
-  packages/mirror-data: {}
-
-  packages/mirror-types: {}
 
 packages:
 
