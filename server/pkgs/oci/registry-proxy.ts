@@ -23,6 +23,22 @@ export type FetchImpl = (
   init?: RequestInit,
 ) => Promise<Response>;
 
+/** Minimal Cache API surface used here — keeps the module testable with a mock. */
+export interface CacheLike {
+  match(request: string | URL | Request): Promise<Response | undefined>;
+  put(request: string | URL | Request, response: Response): Promise<void>;
+}
+
+/**
+ * The Workers default Cache, or `undefined` outside the runtime (e.g. unit
+ * tests in Node) where the `caches` global does not exist.
+ */
+export function defaultCache(): CacheLike | undefined {
+  return typeof caches !== "undefined"
+    ? (caches.default as unknown as CacheLike)
+    : undefined;
+}
+
 export interface RegistryProxyOptions {
   /** Upstream registry host, e.g. `"registry-1.docker.io"`. */
   upstream: string;
@@ -36,6 +52,12 @@ export interface RegistryProxyOptions {
   kv?: KvLike;
   /** KV key prefix for cached tokens. */
   tokenCachePrefix?: string;
+  /** Optional Cache API store for content-addressed (digest) responses. */
+  cache?: CacheLike;
+  /** Max object size to cache, in bytes (default 512 MB — the Free/Pro limit). */
+  maxCacheBytes?: number;
+  /** Schedule a background promise (e.g. `ctx.waitUntil`) for async cache writes. */
+  waitUntil?: (promise: Promise<unknown>) => void;
 }
 
 /** Request headers that must not be forwarded upstream. */
@@ -56,6 +78,16 @@ const STRIP_REQUEST_HEADERS = new Set([
 const STRIP_RESPONSE_HEADERS = new Set([
   // Never leak an auth challenge — that is what makes clients prompt for login.
   "www-authenticate",
+  // Per-session header set by upstream/CDN. Caching is keyed by content digest
+  // and replayed to every client, so a cached Set-Cookie would leak one
+  // client's cookie to all others — strip it unconditionally.
+  "set-cookie",
+  "set-cookie2",
+  // Digest-addressed content is identical regardless of request headers, so a
+  // `Vary` would only cause spurious cache misses. Drop it for consistent hits.
+  "vary",
+  // Origin-relative freshness metadata; meaningless once we re-serve from cache.
+  "age",
   // Hop-by-hop / connection-scoped headers.
   "connection",
   "keep-alive",
@@ -67,6 +99,53 @@ const MAX_REDIRECTS = 5;
 
 const isRedirect = (status: number): boolean =>
   status === 301 || status === 302 || status === 303 || status === 307 || status === 308;
+
+/**
+ * Content-addressed registry paths: blobs and manifests fetched *by digest*
+ * (`<algo>:<hex>`). These are immutable, so they are safe to cache forever.
+ * Tag manifests (`/manifests/latest`) are mutable and deliberately excluded.
+ * The captured group is the bare digest.
+ */
+const DIGEST_PATH =
+  /\/(?:blobs|manifests)\/([a-z0-9]+(?:[+._-][a-z0-9]+)*:[0-9a-f]{32,})$/;
+
+/** Extract the digest from a by-digest path, or null if it isn't one. */
+const extractDigest = (path: string): string | null => {
+  const m = path.match(DIGEST_PATH);
+  return m ? m[1] : null;
+};
+
+/**
+ * Build the cache key for a content-addressed object. Keyed by digest (not the
+ * full path) so the same layer shared across repositories — e.g. a common
+ * `debian` base layer under `library/nginx` and `library/node` — hits one cache
+ * entry. Scoped to the upstream host to keep registries isolated.
+ */
+const digestCacheKey = (upstream: string, digest: string): string =>
+  `https://${upstream}/__cache__/${encodeURIComponent(digest)}`;
+
+/** One year — content-addressed data never changes under its digest. */
+const IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable";
+
+/**
+ * Default cap on what we store in the Cache API. Cloudflare rejects objects over
+ * a per-plan limit (512 MB Free/Pro, larger on Business/Enterprise); a blob
+ * above this is streamed straight through and never cached. 512 MB is the safe
+ * floor — override via `maxCacheBytes` on higher plans.
+ */
+const DEFAULT_MAX_CACHE_BYTES = 512 * 1024 * 1024;
+
+/**
+ * Decide whether a content-addressed 200 is small enough to cache. Requires a
+ * known `Content-Length` — without it we can't size the object, so skip rather
+ * than risk a mid-stream `cache.put` rejection.
+ */
+function withinCacheLimit(response: Response, limit: number): boolean {
+  const len = response.headers.get("content-length");
+  if (!len) return false;
+  const bytes = Number(len);
+  return Number.isFinite(bytes) && bytes <= limit;
+}
 
 function buildUpstreamHeaders(request: Request): Headers {
   const headers = new Headers();
@@ -158,6 +237,17 @@ export async function proxyRegistryRequest(
   const path = opts.rewritePath ? opts.rewritePath(incoming.pathname) : incoming.pathname;
   const upstreamUrl = `https://${opts.upstream}${path}${incoming.search}`;
 
+  // Serve immutable digest-addressed content from the Cache API when possible.
+  // The key is the digest, so identical layers shared across repositories hit
+  // the same entry.
+  const digest = extractDigest(path);
+  const cacheable = request.method === "GET" && !!opts.cache && digest !== null;
+  const cacheKey = digest ? digestCacheKey(opts.upstream, digest) : upstreamUrl;
+  if (cacheable) {
+    const hit = await opts.cache!.match(cacheKey);
+    if (hit) return hit;
+  }
+
   const baseHeaders = buildUpstreamHeaders(request);
   // Buffer the body once so the request can be retried after authentication.
   const body =
@@ -211,5 +301,28 @@ export async function proxyRegistryRequest(
     hops += 1;
   }
 
-  return sanitizeResponse(response);
+  const final = sanitizeResponse(response);
+
+  // Persist content-addressed 200s. Force a long immutable Cache-Control so the
+  // store accepts it regardless of upstream headers. The write runs in the
+  // background (waitUntil) so the client streams without waiting on the cache.
+  if (
+    cacheable &&
+    final.status === 200 &&
+    withinCacheLimit(final, opts.maxCacheBytes ?? DEFAULT_MAX_CACHE_BYTES)
+  ) {
+    const headers = new Headers(final.headers);
+    headers.set("cache-control", IMMUTABLE_CACHE_CONTROL);
+    const cached = new Response(final.body, {
+      status: 200,
+      statusText: final.statusText,
+      headers,
+    });
+    const write = opts.cache!.put(cacheKey, cached.clone()).catch(() => {});
+    if (opts.waitUntil) opts.waitUntil(write);
+    else await write;
+    return cached;
+  }
+
+  return final;
 }

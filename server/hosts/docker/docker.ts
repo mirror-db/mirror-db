@@ -7,7 +7,10 @@ import {
   type Credentials,
   type KvLike,
 } from "@server/pkgs/oci/creds";
-import { proxyRegistryRequest } from "@server/pkgs/oci/registry-proxy";
+import {
+  defaultCache,
+  proxyRegistryRequest,
+} from "@server/pkgs/oci/registry-proxy";
 
 /** KV key holding the Docker Hub credentials. */
 export const KV_KEY = "creds:docker-hub";
@@ -86,25 +89,30 @@ async function handleLogin(request: Request): Promise<Response> {
 }
 
 /** Proxy a distribution-API request to Docker Hub with transparent auth. */
-function proxy(request: Request): Promise<Response> {
+function proxy(request: Request, ctx?: ExecutionContext): Promise<Response> {
   return proxyRegistryRequest(request, {
     upstream: UPSTREAM,
     getCredentials: resolveCredentials,
     rewritePath: normalizeDockerPath,
     kv: env.kv as unknown as KvLike,
     tokenCachePrefix: TOKEN_CACHE_PREFIX,
+    cache: defaultCache(),
+    waitUntil: ctx ? ctx.waitUntil.bind(ctx) : undefined,
   });
 }
 
 /** Entry point for the `dcr` host: route by path, no framework. */
-export function handle(request: Request): Promise<Response> | Response {
+export function handle(
+  request: Request,
+  ctx?: ExecutionContext,
+): Promise<Response> | Response {
   const { pathname } = new URL(request.url);
 
   if (request.method === "POST" && pathname === "/auth/login") {
     return handleLogin(request);
   }
   if (pathname === "/v2" || pathname.startsWith("/v2/")) {
-    return proxy(request);
+    return proxy(request, ctx);
   }
   return new Response("Not Found", { status: 404 });
 }

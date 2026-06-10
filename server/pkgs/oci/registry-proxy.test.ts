@@ -4,6 +4,7 @@ import type { Credentials } from "./creds";
 import {
   getToken,
   proxyRegistryRequest,
+  type CacheLike,
   type FetchImpl,
 } from "./registry-proxy";
 import { parseWwwAuthenticate } from "./www-authenticate";
@@ -172,6 +173,51 @@ describe("proxyRegistryRequest", () => {
     expect(authHeader(last.init)).toBeNull();
   });
 
+  it("strips Set-Cookie and Vary from the response", async () => {
+    const { fetchImpl } = mockFetch(
+      () =>
+        new Response("ok", {
+          status: 200,
+          headers: {
+            "set-cookie": "session=secret; HttpOnly",
+            vary: "Accept",
+          },
+        }),
+    );
+
+    const res = await proxyRegistryRequest(req("/v2/library/nginx/manifests/latest"), {
+      upstream: "registry-1.docker.io",
+      fetchImpl,
+    });
+
+    expect(res.headers.get("set-cookie")).toBeNull();
+    expect(res.headers.get("vary")).toBeNull();
+  });
+
+  it("never caches a Set-Cookie header", async () => {
+    const { cache, store } = mockCache();
+    const { fetchImpl } = mockFetch(
+      () =>
+        new Response("LAYER", {
+          status: 200,
+          headers: {
+            "content-length": "5",
+            "set-cookie": "session=secret; HttpOnly",
+          },
+        }),
+    );
+
+    await proxyRegistryRequest(req(`/v2/library/nginx/blobs/${DIGEST}`), {
+      upstream: "registry-1.docker.io",
+      fetchImpl,
+      cache,
+    });
+
+    const entry = [...store.values()][0];
+    expect(entry).toBeDefined();
+    expect(entry.headers.get("set-cookie")).toBeNull();
+  });
+
   it("does not forward the client's Authorization header upstream", async () => {
     const { fetchImpl, calls } = mockFetch(() => new Response("ok", { status: 200 }));
 
@@ -183,6 +229,163 @@ describe("proxyRegistryRequest", () => {
     );
 
     expect(authHeader(calls[0].init)).toBeNull();
+  });
+});
+
+/** In-memory Cache API mock keyed by URL string. */
+function mockCache(): { cache: CacheLike; store: Map<string, Response> } {
+  const store = new Map<string, Response>();
+  const key = (r: string | URL | Request) =>
+    typeof r === "string" ? r : r.toString();
+  const cache: CacheLike = {
+    async match(r) {
+      return store.get(key(r));
+    },
+    async put(r, res) {
+      store.set(key(r), res);
+    },
+  };
+  return { cache, store };
+}
+
+const DIGEST = "sha256:" + "a".repeat(64);
+
+describe("proxyRegistryRequest caching", () => {
+  it("caches a content-addressed blob and serves the second hit from cache", async () => {
+    const { cache } = mockCache();
+    const { fetchImpl, calls } = mockFetch(
+      () =>
+        new Response("BLOBDATA", {
+          status: 200,
+          headers: { "content-length": "8" },
+        }),
+    );
+
+    const opts = { upstream: "registry-1.docker.io", fetchImpl, cache };
+
+    const first = await proxyRegistryRequest(
+      req(`/v2/library/nginx/blobs/${DIGEST}`),
+      opts,
+    );
+    expect(await first.text()).toBe("BLOBDATA");
+    expect(first.headers.get("cache-control")).toContain("immutable");
+    expect(calls).toHaveLength(1);
+
+    const second = await proxyRegistryRequest(
+      req(`/v2/library/nginx/blobs/${DIGEST}`),
+      opts,
+    );
+    expect(await second.text()).toBe("BLOBDATA");
+    // No new upstream fetch — served from cache.
+    expect(calls).toHaveLength(1);
+  });
+
+  it("shares a cached layer across repositories by digest", async () => {
+    const { cache } = mockCache();
+    const { fetchImpl, calls } = mockFetch(
+      () =>
+        new Response("LAYER", {
+          status: 200,
+          headers: { "content-length": "5" },
+        }),
+    );
+    const opts = { upstream: "registry-1.docker.io", fetchImpl, cache };
+
+    // First repo populates the cache for this digest.
+    await proxyRegistryRequest(req(`/v2/library/nginx/blobs/${DIGEST}`), opts);
+    expect(calls).toHaveLength(1);
+
+    // A different repo referencing the same digest hits the same entry.
+    const res = await proxyRegistryRequest(
+      req(`/v2/library/node/blobs/${DIGEST}`),
+      opts,
+    );
+    expect(await res.text()).toBe("LAYER");
+    expect(calls).toHaveLength(1); // no second upstream fetch
+  });
+
+  it("skips caching a blob larger than the size limit", async () => {
+    const { cache, store } = mockCache();
+    const { fetchImpl } = mockFetch(
+      () =>
+        new Response("BIG", {
+          status: 200,
+          headers: { "content-length": String(2 * 1024 * 1024 * 1024) },
+        }),
+    );
+
+    await proxyRegistryRequest(req(`/v2/library/nginx/blobs/${DIGEST}`), {
+      upstream: "registry-1.docker.io",
+      fetchImpl,
+      cache,
+    });
+    expect(store.size).toBe(0);
+  });
+
+  it("skips caching when Content-Length is unknown", async () => {
+    const { cache, store } = mockCache();
+    const { fetchImpl } = mockFetch(() => new Response("data", { status: 200 }));
+
+    await proxyRegistryRequest(req(`/v2/library/nginx/blobs/${DIGEST}`), {
+      upstream: "registry-1.docker.io",
+      fetchImpl,
+      cache,
+    });
+    expect(store.size).toBe(0);
+  });
+
+  it("does not cache a mutable tag manifest", async () => {
+    const { cache, store } = mockCache();
+    const { fetchImpl, calls } = mockFetch(
+      () => new Response("manifest", { status: 200 }),
+    );
+    const opts = { upstream: "registry-1.docker.io", fetchImpl, cache };
+
+    await proxyRegistryRequest(req("/v2/library/nginx/manifests/latest"), opts);
+    await proxyRegistryRequest(req("/v2/library/nginx/manifests/latest"), opts);
+
+    expect(store.size).toBe(0);
+    expect(calls).toHaveLength(2);
+  });
+
+  it("caches a manifest fetched by digest", async () => {
+    const { cache, store } = mockCache();
+    const { fetchImpl } = mockFetch(
+      () =>
+        new Response("manifest", {
+          status: 200,
+          headers: { "content-length": "8" },
+        }),
+    );
+
+    await proxyRegistryRequest(req(`/v2/library/nginx/manifests/${DIGEST}`), {
+      upstream: "registry-1.docker.io",
+      fetchImpl,
+      cache,
+    });
+    expect(store.size).toBe(1);
+  });
+
+  it("schedules the cache write via waitUntil when provided", async () => {
+    const { cache } = mockCache();
+    const { fetchImpl } = mockFetch(
+      () =>
+        new Response("X", {
+          status: 200,
+          headers: { "content-length": "1" },
+        }),
+    );
+    const scheduled: Promise<unknown>[] = [];
+
+    await proxyRegistryRequest(req(`/v2/library/nginx/blobs/${DIGEST}`), {
+      upstream: "registry-1.docker.io",
+      fetchImpl,
+      cache,
+      waitUntil: (p) => scheduled.push(p),
+    });
+
+    expect(scheduled).toHaveLength(1);
+    await Promise.all(scheduled);
   });
 });
 

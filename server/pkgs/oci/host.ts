@@ -1,13 +1,16 @@
 import { env } from "cloudflare:workers";
 
 import { type Credentials, type KvLike } from "./creds";
-import { proxyRegistryRequest } from "./registry-proxy";
+import { defaultCache, proxyRegistryRequest } from "./registry-proxy";
 
 /** A host descriptor consumed by the server entry router. */
 export interface OciHost {
   /** Subdomain this host is served at, e.g. `"ghcr"`. */
   host: string;
-  fetch: (request: Request) => Promise<Response> | Response;
+  fetch: (
+    request: Request,
+    ctx?: ExecutionContext,
+  ) => Promise<Response> | Response;
 }
 
 export interface OciHostOptions {
@@ -28,13 +31,15 @@ export interface OciHostOptions {
 export function createRegistryHost(opts: OciHostOptions): OciHost {
   const tokenCachePrefix = `token:${opts.host}:`;
 
-  const proxy = (request: Request): Promise<Response> =>
+  const proxy = (request: Request, ctx?: ExecutionContext): Promise<Response> =>
     proxyRegistryRequest(request, {
       upstream: opts.upstream,
       getCredentials: opts.getCredentials,
       rewritePath: opts.rewritePath,
       kv: env.kv as unknown as KvLike,
       tokenCachePrefix,
+      cache: defaultCache(),
+      waitUntil: ctx ? ctx.waitUntil.bind(ctx) : undefined,
     });
 
   // Proxy every path, not just `/v2/`: some registries (e.g. gcr.io) answer a
