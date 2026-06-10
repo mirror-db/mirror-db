@@ -4,12 +4,22 @@
  */
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
-	"name": "mirror-db",
+	"name": "mirs-uk",
 	"compatibility_date": "2026-06-10",
 	"main": "server/index.ts",
 	"assets": {
 		"not_found_handling": "single-page-application"
 	},
+	"routes": [
+		{
+			"pattern": "mirs.uk/*",
+			"zone_name": "mirs.uk"
+		},
+		{
+			"pattern": "*.mirs.uk/*",
+			"zone_name": "mirs.uk"
+		}
+	],
 	"observability": {
 		"enabled": true
 	},
