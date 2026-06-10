@@ -28,6 +28,12 @@
   "vars": {
     "BASE_DOMAIN": "mirs.uk",
   },
+  "kv_namespaces": [
+    {
+      "binding": "kv",
+      "id": "8bc635fa5924413694f2f208fafc98d6",
+    },
+  ],
   /**
    * Smart Placement
    * https://developers.cloudflare.com/workers/configuration/smart-placement/#smart-placement
