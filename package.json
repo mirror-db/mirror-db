@@ -10,10 +10,12 @@
 		"build-only": "vite build",
 		"type-check": "vue-tsc --build",
 		"deploy": "pnpm run build && wrangler deploy",
-		"cf-typegen": "wrangler types"
+		"cf-typegen": "wrangler types",
+		"test": "vitest run",
+		"test:e2e": "vitest run --config vitest.e2e.config.ts"
 	},
 	"dependencies": {
-		"hono": "^4.12.25",
+		"vitest": "^4.1.8",
 		"vue": "^3.5.32",
 		"vue-router": "^5.0.4"
 	},

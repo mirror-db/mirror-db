@@ -3,6 +3,12 @@
   "compilerOptions": {
     "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.worker.tsbuildinfo",
     "types": [ "./worker-configuration.d.ts","vite/client"],
+    "paths": {
+      "@server/*": ["./server/*"],
+    },
   },
   "include": ["server"],
+  // The e2e test runs in Node (spawns wrangler, uses node:http) — type-checked
+  // by tsconfig.vitest.json instead. Other *.test.ts use only workerd globals.
+  "exclude": ["server/hosts/docker/docker.e2e.test.ts"],
 }
