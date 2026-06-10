@@ -122,6 +122,56 @@ describe("proxyRegistryRequest", () => {
     expect(res.headers.get("www-authenticate")).toBeNull();
   });
 
+  it("follows a relative redirect server-side, keeping auth on the same host", async () => {
+    const { fetchImpl, calls } = mockFetch((url, _init, n) => {
+      if (n === 0) {
+        return new Response(null, { status: 401, headers: { "www-authenticate": CHALLENGE } });
+      }
+      if (url.startsWith("https://auth.docker.io/token")) {
+        return new Response(JSON.stringify({ token: "TKN" }), { status: 200 });
+      }
+      if (url === "https://registry-1.docker.io/v2/library/nginx/blobs/sha256:abc") {
+        // Relative redirect to an on-host download path.
+        return new Response(null, { status: 307, headers: { location: "/downloads/blob-1" } });
+      }
+      return new Response("BLOBDATA", { status: 200 });
+    });
+
+    const res = await proxyRegistryRequest(req("/v2/library/nginx/blobs/sha256:abc"), {
+      upstream: "registry-1.docker.io",
+      fetchImpl,
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("BLOBDATA");
+    // Final hop resolved against the upstream host and carried the bearer.
+    const last = calls[calls.length - 1];
+    expect(last.url).toBe("https://registry-1.docker.io/downloads/blob-1");
+    expect(authHeader(last.init)).toBe("Bearer TKN");
+  });
+
+  it("drops auth when a redirect points to a different (CDN) host", async () => {
+    const { fetchImpl, calls } = mockFetch((url) => {
+      if (url === "https://registry-1.docker.io/v2/library/nginx/blobs/sha256:abc") {
+        return new Response(null, {
+          status: 307,
+          headers: { location: "https://cdn.example.com/signed/blob" },
+        });
+      }
+      return new Response("BLOBDATA", { status: 200 });
+    });
+
+    const res = await proxyRegistryRequest(req("/v2/library/nginx/blobs/sha256:abc"), {
+      upstream: "registry-1.docker.io",
+      fetchImpl,
+    });
+
+    expect(res.status).toBe(200);
+    const last = calls[calls.length - 1];
+    expect(last.url).toBe("https://cdn.example.com/signed/blob");
+    expect(authHeader(last.init)).toBeNull();
+  });
+
   it("does not forward the client's Authorization header upstream", async () => {
     const { fetchImpl, calls } = mockFetch(() => new Response("ok", { status: 200 }));
 

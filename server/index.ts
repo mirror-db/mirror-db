@@ -1,9 +1,6 @@
-import docker from "./hosts/docker";
+import { hosts } from "./hosts";
 
 const notfound = () => new Response(null, { status: 404 });
-
-/** Registered hosts, keyed by their subdomain. */
-const hosts = new Map([docker].map((h) => [h.host, h]));
 
 export default {
   fetch(request, env) {

@@ -62,6 +62,12 @@ const STRIP_RESPONSE_HEADERS = new Set([
   "transfer-encoding",
 ]);
 
+/** Max server-side redirect hops to follow before giving up. */
+const MAX_REDIRECTS = 5;
+
+const isRedirect = (status: number): boolean =>
+  status === 301 || status === 302 || status === 303 || status === 307 || status === 308;
+
 function buildUpstreamHeaders(request: Request): Headers {
   const headers = new Headers();
   request.headers.forEach((value, key) => {
@@ -159,10 +165,10 @@ export async function proxyRegistryRequest(
       ? undefined
       : await request.arrayBuffer();
 
-  const send = (auth?: string): Promise<Response> => {
+  const send = (url: string, auth?: string): Promise<Response> => {
     const headers = new Headers(baseHeaders);
     if (auth) headers.set("Authorization", auth);
-    return fetchImpl(upstreamUrl, {
+    return fetchImpl(url, {
       method: request.method,
       headers,
       body: body as BodyInit | undefined,
@@ -170,7 +176,9 @@ export async function proxyRegistryRequest(
     });
   };
 
-  let response = await send();
+  let url = upstreamUrl;
+  let auth: string | undefined;
+  let response = await send(url);
 
   if (response.status === 401) {
     const challenge = parseWwwAuthenticate(response.headers.get("www-authenticate"));
@@ -181,9 +189,26 @@ export async function proxyRegistryRequest(
         cachePrefix: opts.tokenCachePrefix,
       });
       if (token) {
-        response = await send(`Bearer ${token}`);
+        auth = `Bearer ${token}`;
+        response = await send(url, auth);
       }
     }
+  }
+
+  // Follow redirects inside the worker rather than returning them to the
+  // client. Registries (e.g. gcr.io) may answer with a *relative* redirect to
+  // an on-host download path that still needs auth — a client following it
+  // would land back on this mirror or drop the bearer. Only forward auth when
+  // the next hop stays on the upstream host; CDN targets are pre-signed.
+  let hops = 0;
+  while (isRedirect(response.status) && hops < MAX_REDIRECTS) {
+    const location = response.headers.get("location");
+    if (!location) break;
+    const next = new URL(location, url);
+    const sameHost = next.host === new URL(url).host;
+    response = await send(next.toString(), sameHost ? auth : undefined);
+    url = next.toString();
+    hops += 1;
   }
 
   return sanitizeResponse(response);
