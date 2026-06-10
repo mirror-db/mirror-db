@@ -1,4 +1,5 @@
 import { hosts } from "./hosts";
+import { matchPath } from "./paths";
 
 const notfound = () => new Response(null, { status: 404 });
 
@@ -13,11 +14,20 @@ export default {
     if (handler) return handler.fetch(request, ctx);
 
     const url = new URL(request.url);
+
+    // The bare domain routes mirrors (APT repos) by path prefix.
+    if (subdomain === "@") {
+      const pathHost = matchPath(url.pathname);
+      if (pathHost) return pathHost.fetch(request, ctx);
+    }
+
     if (url.pathname.startsWith("/api/")) {
       return Response.json({
         name: subdomain,
       });
     }
-    return notfound();
+
+    // Nothing matched a mirror — serve the static site (SPA fallback).
+    return env.ASSETS.fetch(request);
   },
 } satisfies ExportedHandler<Env>;
