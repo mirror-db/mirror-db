@@ -11,6 +11,8 @@
  * can be unit-tested without the Workers runtime.
  */
 
+import { CFCacheLimit, mdbfetch, parseContentLength, sanitizeResponse, STRIP_RESPONSE_HEADERS } from "@server/pkgs/fetch";
+
 import {
   basicAuthHeader,
   type Credentials,
@@ -74,26 +76,6 @@ const STRIP_REQUEST_HEADERS = new Set([
   "cf-ipcountry",
 ]);
 
-/** Response headers stripped before returning to the client. */
-const STRIP_RESPONSE_HEADERS = new Set([
-  // Never leak an auth challenge — that is what makes clients prompt for login.
-  "www-authenticate",
-  // Per-session header set by upstream/CDN. Caching is keyed by content digest
-  // and replayed to every client, so a cached Set-Cookie would leak one
-  // client's cookie to all others — strip it unconditionally.
-  "set-cookie",
-  "set-cookie2",
-  // Digest-addressed content is identical regardless of request headers, so a
-  // `Vary` would only cause spurious cache misses. Drop it for consistent hits.
-  "vary",
-  // Origin-relative freshness metadata; meaningless once we re-serve from cache.
-  "age",
-  // Hop-by-hop / connection-scoped headers.
-  "connection",
-  "keep-alive",
-  "transfer-encoding",
-]);
-
 /** Max server-side redirect hops to follow before giving up. */
 const MAX_REDIRECTS = 5;
 
@@ -133,7 +115,7 @@ const IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable";
  * above this is streamed straight through and never cached. 512 MB is the safe
  * floor — override via `maxCacheBytes` on higher plans.
  */
-const DEFAULT_MAX_CACHE_BYTES = 512 * 1024 * 1024;
+const DEFAULT_MAX_CACHE_BYTES = CFCacheLimit;
 
 /**
  * Decide whether a content-addressed 200 is small enough to cache. Requires a
@@ -141,10 +123,8 @@ const DEFAULT_MAX_CACHE_BYTES = 512 * 1024 * 1024;
  * than risk a mid-stream `cache.put` rejection.
  */
 function withinCacheLimit(response: Response, limit: number): boolean {
-  const len = response.headers.get("content-length");
-  if (!len) return false;
-  const bytes = Number(len);
-  return Number.isFinite(bytes) && bytes <= limit;
+  const bytes = parseContentLength(response.headers);
+  return bytes !== undefined && bytes <= limit;
 }
 
 function buildUpstreamHeaders(request: Request): Headers {
@@ -155,20 +135,6 @@ function buildUpstreamHeaders(request: Request): Headers {
     }
   });
   return headers;
-}
-
-function sanitizeResponse(response: Response): Response {
-  const headers = new Headers();
-  response.headers.forEach((value, key) => {
-    if (!STRIP_RESPONSE_HEADERS.has(key.toLowerCase())) {
-      headers.set(key, value);
-    }
-  });
-  return new Response(response.body, {
-    status: response.status,
-    statusText: response.statusText,
-    headers,
-  });
 }
 
 interface TokenResponse {
@@ -231,7 +197,7 @@ export async function proxyRegistryRequest(
   request: Request,
   opts: RegistryProxyOptions,
 ): Promise<Response> {
-  const fetchImpl = opts.fetchImpl ?? (globalThis.fetch as FetchImpl);
+  const fetchImpl = opts.fetchImpl ?? mdbfetch;
 
   const incoming = new URL(request.url);
   const path = opts.rewritePath ? opts.rewritePath(incoming.pathname) : incoming.pathname;
