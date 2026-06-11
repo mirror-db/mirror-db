@@ -1,6 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { AptRepo, type FetchImpl } from "./repo";
+import { AptRepo } from "./repo";
 
 const HASH_A = "a".repeat(64);
 const VALID_UNTIL = "Sat, 14 Jun 2026 10:00:00 UTC";
@@ -12,31 +12,36 @@ SHA256:
  ${HASH_A}  1234 main/binary-amd64/Packages
 `;
 
-/**
- * Mock fetch serving InRelease for the given suites; everything else 404s.
- * (HTMLRewriter is absent in Node, so the repo falls back to its configured
- * suite list — this exercises exactly that path.)
- */
-function mockUpstream(suites: string[]): { fetchImpl: FetchImpl; urls: string[] } {
+// `AptRepo` fetches each suite's Release through `cachedfetch`; mock it.
+const { cachedfetchMock } = vi.hoisted(() => ({ cachedfetchMock: vi.fn() }));
+vi.mock("@server/pkgs/fetch", () => ({
+  cachedfetch: cachedfetchMock,
+  mdbfetch: vi.fn(),
+}));
+
+/** Serve InRelease for the given suites; everything else 404s. */
+function mockUpstream(suites: string[]): { urls: string[] } {
   const urls: string[] = [];
-  const fetchImpl: FetchImpl = async (input) => {
-    const url = input.toString();
+  cachedfetchMock.mockImplementation(async (input: unknown) => {
+    const url = String(input);
     urls.push(url);
     const m = url.match(/\/dists\/([^/]+)\/InRelease$/);
     if (m && suites.includes(m[1])) {
       return new Response(release(m[1]), { status: 200 });
     }
     return new Response(null, { status: 404 });
-  };
-  return { fetchImpl, urls };
+  });
+  return { urls };
 }
+
+beforeEach(() => cachedfetchMock.mockReset());
 
 const BASE = "https://up.example/debian/";
 
 describe("AptRepo.resolve", () => {
-  it("builds the index from the configured suites (listing fallback)", async () => {
-    const { fetchImpl } = mockUpstream(["trixie"]);
-    const repo = new AptRepo({ base: BASE, suites: ["trixie", "bogus"], fetchImpl });
+  it("builds the index from the configured suites", async () => {
+    mockUpstream(["trixie"]);
+    const repo = new AptRepo({ base: BASE, suites: ["trixie", "bogus"] });
 
     await repo.resolve();
 
@@ -50,8 +55,8 @@ describe("AptRepo.resolve", () => {
   });
 
   it("stays idle (no enforcement) when nothing resolves", async () => {
-    const { fetchImpl } = mockUpstream([]); // every suite 404s
-    const repo = new AptRepo({ base: BASE, suites: ["trixie"], fetchImpl });
+    mockUpstream([]); // every suite 404s
+    const repo = new AptRepo({ base: BASE, suites: ["trixie"] });
 
     await repo.resolve();
 
@@ -60,8 +65,8 @@ describe("AptRepo.resolve", () => {
   });
 
   it("ensureResolved runs in the background and flips to ready", async () => {
-    const { fetchImpl } = mockUpstream(["trixie"]);
-    const repo = new AptRepo({ base: BASE, suites: ["trixie"], fetchImpl });
+    mockUpstream(["trixie"]);
+    const repo = new AptRepo({ base: BASE, suites: ["trixie"] });
 
     const jobs: Promise<unknown>[] = [];
     repo.ensureResolved((p) => jobs.push(p));
@@ -72,7 +77,7 @@ describe("AptRepo.resolve", () => {
   });
 
   it("normalizes a base without a trailing slash", () => {
-    const repo = new AptRepo({ base: "https://up.example/debian", fetchImpl: mockUpstream([]).fetchImpl });
+    const repo = new AptRepo({ base: "https://up.example/debian" });
     expect(repo.url("dists/trixie/InRelease")).toBe(`${BASE}dists/trixie/InRelease`);
   });
 });

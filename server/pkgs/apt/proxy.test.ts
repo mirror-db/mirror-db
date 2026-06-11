@@ -1,155 +1,134 @@
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { AptRepo, type FetchImpl } from "./repo";
-import { proxyAptRequest, type CacheLike } from "./proxy";
+import { AptRepo } from "./repo";
+import { createAptProxy } from "./proxy";
 
 const HASH = "a".repeat(64);
 const BASE = "https://up.example/debian/";
 
-/** A repo with a hand-set index, so we drive enforcement directly. */
+// The proxy fetches upstream through `cachedfetch`; mock it to drive responses.
+const { cachedfetchMock } = vi.hoisted(() => ({ cachedfetchMock: vi.fn() }));
+vi.mock("@server/pkgs/fetch", async (importOriginal) => {
+  const orig: any = await importOriginal();
+  return {
+    ...orig,
+    cachedfetch: cachedfetchMock,
+  };
+});
+
+// WebListFs.readdir needs HTMLRewriter (Workers runtime), unavailable in node.
+// Mock the parseListing function so readdir returns a fixed listing.
+vi.mock("@server/pkgs/web-list/parse", async (importOriginal) => {
+  const orig: any = await importOriginal();
+  return {
+    ...orig,
+    parseListing: async () => [
+      { name: "dists", href: "dists/", type: "directory", lastModified: null, size: null },
+      { name: "pool", href: "pool/", type: "directory", lastModified: null, size: null },
+      { name: "README", href: "README", type: "file", lastModified: null, size: 100 },
+    ],
+  };
+});
+
+beforeEach(() => {
+  cachedfetchMock.mockReset();
+  cachedfetchMock.mockImplementation(
+    async () =>
+      new Response("data", { status: 200, headers: { "content-length": "4" } }),
+  );
+});
+
+/** A repo with a hand-set index for direct enforcement testing. */
 function makeRepo(opts: {
   ready: boolean;
   paths?: string[];
   hashes?: string[];
   validUntil?: number;
 }): AptRepo {
-  const repo = new AptRepo({ base: BASE, fetchImpl: async () => new Response() });
+  const repo = new AptRepo({ base: BASE });
   repo.state = opts.ready ? "ready" : "idle";
   repo.knownPaths = new Set(opts.paths ?? []);
   repo.knownHashes = new Set(opts.hashes ?? []);
-  repo.validUntil = opts.validUntil ?? 0;
+  repo.validUntil = opts.validUntil ?? Date.now() + 3_600_000;
+  // Prevent the proxy's awaitResolved from triggering a real resolve that would
+  // mutate the hand-set state.
+  repo.awaitResolved = async () => {};
   return repo;
 }
 
-/** Mock fetch returning a 200 with an explicit Content-Length (size guard needs it). */
-function mockFetch(body = "data"): { fetchImpl: FetchImpl; urls: string[] } {
-  const urls: string[] = [];
-  const fetchImpl: FetchImpl = async (input) => {
-    urls.push(input.toString());
-    return new Response(body, {
-      status: 200,
-      headers: { "content-length": String(body.length) },
-    });
-  };
-  return { fetchImpl, urls };
+function makeProxy(opts: Parameters<typeof makeRepo>[0]) {
+  return createAptProxy(makeRepo(opts));
 }
 
-/** In-memory Cache API mock. */
-function mockCache(): { cache: CacheLike; store: Map<string, Response> } {
-  const store = new Map<string, Response>();
-  const cache: CacheLike = {
-    async match(req) {
-      return store.get(req.toString());
-    },
-    async put(req, res) {
-      store.set(req.toString(), res);
-    },
-  };
-  return { cache, store };
-}
+const get = (path: string) =>
+  new Request(`https://mirs.uk/${path}`, { method: "GET" });
 
-const get = () => new Request("https://mirs.uk/debian/x", { method: "GET" });
-
-describe("proxyAptRequest", () => {
+describe("createAptProxy — file enforcement", () => {
   it("passes through unjudged while the repo is not ready", async () => {
-    const { fetchImpl, urls } = mockFetch();
-    const repo = makeRepo({ ready: false });
-
-    const res = await proxyAptRequest(get(), {
-      rel: "dists/trixie/does-not-exist",
-      repo,
-      fetchImpl,
-    });
+    const proxy = makeProxy({ ready: false });
+    const res = await proxy.fetch(get("dists/trixie/does-not-exist"));
 
     expect(res.status).toBe(200);
-    expect(urls).toEqual([`${BASE}dists/trixie/does-not-exist`]);
+    expect(cachedfetchMock).toHaveBeenCalled();
   });
 
   it("404s an unknown by-hash file once ready, without fetching", async () => {
-    const { fetchImpl, urls } = mockFetch();
-    const repo = makeRepo({ ready: true, hashes: [] });
-
-    const res = await proxyAptRequest(get(), {
-      rel: `dists/trixie/main/binary-amd64/by-hash/SHA256/${"b".repeat(64)}`,
-      repo,
-      fetchImpl,
-    });
+    const proxy = makeProxy({ ready: true, hashes: [] });
+    const res = await proxy.fetch(
+      get(`dists/trixie/main/binary-amd64/by-hash/SHA256/${"b".repeat(64)}`),
+    );
 
     expect(res.status).toBe(404);
-    expect(urls).toHaveLength(0);
+    expect(cachedfetchMock).not.toHaveBeenCalled();
   });
 
-  it("matches a known by-hash file under a non-SHA256 algo (SHA512)", async () => {
+  it("matches a known by-hash file (SHA512)", async () => {
     const sha512 = "c".repeat(128);
-    const { fetchImpl, urls } = mockFetch();
-    const repo = makeRepo({ ready: true, hashes: [sha512] });
-
-    const res = await proxyAptRequest(get(), {
-      rel: `dists/trixie/main/binary-amd64/by-hash/SHA512/${sha512}`,
-      repo,
-      fetchImpl,
-    });
+    const proxy = makeProxy({ ready: true, hashes: [sha512] });
+    const res = await proxy.fetch(
+      get(`dists/trixie/main/binary-amd64/by-hash/SHA512/${sha512}`),
+    );
 
     expect(res.status).toBe(200);
-    expect(urls).toHaveLength(1);
+    expect(cachedfetchMock).toHaveBeenCalledTimes(1);
   });
 
   it("404s an unknown dists file once ready", async () => {
-    const { fetchImpl } = mockFetch();
-    const repo = makeRepo({ ready: true, paths: ["dists/trixie/Release"] });
-
-    const res = await proxyAptRequest(get(), {
-      rel: "dists/trixie/ghost",
-      repo,
-      fetchImpl,
-    });
+    const proxy = makeProxy({ ready: true, paths: ["dists/trixie/Release"] });
+    const res = await proxy.fetch(get("dists/trixie/ghost"));
 
     expect(res.status).toBe(404);
+    expect(cachedfetchMock).not.toHaveBeenCalled();
   });
 
-  it("always passes through pool/ paths (not listed in Release)", async () => {
-    const { fetchImpl, urls } = mockFetch();
-    const repo = makeRepo({ ready: true, paths: [] });
-
-    const res = await proxyAptRequest(get(), {
-      rel: "pool/main/n/nginx/nginx_1.0_amd64.deb",
-      repo,
-      fetchImpl,
-    });
+  it("always passes through pool/ paths (not in Release)", async () => {
+    const proxy = makeProxy({ ready: true, paths: [] });
+    const res = await proxy.fetch(get("pool/main/n/nginx/nginx_1.0_amd64.deb"));
 
     expect(res.status).toBe(200);
-    expect(urls).toHaveLength(1);
+    expect(cachedfetchMock).toHaveBeenCalledTimes(1);
   });
+});
 
+describe("createAptProxy — cache-control", () => {
   it("caches a known by-hash file as immutable", async () => {
-    const { fetchImpl } = mockFetch();
-    const { cache, store } = mockCache();
-    const rel = `dists/trixie/main/binary-amd64/by-hash/SHA256/${HASH}`;
-    const repo = makeRepo({ ready: true, hashes: [HASH] });
-
-    const res = await proxyAptRequest(get(), { rel, repo, fetchImpl, cache });
+    const proxy = makeProxy({ ready: true, hashes: [HASH] });
+    const res = await proxy.fetch(
+      get(`dists/trixie/main/binary-amd64/by-hash/SHA256/${HASH}`),
+    );
 
     expect(res.headers.get("cache-control")).toBe(
       "public, max-age=31536000, immutable",
     );
-    expect(store.has(`${BASE}${rel}`)).toBe(true);
   });
 
   it("caches a dist file with the source freshness window", async () => {
-    const { fetchImpl } = mockFetch();
-    const { cache } = mockCache();
-    const repo = makeRepo({
+    const proxy = makeProxy({
       ready: true,
       paths: ["dists/trixie/InRelease"],
       validUntil: Date.now() + 3600_000,
     });
-
-    const res = await proxyAptRequest(get(), {
-      rel: "dists/trixie/InRelease",
-      repo,
-      fetchImpl,
-      cache,
-    });
+    const res = await proxy.fetch(get("dists/trixie/InRelease"));
 
     const cc = res.headers.get("cache-control") ?? "";
     const maxAge = Number(cc.match(/max-age=(\d+)/)?.[1]);
@@ -157,16 +136,84 @@ describe("proxyAptRequest", () => {
     expect(maxAge).toBeLessThanOrEqual(3600);
   });
 
-  it("serves a cache hit without fetching upstream", async () => {
-    const { fetchImpl, urls } = mockFetch();
-    const { cache } = mockCache();
-    const rel = "dists/trixie/InRelease";
-    await cache.put(`${BASE}${rel}`, new Response("cached", { status: 200 }));
-    const repo = makeRepo({ ready: true, paths: [rel] });
+  it("strips set-cookie from upstream responses", async () => {
+    cachedfetchMock.mockImplementation(async () =>
+      new Response("x", {
+        status: 200,
+        headers: { "set-cookie": "foo=bar", "content-length": "1" },
+      }),
+    );
+    const proxy = makeProxy({ ready: true, paths: ["dists/trixie/Release"] });
+    const res = await proxy.fetch(get("dists/trixie/Release"));
 
-    const res = await proxyAptRequest(get(), { rel, repo, fetchImpl, cache });
+    expect(res.headers.has("set-cookie")).toBe(false);
+  });
+});
 
-    expect(await res.text()).toBe("cached");
-    expect(urls).toHaveLength(0);
+describe("createAptProxy — directory listing", () => {
+  it("renders root directory as HTML via defaultRender", async () => {
+    const proxy = makeProxy({ ready: true, paths: ["dists/trixie/InRelease"] });
+    const res = await proxy.fetch(get(""));
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("text/html");
+    const html = await res.text();
+    expect(html).toContain("dists/");
+  });
+
+  it("returns JSON with ?format=json", async () => {
+    const proxy = makeProxy({ ready: true, paths: ["dists/trixie/InRelease"] });
+    const res = await proxy.fetch(
+      new Request("https://mirs.uk/?format=json"),
+    );
+
+    expect(res.headers.get("content-type")).toContain("application/json");
+    const body: any = await res.json();
+    expect(body.path).toBe("");
+    expect(body.entries.length).toBeGreaterThan(0);
+  });
+
+  it("redirects to trailing slash for a dists dir without trailing slash", async () => {
+    const proxy = makeProxy({
+      ready: true,
+      paths: ["dists/trixie/InRelease"],
+    });
+    // "dists" has children in knownPaths → fetchHook returns 301 redirect
+    const res = await proxy.fetch(get("dists"));
+
+    expect(res.status).toBe(301);
+    expect(res.headers.get("location")).toContain("dists/");
+  });
+});
+
+describe("createAptProxy — WebDAV", () => {
+  it("OPTIONS returns DAV:1", async () => {
+    const proxy = makeProxy({ ready: true, paths: [] });
+    const res = await proxy.fetch(
+      new Request("https://mirs.uk/", { method: "OPTIONS" }),
+    );
+
+    expect(res.status).toBe(204);
+    expect(res.headers.get("dav")).toBe("1");
+  });
+
+  it("PROPFIND returns 207 multistatus", async () => {
+    const proxy = makeProxy({ ready: true, paths: [] });
+    const res = await proxy.fetch(
+      new Request("https://mirs.uk/", { method: "PROPFIND", headers: { depth: "1" } }),
+    );
+
+    expect(res.status).toBe(207);
+    const xml = await res.text();
+    expect(xml).toContain("<D:multistatus");
+  });
+
+  it("PUT returns 405", async () => {
+    const proxy = makeProxy({ ready: true, paths: [] });
+    const res = await proxy.fetch(
+      new Request("https://mirs.uk/foo", { method: "PUT" }),
+    );
+
+    expect(res.status).toBe(405);
   });
 });
