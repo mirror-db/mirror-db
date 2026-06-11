@@ -1,11 +1,11 @@
 export interface MirrorStatus {
   health: "initializing" | "healthy" | "unhealthy";
-  [key: string]: any;
 }
 
 export interface Mirror {
+  name: string;
   host?: string;
   path?: string;
-  fetch(request: Request, ctx?: ExecutionContext): Promise<Response> | Response;
+  fetch(request: Request): Promise<Response> | Response;
   status?(): Promise<MirrorStatus> | MirrorStatus;
 }

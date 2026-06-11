@@ -7,14 +7,21 @@ challenges never reach clients.
 
 ## Routing
 
-`BASE_DOMAIN` = `mirs.uk`. Subdomain → host. `dcr.mirs.uk` → Docker Hub.
+`BASE_DOMAIN` = `mirs.uk`. Every mirror implements the `Mirror` interface
+([server/types.ts](server/types.ts)): `name`, optional `host` (subdomain route,
+e.g. `dcr.mirs.uk` → Docker Hub) or `path` (prefix route on the bare `@`
+subdomain, e.g. `mirs.uk/debian/`), `fetch`, optional `status()`.
 
-- [server/index.ts](server/index.ts) — entry. Parses subdomain, dispatches to a
-  host from the `hosts` map, passes `ctx` through. 404 otherwise.
-- [server/hosts/index.ts](server/hosts/index.ts) — aggregates all hosts into a
-  `Map<subdomain, OciHost>`. Simple passthrough mirrors declared inline via
-  `createRegistryHost`; hosts needing logic (login, path rewrite) live in their
-  own subdir.
+- [server/index.ts](server/index.ts) — entry. Parses subdomain. Subdomain
+  mirror wins first; on the bare `@` it serves `/status/<name>`, then path
+  mirrors, then `/api/`, then the static SPA. 404 if no host header / wrong domain.
+- [server/mirrors/index.ts](server/mirrors/index.ts) — aggregates every mirror
+  into one `mirrors` array plus lookups: `mirrorsBySubdomain`, `mirrorsByName`
+  (for `/status/<name>`), `matchMirrorPath` (longest-prefix). Simple passthrough
+  registries declared inline via `createRegistryHost`; mirrors needing logic
+  (login, path rewrite, an index) live in their own subdir under `mirrors/`.
+- `GET mirs.uk/status/<name>` → that mirror's `status()` (404 if no such mirror
+  or no `status()`).
 
 ### Mirrors
 
@@ -71,7 +78,7 @@ cached.
 `age`, hop-by-hop (`connection`/`keep-alive`/`transfer-encoding`). Stripping
 happens **before** cache write, so neither cache nor client sees them.
 
-## Docker Hub host — [server/hosts/docker/](server/hosts/docker/)
+## Docker Hub mirror — [server/mirrors/docker/](server/mirrors/docker/)
 
 - `normalizeDockerPath`: `/v2/<single>/...` → `/v2/library/<single>/...`.
 - `resolveCredentials`: KV `creds:docker-hub` → fallback env
@@ -87,12 +94,42 @@ Password lives only in: KV value + outbound `Authorization` to the token
 endpoint. **Never** in responses, logs, or error messages. `.env` holds a real
 Docker Hub PAT and is gitignored — never echo it.
 
+## Upstream fetch — [server/pkgs/fetch/](server/pkgs/fetch/)
+
+Shared helpers for talking to upstreams. All outbound proxy traffic should go
+through these, not bare `fetch`, so user-agent + rate-limiting are uniform.
+
+- **`mdbfetch(input, init)`** — `typeof fetch`. The base primitive: wraps args in
+  a `Request`, sets `user-agent: mirror-db/0.0.0-dev` ([`MdbUserAgent`](server/pkgs/fetch/const.ts))
+  if absent, and runs every call through a shared `p-limit` gate
+  (`MdbMaxConcurrentRequests` = 64 concurrent). It is the default `fetchImpl`
+  for both proxies ([oci/registry-proxy.ts](server/pkgs/oci/registry-proxy.ts),
+  [apt/proxy.ts](server/pkgs/apt/proxy.ts)) and `AptRepo`. **Gotcha:** it hands a
+  `Request` to global `fetch`, not `(url, init)` — a `fetch` stub must read
+  `input.url`, not `input.toString()`.
+- **`ezfetch(reqInfo, parts?, init?)`** — ergonomic `mdbfetch`. `buildRequest`
+  `url-join`s any `parts` onto the URL and defaults `redirect: "follow"`. Use
+  when joining path segments to a base; returns the `Response`.
+- **`cachedfetch`** — `ezfetch` + read-through Cache API via the module-level
+  `mdbCache` (`MdbCacheManager`): `match` first, on miss `mdbfetch` then `save` a
+  clone. Keyed by **`req.url`** (not digest), guarded by `isCacheable`
+  (size ≤ `MdbCacheSizeLimit`, no `content-range`, bounded `range`), with
+  in-flight write dedup. Used by the **APT proxy** ([apt/proxy.ts](server/pkgs/apt/proxy.ts))
+  and `AptRepo`'s Release fetch — both key on the bare upstream URL. The **OCI
+  proxy** does *not* use it: it needs digest-keyed entries + immutable
+  `Cache-Control` rewriting, so it calls `mdbfetch` + an injected `cache` directly.
+- Constants in [const.ts](server/pkgs/fetch/const.ts): `CFCacheLimit` (512 MB,
+  CF Free/Pro per-object cap) = `MdbCacheSizeLimit`, `MdbMaxConcurrentRequests`,
+  `MdbCacheName` (`"upstream"`), `MdbUserAgent`.
+
 ## Layout
 
 - `server/pkgs/oci/` — reusable OCI components (proxy, creds, www-authenticate,
-  host factory). Shared across mirror sources.
-- `server/hosts/<name>/` — per-host logic + `index.ts` exporting
-  `{ host, fetch }`.
+  host factory). `server/pkgs/apt/` — APT repo index + proxy + status.
+  `server/pkgs/fetch/` — shared upstream fetch + cache helpers (above).
+- `server/mirrors/<name>/` — per-mirror logic + `index.ts` exporting a `Mirror`
+  (`{ name, host? | path?, fetch, status? }`). `server/mirrors/index.ts`
+  aggregates them.
 - Path alias: `@server/*` → `./server/*`.
 
 ## Commands
@@ -106,7 +143,7 @@ pnpm deploy        # build + wrangler deploy
 pnpm cf-typegen    # regenerate worker-configuration.d.ts (KV binding `kv`, etc.)
 ```
 
-E2E ([docker.e2e.test.ts](server/hosts/docker/docker.e2e.test.ts)) is
+E2E ([docker.e2e.test.ts](server/mirrors/docker/docker.e2e.test.ts)) is
 self-contained: `beforeAll` builds + spawns `wrangler dev --remote --host
 dcr.mirs.uk`, `afterAll` kills the process group. Uses plain `fetch`.
 **Local Docker Hub is firewalled** → e2e must use `--remote`.

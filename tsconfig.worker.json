@@ -10,5 +10,5 @@
   "include": ["server"],
   // The e2e test runs in Node (spawns wrangler, uses node:http) — type-checked
   // by tsconfig.vitest.json instead. Other *.test.ts use only workerd globals.
-  "exclude": ["server/hosts/docker/docker.e2e.test.ts"],
+  "exclude": ["server/mirrors/docker/docker.e2e.test.ts"],
 }

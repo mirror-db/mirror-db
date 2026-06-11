@@ -1,4 +1,4 @@
-import { env } from "cloudflare:workers";
+import { env, waitUntil } from "cloudflare:workers";
 
 import {
   basicAuthHeader,
@@ -11,6 +11,7 @@ import {
   defaultCache,
   proxyRegistryRequest,
 } from "@server/pkgs/oci/registry-proxy";
+import { mdbfetch } from "@server/pkgs/fetch";
 
 /** KV key holding the Docker Hub credentials. */
 export const KV_KEY = "creds:docker-hub";
@@ -52,7 +53,7 @@ async function validateCredentials(creds: Credentials): Promise<boolean> {
   const url = new URL(TOKEN_REALM);
   url.searchParams.set("service", TOKEN_SERVICE);
   url.searchParams.set("scope", "repository:library/hello-world:pull");
-  const res = await fetch(url.toString(), {
+  const res = await mdbfetch(url.toString(), {
     headers: { Authorization: basicAuthHeader(creds) },
   });
   return res.ok;
@@ -89,7 +90,7 @@ async function handleLogin(request: Request): Promise<Response> {
 }
 
 /** Proxy a distribution-API request to Docker Hub with transparent auth. */
-function proxy(request: Request, ctx?: ExecutionContext): Promise<Response> {
+function proxy(request: Request): Promise<Response> {
   return proxyRegistryRequest(request, {
     upstream: UPSTREAM,
     getCredentials: resolveCredentials,
@@ -97,22 +98,19 @@ function proxy(request: Request, ctx?: ExecutionContext): Promise<Response> {
     kv: env.kv as unknown as KvLike,
     tokenCachePrefix: TOKEN_CACHE_PREFIX,
     cache: defaultCache(),
-    waitUntil: ctx ? ctx.waitUntil.bind(ctx) : undefined,
+    waitUntil,
   });
 }
 
 /** Entry point for the `dcr` host: route by path, no framework. */
-export function handle(
-  request: Request,
-  ctx?: ExecutionContext,
-): Promise<Response> | Response {
+export function handle(request: Request): Promise<Response> | Response {
   const { pathname } = new URL(request.url);
 
   if (request.method === "POST" && pathname === "/auth/login") {
     return handleLogin(request);
   }
   if (pathname === "/v2" || pathname.startsWith("/v2/")) {
-    return proxy(request, ctx);
+    return proxy(request);
   }
   return new Response("Not Found", { status: 404 });
 }

@@ -94,7 +94,7 @@ describe("/v2 proxy routing", () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: string | URL | Request) => {
-        calls.push(typeof input === "string" ? input : input.toString());
+        calls.push(input instanceof Request ? input.url : input.toString());
         return new Response("ok", { status: 200 });
       }),
     );

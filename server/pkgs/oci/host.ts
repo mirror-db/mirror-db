@@ -1,17 +1,9 @@
-import { env } from "cloudflare:workers";
+import { env, waitUntil } from "cloudflare:workers";
+
+import type { Mirror } from "@server/types";
 
 import { type Credentials, type KvLike } from "./creds";
 import { defaultCache, proxyRegistryRequest } from "./registry-proxy";
-
-/** A host descriptor consumed by the server entry router. */
-export interface OciHost {
-  /** Subdomain this host is served at, e.g. `"ghcr"`. */
-  host: string;
-  fetch: (
-    request: Request,
-    ctx?: ExecutionContext,
-  ) => Promise<Response> | Response;
-}
 
 export interface OciHostOptions {
   host: string;
@@ -28,10 +20,10 @@ export interface OciHostOptions {
  * proxy follows each registry's own token-auth challenge, so anonymous public
  * pulls work out of the box; pass `getCredentials` for authenticated upstreams.
  */
-export function createRegistryHost(opts: OciHostOptions): OciHost {
+export function createRegistryHost(opts: OciHostOptions): Mirror {
   const tokenCachePrefix = `token:${opts.host}:`;
 
-  const proxy = (request: Request, ctx?: ExecutionContext): Promise<Response> =>
+  const proxy = (request: Request): Promise<Response> =>
     proxyRegistryRequest(request, {
       upstream: opts.upstream,
       getCredentials: opts.getCredentials,
@@ -39,12 +31,12 @@ export function createRegistryHost(opts: OciHostOptions): OciHost {
       kv: env.kv as unknown as KvLike,
       tokenCachePrefix,
       cache: defaultCache(),
-      waitUntil: ctx ? ctx.waitUntil.bind(ctx) : undefined,
+      waitUntil,
     });
 
   // Proxy every path, not just `/v2/`: some registries (e.g. gcr.io) answer a
   // blob request with a *relative* redirect to an on-host download path like
   // `/artifacts-downloads/...`, which the client resolves against this mirror.
   // Those follow-up requests still need upstream auth, so they must be proxied.
-  return { host: opts.host, fetch: proxy };
+  return { name: opts.host, host: opts.host, fetch: proxy };
 }

@@ -19,4 +19,7 @@ export default defineConfig({
 			'@server': fileURLToPath(new URL('./server', import.meta.url)),
 		},
 	},
+	server: {
+		allowedHosts: ["localhost", "mirs.uk", "*.mirs.uk"],
+	}
 })
