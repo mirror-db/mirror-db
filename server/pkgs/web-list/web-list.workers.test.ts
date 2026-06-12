@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 // Raw HTML fixtures captured from the live mirrors.
 import debianHtml from "./__fixtures__/cloudflaremirrors-debian.html?raw";
 import ubuntuHtml from "./__fixtures__/nl-archive-ubuntu.html?raw";
+import nvidiaHtml from "./__fixtures__/nvidia-cuda-repos.html?raw";
 import { WebListFs, type WebListEntry } from "./web-list";
 
 // Runs in the workers pool → real HTMLRewriter. The fetch impl is stubbed so
@@ -84,5 +85,58 @@ describe("WebListFs url/fetch", () => {
 
     await fs.fetch("README");
     expect(lastUrl()).toBe("https://cloudflaremirrors.com/debian/README");
+  });
+});
+
+describe("WebListFs.readdir — developer.download.nvidia.com (UL-based)", () => {
+  it("parses <ul>/<li>/<span> NVIDIA-style listing", async () => {
+    const { fs } = fsFor(
+      "https://developer.download.nvidia.com/compute/cuda/repos/",
+      nvidiaHtml,
+    );
+    const entries = await fs.readdir();
+    const map = byName(entries);
+
+    // Parent `..\` is excluded; both files and directories are captured.
+    expect(Object.keys(map).sort()).toEqual(
+      [
+        "GPGKEY",
+        "amzn2023",
+        "cuda-keyring_1.1-1_all.deb",
+        "debian10",
+        "debian11",
+        "debian12",
+        "fedora39",
+        "ubuntu2004",
+        "ubuntu2204",
+        "ubuntu2404",
+      ].sort(),
+    );
+
+    // Files have correct type, size, and date
+    expect(map["GPGKEY"]).toMatchObject({
+      type: "file",
+      href: "GPGKEY",
+      size: Math.round(4.0 * 1024),
+    });
+    expect(map["GPGKEY"].lastModified?.toISOString()).toBe("2014-05-09T01:12:00.000Z");
+
+    expect(map["cuda-keyring_1.1-1_all.deb"]).toMatchObject({
+      type: "file",
+      href: "cuda-keyring_1.1-1_all.deb",
+      size: Math.round(5.2 * 1024),
+    });
+    expect(map["cuda-keyring_1.1-1_all.deb"].lastModified?.toISOString()).toBe(
+      "2024-03-14T18:30:00.000Z",
+    );
+
+    // Directories have no size/date
+    expect(map["amzn2023"]).toMatchObject({
+      type: "directory",
+      href: "amzn2023/",
+      size: null,
+    });
+    expect(map["debian12"]).toMatchObject({ type: "directory", href: "debian12/" });
+    expect(map["ubuntu2404"]).toMatchObject({ type: "directory", href: "ubuntu2404/" });
   });
 });

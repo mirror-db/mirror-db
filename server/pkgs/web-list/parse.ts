@@ -73,11 +73,16 @@ function cleanText(raw: string): string {
 /**
  * Stream a listing page through HTMLRewriter into header/data row arrays.
  *
- * Tables are walked statefully in document order: `<tr>` opens a row, `<th>` /
- * `<td>` opens a cell (the row's kind follows its cells), and text chunks —
- * which arrive split per the streaming parser — are concatenated onto the open
- * cell. Anchor text lives under `<a>`, not directly under the cell, so it is
- * captured by a dedicated `a` handler that also records the first `href`.
+ * Supports two listing formats:
+ *
+ * 1. **Table** (Apache/nginx autoindex): `<tr>` rows with `<th>` / `<td>` cells.
+ * 2. **UL** (NVIDIA-style): `<ul class="directorycontents">` → `<li>` items
+ *    with `<span class="file|dir">`, `<span class="size">`, `<span class="date">`.
+ *
+ * Both formats are walked statefully in document order. Text chunks — which
+ * arrive split per the streaming parser — are concatenated onto the open cell.
+ * Anchor text lives under `<a>`, so it is captured by a dedicated `a` handler
+ * that also records the first `href`.
  */
 export async function collectRows(input: Response | string): Promise<ListingRows> {
   if (typeof HTMLRewriter === "undefined") {
@@ -109,7 +114,17 @@ export async function collectRows(input: Response | string): Promise<ListingRows
     });
   };
 
+  // ── UL-based listing state (NVIDIA-style) ──────────────────────────────
+  // Each `<li>` is a row. `<span class="file|dir">` is the name cell,
+  // `<span class="size">` and `<span class="date">` are metadata cells.
+  // We synthesize a header row so `guessColumns` can match them.
+  let ulActive = false;
+  let liRow: Cell[] | null = null;
+  let liCell: Cell | null = null;
+  let syntheticHeader = false;
+
   await new HTMLRewriter()
+    // ── Table-based listing ────────────────────────────────────────────
     .on("tr", {
       element(el) {
         row = [];
@@ -140,17 +155,75 @@ export async function collectRows(input: Response | string): Promise<ListingRows
         if (cell && !inAnchor) cell.text += t.text;
       },
     })
+    // ── UL-based listing (NVIDIA-style) ────────────────────────────────
+    .on("ul.directorycontents", {
+      element(el) {
+        ulActive = true;
+        el.onEndTag(() => { ulActive = false; });
+      },
+    })
+    .on("ul.directorycontents li", {
+      element(el) {
+        if (!ulActive) return;
+        // Inject a synthetic header row once so guessColumns sees columns.
+        if (!syntheticHeader) {
+          headerRows.push([
+            { text: "Name" },
+            { text: "Size" },
+            { text: "Last modified" },
+          ]);
+          syntheticHeader = true;
+        }
+        liRow = [
+          { text: "" },  // col 0: name
+          { text: "" },  // col 1: size
+          { text: "" },  // col 2: date
+        ];
+        el.onEndTag(() => {
+          if (liRow && liRow[0].href) dataRows.push(liRow);
+          liRow = null;
+          liCell = null;
+        });
+      },
+    })
+    .on("ul.directorycontents li span", {
+      element(el) {
+        if (!liRow) return;
+        const cls = el.getAttribute("class") ?? "";
+        if (cls.includes("file") || cls.includes("dir")) {
+          liCell = liRow[0]; // name column
+        } else if (cls.includes("size")) {
+          liCell = liRow[1];
+        } else if (cls.includes("date")) {
+          liCell = liRow[2];
+        } else {
+          liCell = null;
+        }
+        el.onEndTag(() => { liCell = null; });
+      },
+      text(t) {
+        if (liCell && !inAnchor) liCell.text += t.text;
+      },
+    })
+    // ── Shared anchor handler (works for both table and UL) ────────────
     .on("a", {
       element(el) {
         inAnchor++;
+        // Table path
         if (cell && cell.href === undefined) {
           const h = el.getAttribute("href");
           if (h != null) cell.href = h;
+        }
+        // UL path — anchor is always inside the name span (col 0)
+        if (liRow && liRow[0].href === undefined) {
+          const h = el.getAttribute("href");
+          if (h != null) liRow[0].href = h;
         }
         el.onEndTag(() => { inAnchor--; });
       },
       text(t) {
         if (cell) cell.text += t.text;
+        if (liCell) liCell.text += t.text;
       },
     })
     .transform(res)
