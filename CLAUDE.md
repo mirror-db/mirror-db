@@ -118,6 +118,10 @@ through these, not bare `fetch`, so user-agent + rate-limiting are uniform.
   and `AptRepo`'s Release fetch — both key on the bare upstream URL. The **OCI
   proxy** does *not* use it: it needs digest-keyed entries + immutable
   `Cache-Control` rewriting, so it calls `mdbfetch` + an injected `cache` directly.
+- **`sanitizeResponse(upstream, opts?)`** — strip dangerous headers
+  (`STRIP_RESPONSE_HEADERS`: `www-authenticate`, `set-cookie`, `vary`, `age`,
+  hop-by-hop) from an upstream response before serving to clients. Optional
+  `cacheControl` override on 200s. Shared by both OCI and APT proxies.
 - Constants in [const.ts](server/pkgs/fetch/const.ts): `CFCacheLimit` (512 MB,
   CF Free/Pro per-object cap) = `MdbCacheSizeLimit`, `MdbMaxConcurrentRequests`,
   `MdbCacheName` (`"upstream"`), `MdbUserAgent`.
@@ -126,16 +130,43 @@ through these, not bare `fetch`, so user-agent + rate-limiting are uniform.
 
 - `server/pkgs/oci/` — reusable OCI components (proxy, creds, www-authenticate,
   host factory). `server/pkgs/apt/` — APT repo index + proxy + status.
-  `server/pkgs/fetch/` — shared upstream fetch + cache helpers (above).
+  `server/pkgs/fetch/` — shared upstream fetch + cache + sanitize helpers.
+  `server/pkgs/web-list/` — upstream directory-listing proxy (see below).
 - `server/mirrors/<name>/` — per-mirror logic + `index.ts` exporting a `Mirror`
   (`{ name, host? | path?, fetch, status? }`). `server/mirrors/index.ts`
   aggregates them.
 - Path alias: `@server/*` → `./server/*`.
 
+## Web listing proxy — [server/pkgs/web-list/](server/pkgs/web-list/)
+
+Generic proxy for upstream sites that serve Apache/nginx autoindex HTML. Used by
+the APT mirror but reusable for any directory-listing upstream.
+
+- **`WebListFs`** — read-only FS abstraction over an upstream listing site. Uses
+  `cachedfetch` by default. `readdir(rel)` streams HTML through `HTMLRewriter`,
+  extracting `<tr>/<th>/<td>/<a>` into a 2D cell array, guesses column semantics
+  (Name/Last modified/Size) via regex, and cleans values into typed
+  `WebListEntry` objects.
+- **`WebListProxy`** — unified request handler exposing three access modes:
+  1. **JSON API**: `?format=json` on any directory → `{ path, entries }`.
+  2. **Web listing**: directory GET → injected `render(entries, path)` callback
+     (or use `defaultRender` for a minimal `<ul>` page).
+  3. **WebDAV (read-only, anonymous)**: `PROPFIND` Depth 0/1 → 207 multistatus,
+     `OPTIONS` → DAV:1. Supports Windows/macOS/Linux native mount.
+  - `fetchHook(path, request)` — optional hook to intercept requests before
+    default handling (APT proxy uses this for existence enforcement + caching).
+  - `baseHref` — prefix for `<D:href>` in PROPFIND responses (must match the
+    mount point for Windows WebClient compatibility).
+- **`parseListing`** — two-stage: `collectRows` (HTMLRewriter, Workers-only) →
+  `rowsToEntries` (pure, testable in Node). Handles text-chunk deduplication
+  between `<td>` and nested `<a>` via `inAnchor` depth tracking.
+- **`webdav.ts`** — hand-crafted RFC 4918 class 1 responses (no XML library
+  needed). `propfindResponse`, `optionsResponse`, `methodNotAllowed`.
+
 ## Commands
 
 ```
-pnpm test          # unit (vitest, node env, cloudflare:workers stubbed)
+pnpm test          # unit: both "node" + "workers" vitest projects
 pnpm test:e2e      # e2e: builds + spawns `wrangler dev --remote`, real pull
 pnpm type-check
 pnpm build
@@ -153,8 +184,13 @@ post-deploy).
 
 ## Testing notes
 
-- `cloudflare:workers` virtual module stubbed in
-  [server/test-stubs/cloudflare-workers.ts](server/test-stubs/cloudflare-workers.ts).
+- Two vitest projects ([vitest.config.ts](vitest.config.ts)):
+  - **`node`** — `*.test.ts`. Plain Node env, `cloudflare:workers` stubbed
+    ([server/test-stubs/cloudflare-workers.ts](server/test-stubs/cloudflare-workers.ts)).
+    Pure logic, mocked fetch.
+  - **`workers`** — `*.workers.test.ts`. Runs inside workerd via
+    `@cloudflare/vitest-pool-workers` ([vitest.workers.config.ts](vitest.workers.config.ts)).
+    Real `HTMLRewriter`, `caches`, etc. Used by `web-list` parsing tests.
 - `caches` global absent in Node → `defaultCache()` returns `undefined` outside
   the runtime; caching is a no-op in unit tests unless a mock `cache` is passed.
 - Node `Response(str)` does **not** auto-set `Content-Length` → cache tests must
