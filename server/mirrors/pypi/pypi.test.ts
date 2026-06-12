@@ -24,7 +24,7 @@ beforeEach(() => {
 describe("pypi mirror", () => {
   it("has correct name and path", () => {
     expect(pypi.name).toBe("pypi");
-    expect(pypi.path).toBe("/pypi/");
+    expect(pypi.path).toBe("pypi");
   });
 
   it("proxies JSON API to pypi.org", async () => {

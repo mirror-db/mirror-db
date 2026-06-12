@@ -29,17 +29,12 @@ export const mirrorsBySubdomain: Map<string, Mirror> = new Map(
   mirrors.filter((m) => m.host).map((m) => [m.host as string, m]),
 );
 
-/** All mirrors, keyed by name — used by the `/status/<name>` endpoint. */
+/** All mirrors, keyed by name — used by the `/api/status/:name` endpoint. */
 export const mirrorsByName: Map<string, Mirror> = new Map(
   mirrors.map((m) => [m.name, m]),
 );
 
-// Path-routed mirrors, longest prefix first so the most specific one wins.
-const pathRouted: Mirror[] = mirrors
-  .filter((m) => m.path)
-  .sort((a, b) => (b.path as string).length - (a.path as string).length);
-
-/** Find the path-routed mirror whose prefix matches `pathname`, or undefined. */
-export function matchMirrorPath(pathname: string): Mirror | undefined {
-  return pathRouted.find((m) => pathname.startsWith(m.path as string));
-}
+/** Path-routed mirrors, keyed by path segment (e.g. `"npm"`). */
+export const mirrorsByPath: Map<string, Mirror> = new Map(
+  mirrors.filter((m) => m.path).map((m) => [m.path as string, m]),
+);

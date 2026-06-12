@@ -9,6 +9,7 @@
  */
 
 import { cachedfetch } from "@server/pkgs/fetch";
+import urlJoin from "url-join";
 
 import { parseListing, type WebListEntry } from "./parse";
 import type { WebListParserFactory } from "./parsers";
@@ -50,7 +51,10 @@ export class WebListFs {
 
   /** Resolve a repo-relative path against the base. */
   url(rel = ""): string {
-    return new URL(rel, this.base).toString();
+    const joined = urlJoin(this.base, rel);
+    // Preserve trailing slash — url-join strips it but directory semantics depend on it.
+    const shouldSlash = rel ? rel.endsWith("/") : this.base.endsWith("/");
+    return shouldSlash && !joined.endsWith("/") ? joined + "/" : joined;
   }
 
   /** Fetch a single path under the base (a file, or a raw listing page). */

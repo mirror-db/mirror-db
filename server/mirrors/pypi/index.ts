@@ -18,11 +18,12 @@ import type { Mirror } from "@server/types";
 const PYPI_ORIGIN = "https://pypi.org";
 const FILES_ORIGIN = "https://files.pythonhosted.org";
 
-const PREFIX = "/pypi/";
+const PATH = "pypi";
+const PREFIX = `/${PATH}/`;
 
 export const pypi: Mirror = {
   name: "pypi",
-  path: PREFIX,
+  path: PATH,
   async fetch(request) {
     const url = new URL(request.url);
     const rel = url.pathname.slice(PREFIX.length);

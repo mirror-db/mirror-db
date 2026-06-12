@@ -12,6 +12,7 @@ import { defaultRender } from "@server/pkgs/web-list/render";
 import type { WebListParserFactory } from "@server/pkgs/web-list/parsers";
 import { cachedfetch, sanitizeResponse } from "@server/pkgs/fetch";
 import type { Mirror } from "@server/types";
+import urlJoin from "url-join";
 
 export interface WebMirrorConfig {
   /** Mirror name — determines the path as `/<name>/`. */
@@ -41,7 +42,7 @@ export function createWebListMirror(config: WebMirrorConfig): Mirror {
 
   return {
     name: config.name,
-    path: prefix,
+    path: config.name,
     fetch(request) {
       const url = new URL(request.url);
       const rel = url.pathname.slice(prefix.length);
@@ -60,11 +61,11 @@ export function createPassthroughMirror(config: WebMirrorConfig): Mirror {
 
   return {
     name: config.name,
-    path: prefix,
+    path: config.name,
     async fetch(request) {
       const url = new URL(request.url);
       const rel = url.pathname.slice(prefix.length);
-      const target = new URL(rel + url.search, config.base).toString();
+      const target = urlJoin(config.base, rel) + url.search;
       const upstream = await cachedfetch(target);
       return sanitizeResponse(upstream);
     },

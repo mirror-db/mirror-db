@@ -9,19 +9,38 @@ challenges never reach clients.
 
 `BASE_DOMAIN` = `mirs.uk`. Every mirror implements the `Mirror` interface
 ([server/types.ts](server/types.ts)): `name`, optional `host` (subdomain route,
-e.g. `dcr.mirs.uk` → Docker Hub) or `path` (prefix route on the bare `@`
-subdomain, e.g. `mirs.uk/debian/`), `fetch`, optional `status()`.
+e.g. `dcr.mirs.uk` → Docker Hub) or `path` (single word, matched as the first
+URL segment, e.g. `mirs.uk/npm/...`), `fetch(request, ctx?)`, optional
+`status()`.
 
-- [server/index.ts](server/index.ts) — entry. Parses subdomain. Subdomain
-  mirror wins first; on the bare `@` it serves `/status/<name>`, then path
-  mirrors, then `/api/`, then the static SPA. 404 if no host header / wrong domain.
+- [server/index.ts](server/index.ts) — entry. Runs `relayMiddleware` first,
+  then parses subdomain from host header. Subdomain mirror wins; on bare `@`
+  splits pathname, looks up first segment in `mirrorsByPath`, then falls through
+  to Hono API (`/api/`), then static SPA.
 - [server/mirrors/index.ts](server/mirrors/index.ts) — aggregates every mirror
-  into one `mirrors` array plus lookups: `mirrorsBySubdomain`, `mirrorsByName`
-  (for `/status/<name>`), `matchMirrorPath` (longest-prefix). Simple passthrough
-  registries declared inline via `createRegistryHost`; mirrors needing logic
-  (login, path rewrite, an index) live in their own subdir under `mirrors/`.
-- `GET mirs.uk/status/<name>` → that mirror's `status()` (404 if no such mirror
-  or no `status()`).
+  into `mirrors` array plus lookups: `mirrorsBySubdomain`, `mirrorsByName`,
+  `mirrorsByPath`. Simple passthrough registries declared inline via
+  `createRegistryHost`; mirrors needing logic (login, path rewrite, an index)
+  live in their own subdir under `mirrors/`.
+- [server/api/index.ts](server/api/index.ts) — Hono app at `/api/`. Endpoints:
+  - `GET /api/mirrors` — JSON manifest of all mirrors (for relay discovery).
+  - `GET /api/status/:name` — per-mirror status snapshot.
+
+### Relay — [server/relay/index.ts](server/relay/index.ts)
+
+`relayMiddleware(request): Request` — pure request rewrite for domestic relay
+servers that access all mirrors through a single domain.
+
+Convention:
+- `/@relay/@<subdomain>/<path>` → rewrites host to `<subdomain>.<BASE_DOMAIN>`,
+  path to `/<path>`. E.g. `/@relay/@dcr/v2/...` → `dcr.mirs.uk/v2/...`.
+- `/@relay/<path>` → strips prefix, keeps same host.
+  E.g. `/@relay/npm/react` → `mirs.uk/npm/react`.
+
+After rewrite, request is indistinguishable from a direct request — downstream
+routing works unchanged. Relay client sends `X-MDB-Relay-Host: <its-domain>` so
+mirrors that rewrite absolute URLs (npm, pypi) can emit correct links via
+`MirrorContext.relay.host`.
 
 ### Mirrors
 
@@ -132,9 +151,13 @@ through these, not bare `fetch`, so user-agent + rate-limiting are uniform.
   host factory). `server/pkgs/apt/` — APT repo index + proxy + status.
   `server/pkgs/fetch/` — shared upstream fetch + cache + sanitize helpers.
   `server/pkgs/web-list/` — upstream directory-listing proxy (see below).
+- `server/relay/` — relay middleware (request rewrite for single-domain access).
+- `server/api/` — Hono API routes.
 - `server/mirrors/<name>/` — per-mirror logic + `index.ts` exporting a `Mirror`
   (`{ name, host? | path?, fetch, status? }`). `server/mirrors/index.ts`
   aggregates them.
+- `tools/relay/` — Go relay server (domestic proxy that talks to the Worker via
+  `/@relay/`).
 - Path alias: `@server/*` → `./server/*`.
 
 ## Web listing proxy — [server/pkgs/web-list/](server/pkgs/web-list/)

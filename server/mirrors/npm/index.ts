@@ -17,11 +17,12 @@ import { cachedfetch, sanitizeResponse } from "@server/pkgs/fetch";
 import type { Mirror } from "@server/types";
 
 const UPSTREAM = "https://registry.npmjs.org";
-const PREFIX = "/npm/";
+const PATH = "npm";
+const PREFIX = `/${PATH}/`;
 
 export const npm: Mirror = {
   name: "npm",
-  path: PREFIX,
+  path: PATH,
   async fetch(request) {
     const url = new URL(request.url);
     const rel = url.pathname.slice(PREFIX.length);

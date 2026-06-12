@@ -17,6 +17,7 @@ import { Release } from "apt-parser";
 
 import { cachedfetch } from "@server/pkgs/fetch";
 import { WebListFs, type WebListFetch } from "@server/pkgs/web-list";
+import urlJoin from "url-join";
 
 import { analyzeApt, toSuiteMeta, type AptMirrorStatus } from "./status";
 
@@ -236,7 +237,7 @@ export class AptRepo {
 
   /** Resolve a repo-relative path against the upstream base. */
   url(rel: string): string {
-    return new URL(rel, this.base).toString();
+    return urlJoin(this.base, rel);
   }
 }
 

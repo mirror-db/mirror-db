@@ -35,7 +35,7 @@ export function createAptMirror(config: AptMirrorConfig): Mirror {
 
   return {
     name: config.name,
-    path: prefix,
+    path: config.name,
     fetch(request) {
       const url = new URL(request.url);
       const rel = url.pathname.slice(prefix.length);

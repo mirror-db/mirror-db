@@ -23,7 +23,7 @@ beforeEach(() => {
 describe("npm mirror", () => {
   it("has correct name and path", () => {
     expect(npm.name).toBe("npm");
-    expect(npm.path).toBe("/npm/");
+    expect(npm.path).toBe("npm");
   });
 
   it("rewrites tarball URLs in JSON metadata", async () => {
