@@ -2,12 +2,12 @@ import { createRegistryHost } from "@server/pkgs/oci/host";
 import type { Mirror } from "@server/types";
 
 import docker from "./docker";
-import debian from "./debian";
+import { aptMirrors } from "./apt-mirrors";
 
 // Simple anonymous-passthrough OCI registries — the proxy follows each
 // registry's own token challenge, so only the upstream host differs. Mirrors
 // needing extra logic (login, path rewrites, an index) live in their own
-// subdirectory, like ./docker and ./debian.
+// subdirectory, like ./docker.
 const simpleRegistries: Mirror[] = [
   createRegistryHost({ host: "ghcr", upstream: "ghcr.io" }),
   createRegistryHost({ host: "gcr", upstream: "gcr.io" }),
@@ -19,7 +19,7 @@ const simpleRegistries: Mirror[] = [
 ];
 
 /** Every mirror, regardless of how it is routed (subdomain or path prefix). */
-export const mirrors: Mirror[] = [docker, ...simpleRegistries, debian];
+export const mirrors: Mirror[] = [docker, ...simpleRegistries, ...aptMirrors];
 
 /** Subdomain-routed mirrors, keyed by subdomain (e.g. `"dcr"`). */
 export const mirrorsBySubdomain: Map<string, Mirror> = new Map(
