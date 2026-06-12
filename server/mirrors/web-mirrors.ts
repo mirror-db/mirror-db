@@ -43,8 +43,24 @@ const webListConfigs: WebMirrorConfig[] = [
  */
 const passthroughConfigs: WebMirrorConfig[] = [
   {
+    name: "anaconda",
+    base: "https://repo.anaconda.com/",
+  },
+  {
+    name: "gh-proxy",
+    base: "https://gh-proxy.com/",
+  },
+  {
+    name: "go-releases",
+    base: "https://go.dev/dl/",
+  },
+  {
     name: "hashicorp",
     base: "https://apt.releases.hashicorp.com/",
+  },
+  {
+    name: "kube-releases",
+    base: "https://dl.k8s.io/",
   },
   {
     name: "kubernetes",
@@ -53,6 +69,10 @@ const passthroughConfigs: WebMirrorConfig[] = [
   {
     name: "libnvidia-container",
     base: "https://nvidia.github.io/libnvidia-container/",
+  },
+  {
+    name: "nodejs",
+    base: "https://nodejs.org/dist/",
   },
 ];
 
