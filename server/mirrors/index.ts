@@ -3,6 +3,7 @@ import type { Mirror } from "@server/types";
 
 import docker from "./docker";
 import { aptMirrors } from "./apt-mirrors";
+import { webMirrors } from "./web-mirrors";
 
 // Simple anonymous-passthrough OCI registries — the proxy follows each
 // registry's own token challenge, so only the upstream host differs. Mirrors
@@ -19,7 +20,7 @@ const simpleRegistries: Mirror[] = [
 ];
 
 /** Every mirror, regardless of how it is routed (subdomain or path prefix). */
-export const mirrors: Mirror[] = [docker, ...simpleRegistries, ...aptMirrors];
+export const mirrors: Mirror[] = [docker, ...simpleRegistries, ...aptMirrors, ...webMirrors];
 
 /** Subdomain-routed mirrors, keyed by subdomain (e.g. `"dcr"`). */
 export const mirrorsBySubdomain: Map<string, Mirror> = new Map(

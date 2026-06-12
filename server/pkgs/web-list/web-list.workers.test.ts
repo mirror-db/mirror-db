@@ -4,6 +4,9 @@ import { describe, expect, it } from "vitest";
 import debianHtml from "./__fixtures__/cloudflaremirrors-debian.html?raw";
 import ubuntuHtml from "./__fixtures__/nl-archive-ubuntu.html?raw";
 import nvidiaHtml from "./__fixtures__/nvidia-cuda-repos.html?raw";
+import releasesUbuntuHtml from "./__fixtures__/releases-ubuntu.html?raw";
+import cdimageUbuntuHtml from "./__fixtures__/cdimage-ubuntu.html?raw";
+import microsoftHtml from "./__fixtures__/packages-microsoft.html?raw";
 import { WebListFs, type WebListEntry } from "./web-list";
 
 // Runs in the workers pool → real HTMLRewriter. The fetch impl is stubbed so
@@ -138,5 +141,87 @@ describe("WebListFs.readdir — developer.download.nvidia.com (UL-based)", () =>
     });
     expect(map["debian12"]).toMatchObject({ type: "directory", href: "debian12/" });
     expect(map["ubuntu2404"]).toMatchObject({ type: "directory", href: "ubuntu2404/" });
+  });
+});
+
+describe("WebListFs.readdir — releases.ubuntu.com (pre-based)", () => {
+  it("parses <pre>-based Apache autoindex listing", async () => {
+    const { fs } = fsFor("https://releases.ubuntu.com/", releasesUbuntuHtml);
+    const entries = await fs.readdir();
+    const map = byName(entries);
+
+    // Sort links (?C=...) and absolute URLs are excluded.
+    expect(Object.keys(map).length).toBeGreaterThanOrEqual(20);
+
+    // Directories are correctly typed
+    expect(map["noble"]).toMatchObject({
+      type: "directory",
+      href: "noble/",
+      size: null,
+    });
+    expect(map["noble"].lastModified?.toISOString()).toBe("2026-03-10T17:24:00.000Z");
+
+    expect(map["jammy"]).toMatchObject({ type: "directory", href: "jammy/" });
+    expect(map["resolute"]).toMatchObject({ type: "directory", href: "resolute/" });
+    expect(map["26.04"]).toMatchObject({ type: "directory", href: "26.04/" });
+
+    // Verify versioned entries
+    expect(map["14.04.6"]).toMatchObject({
+      type: "directory",
+      href: "14.04.6/",
+    });
+    expect(map["14.04.6"].lastModified?.toISOString()).toBe("2025-07-31T15:39:00.000Z");
+
+    // Size is `-` for all directories → null
+    for (const e of entries) {
+      expect(e.size).toBeNull();
+    }
+  });
+});
+
+describe("WebListFs.readdir — cdimage.ubuntu.com (bare <ul>/<li>)", () => {
+  it("parses classless Apache <ul> listing with no metadata", async () => {
+    const { fs } = fsFor("https://cdimage.ubuntu.com/", cdimageUbuntuHtml);
+    const entries = await fs.readdir();
+    const map = byName(entries);
+
+    // All entries from the bare <ul> listing (Parent Directory excluded via /).
+    expect(Object.keys(map).length).toBeGreaterThanOrEqual(20);
+
+    // Known directories
+    expect(map["ubuntu"]).toMatchObject({
+      type: "directory",
+      href: "ubuntu/",
+    });
+    expect(map["kubuntu"]).toMatchObject({ type: "directory", href: "kubuntu/" });
+    expect(map["xubuntu"]).toMatchObject({ type: "directory", href: "xubuntu/" });
+    expect(map["noble"]).toMatchObject({ type: "directory", href: "noble/" });
+
+    // No metadata in this format
+    for (const e of entries) {
+      expect(e.lastModified).toBeNull();
+      expect(e.size).toBeNull();
+    }
+  });
+});
+
+describe("WebListFs.readdir — packages.microsoft.com (multi-pre)", () => {
+  it("parses <pre>-based listing with introductory text block", async () => {
+    const { fs } = fsFor("https://packages.microsoft.com/", microsoftHtml);
+    const entries = await fs.readdir();
+    const map = byName(entries);
+
+    // Real directory entries from the listing <pre> block
+    expect(map["ubuntu"]).toMatchObject({ type: "directory", href: "ubuntu/" });
+    expect(map["debian"]).toMatchObject({ type: "directory", href: "debian/" });
+    expect(map["fedora"]).toMatchObject({ type: "directory", href: "fedora/" });
+    expect(map["keys"]).toMatchObject({ type: "directory", href: "keys/" });
+    expect(map["repos"]).toMatchObject({ type: "directory", href: "repos/" });
+
+    // Date format is DD-Mon-YYYY — not ISO, so cleanLastModified returns null
+    expect(map["ubuntu"].lastModified).toBeNull();
+
+    // No sizes (all `-`)
+    expect(map["ubuntu"].size).toBeNull();
   });
 });

@@ -11,6 +11,7 @@
 import { cachedfetch } from "@server/pkgs/fetch";
 
 import { parseListing, type WebListEntry } from "./parse";
+import type { WebListParserFactory } from "./parsers";
 
 export type { WebListEntry, WebListEntryType } from "./parse";
 
@@ -22,16 +23,29 @@ export type WebListFetch = (
 export interface WebListFsOptions {
   /** Injected fetch (defaults to {@link cachedfetch}). */
   fetchImpl?: WebListFetch;
+  /**
+   * Parser factories to use for `readdir`. Can be:
+   * - An array of factories (static, used for all paths).
+   * - A function `(path) => factories[]` (dynamic, per-path selection).
+   *
+   * Defaults to all known parsers (table, ul, pre).
+   */
+  parsers?: WebListParserFactory[] | ((path: string) => WebListParserFactory[]);
 }
 
 export class WebListFs {
   /** Upstream prefix, always ending in `/`. */
   readonly base: string;
   private readonly fetchImpl: WebListFetch;
+  private readonly parsers:
+    | WebListParserFactory[]
+    | ((path: string) => WebListParserFactory[])
+    | undefined;
 
   constructor(base: string, opts: WebListFsOptions = {}) {
     this.base = base.endsWith("/") ? base : `${base}/`;
     this.fetchImpl = opts.fetchImpl ?? (cachedfetch as WebListFetch);
+    this.parsers = opts.parsers;
   }
 
   /** Resolve a repo-relative path against the base. */
@@ -55,6 +69,9 @@ export class WebListFs {
     if (!res.ok) {
       throw new Error(`readdir ${this.url(dir)} failed: ${res.status}`);
     }
-    return parseListing(res);
+    const factories = typeof this.parsers === "function"
+      ? this.parsers(dir)
+      : this.parsers;
+    return parseListing(res, factories);
   }
 }

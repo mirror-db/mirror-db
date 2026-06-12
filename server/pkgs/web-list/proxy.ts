@@ -18,6 +18,7 @@
  */
 
 import type { WebListEntry } from "./parse";
+import type { WebListParserFactory } from "./parsers";
 import { WebListFs, type WebListFetch } from "./web-list";
 import { methodNotAllowed, optionsResponse, propfindResponse } from "./webdav";
 
@@ -43,6 +44,12 @@ export interface WebListProxyOptions {
   /** Optional: inject fetch impl (for tests / custom caching). */
   fetchImpl?: WebListFetch;
   /**
+   * Optional: parser factories for listing parsing. Can be a static array or a
+   * function `(path) => factories[]` for per-path selection. Defaults to all
+   * known parsers.
+   */
+  parsers?: WebListParserFactory[] | ((path: string) => WebListParserFactory[]);
+  /**
    * Optional hook to intercept requests before normal handling.
    * Called with the relative path and original request. Return a `Response` to
    * short-circuit; return `null`/`undefined` to continue with default behavior.
@@ -67,7 +74,10 @@ export class WebListProxy {
   private readonly baseHref: string;
 
   constructor(opts: WebListProxyOptions) {
-    this.fs = new WebListFs(opts.baseURL, { fetchImpl: opts.fetchImpl });
+    this.fs = new WebListFs(opts.baseURL, {
+      fetchImpl: opts.fetchImpl,
+      parsers: opts.parsers,
+    });
     this.render = opts.render;
     this.fetchHook = opts.fetchHook;
     const href = opts.baseHref ?? "/";
