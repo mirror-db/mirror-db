@@ -29,22 +29,23 @@ export const npm: Mirror = {
     const target = `${UPSTREAM}/${rel}${url.search}`;
 
     const upstream = await cachedfetch(target);
+    const sanitized = sanitizeResponse(upstream);
 
     // Only rewrite JSON metadata responses — tarballs and other content pass through.
-    const ct = upstream.headers.get("content-type") ?? "";
+    const ct = sanitized.headers.get("content-type") ?? "";
     if (!ct.includes("json")) {
-      return sanitizeResponse(upstream);
+      return sanitized;
     }
 
     // Rewrite tarball URLs from registry.npmjs.org to our mirror prefix.
     const origin = new URL(request.url).origin;
     const mirrorBase = `${origin}${PREFIX}`;
-    const body = await upstream.text();
+    const body = await sanitized.text();
     const rewritten = body.replaceAll(`${UPSTREAM}/`, mirrorBase);
 
     return new Response(rewritten, {
-      status: upstream.status,
-      headers: sanitizeResponse(upstream).headers,
+      status: sanitized.status,
+      headers: sanitized.headers,
     });
   },
 };

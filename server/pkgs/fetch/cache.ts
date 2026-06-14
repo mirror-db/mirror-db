@@ -85,6 +85,9 @@ export const cachedfetch = (async (reqInfo, arg2, arg3) => {
   if (resp) return resp;
 
   resp = await mdbfetch(req);
-  if (resp) await mdbCache.save(req, resp.clone());
+  // Don't await — both sides of the tee must be consumed in parallel.
+  // Awaiting here would block the client read, causing tee buffer overflow
+  // on large responses.
+  if (resp) mdbCache.save(req, resp.clone());
   return resp;
 }) as typeof ezfetch;
