@@ -6,6 +6,7 @@ import {
 } from "./mirrors";
 import { relayMiddleware } from "./relay";
 import { api } from "./api";
+import { handleSpeedtest } from "./speedtest";
 import type { MirrorContext } from "./types";
 
 /** Header the relay client sends to declare its public hostname. */
@@ -33,7 +34,9 @@ export default {
 
     // Path-routed mirrors + API on the bare domain.
     if (subdomain === "@") {
-      const [, firstSeg] = url.pathname.split("/");
+      const [, firstSeg, ...rest] = url.pathname.split("/");
+
+      if (firstSeg === "speedtest") return handleSpeedtest(request, rest[0]);
 
       const pathMirror = firstSeg && mirrorsByPath.get(firstSeg);
       if (pathMirror) return pathMirror.fetch(request, mctx);

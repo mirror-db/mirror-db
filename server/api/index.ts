@@ -9,12 +9,12 @@ export const api = new Hono().basePath("/api");
 
 /** Mirror manifest — lists all available mirrors for relay discovery. */
 api.get("/mirrors", (c) => {
-  const entries = mirrors.map((m) => {
-    if (m.host) {
-      return { name: m.name, type: "host" as const, host: m.host };
-    }
-    return { name: m.name, type: "path" as const, path: m.path };
-  });
+  const entries = mirrors.map((m) => ({
+    name: m.name,
+    ...(m.host && { host: m.host }),
+    ...(m.path && { path: m.path }),
+    ...(m.keepHTTP && { keepHTTP: true }),
+  }));
   return c.json({ mirrors: entries });
 });
 
