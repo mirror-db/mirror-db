@@ -10,8 +10,8 @@ challenges never reach clients.
 `BASE_DOMAIN` = `mirs.uk`. Every mirror implements the `Mirror` interface
 ([server/types.ts](server/types.ts)): `name`, optional `host` (subdomain route,
 e.g. `dcr.mirs.uk` → Docker Hub) or `path` (single word, matched as the first
-URL segment, e.g. `mirs.uk/npm/...`), `fetch(request, ctx?)`, optional
-`status()`.
+URL segment, e.g. `mirs.uk/npm/...`), optional `keepHTTP` (serve over plain HTTP
+without redirect), `fetch(request, ctx?)`, optional `status()`.
 
 - [server/index.ts](server/index.ts) — entry. Runs `relayMiddleware` first,
   then parses subdomain from host header. Subdomain mirror wins; on bare `@`
@@ -24,7 +24,11 @@ URL segment, e.g. `mirs.uk/npm/...`), `fetch(request, ctx?)`, optional
   live in their own subdir under `mirrors/`.
 - [server/api/index.ts](server/api/index.ts) — Hono app at `/api/`. Endpoints:
   - `GET /api/mirrors` — JSON manifest of all mirrors (for relay discovery).
+    Includes `keepHTTP` flag for mirrors that allow plain HTTP.
   - `GET /api/status/:name` — per-mirror status snapshot.
+- [server/speedtest.ts](server/speedtest.ts) — `GET /speedtest/{mb}` on bare
+  domain. Streams random bytes (1–1024 MB) via `ReadableStream` +
+  `crypto.getRandomValues`. Ignores `?passthrough` (Worker is always origin).
 
 ### Relay — [server/relay/index.ts](server/relay/index.ts)
 
@@ -159,7 +163,7 @@ through these, not bare `fetch`, so user-agent + rate-limiting are uniform.
   (`{ name, host? | path?, fetch, status? }`). `server/mirrors/index.ts`
   aggregates them.
 - `tools/relay/` — Go relay server (domestic proxy that talks to the Worker via
-  `/@relay/`).
+  `/@relay/`). See [Relay server](#relay-server) below.
 - Path alias: `@server/*` → `./server/*`.
 
 ## Upstream proxy builder — [server/mirrors/proxy/](server/mirrors/proxy/)
@@ -249,3 +253,78 @@ post-deploy).
   the runtime; caching is a no-op in unit tests unless a mock `cache` is passed.
 - Node `Response(str)` does **not** auto-set `Content-Length` → cache tests must
   set it explicitly (size guard requires it).
+
+## Relay server — [tools/relay/](tools/relay/)
+
+Go binary (`relay serve`) — domestic reverse proxy sitting between end-users and
+the Worker. Discovers mirrors from upstream, terminates TLS via certmagic, proxies
+all traffic through the `/@relay/` convention.
+
+### Architecture
+
+```
+Client → relay (HTTPS) → Worker (CF edge)
+Client → relay A → relay B → Worker   (multi-tier)
+```
+
+Each relay layer:
+1. **Entry**: `stripRelayPrefix` — if path starts with `/@relay/`, rewrite host/path
+   (same logic as Worker's `relayMiddleware`). This lets multi-tier chains work
+   without double-prefixing.
+2. **Handler**: normal routing (subdomain check, path match).
+3. **Exit**: construct `/@relay/` path, proxy to upstream.
+
+`X-MDB-Relay-Host` set only on the first relay (not overwritten by upper relays).
+
+### Config — [tools/relay/config/](tools/relay/config/)
+
+YAML (`/etc/mirror-relay/config.yaml`) + env override (dots → underscores).
+
+```yaml
+relay:
+  # disguise_port: 344      # SSH-disguised TLS listener
+  base_domains:
+    - domain: relay.example.com
+      cf_api_token: ""
+
+upstream:
+  url: "https://mirs.uk"
+  # pool_size: 25            # CF edge node pool (default 25, active rotation 3)
+  # disguise_port: 344       # connect via SSH-disguised TLS
+
+acme:
+  source: acme               # "acme" | "upstream" | URL origin
+```
+
+`acme.source`:
+- `acme` — DNS-01 via Let's Encrypt (needs `cf_api_token` per domain).
+- `upstream` — sync cert-pack from `upstream.url`.
+- URL (e.g. `https://upper.example.com`) — sync cert-pack from that origin.
+
+### Upstream transport
+
+- **CF fastest-node** (default): `NewPoolManagerWithFile(poolSize, cf-nodes.csv)`,
+  `UpstreamCount: 3`. Pool auto-refreshes when depleted.
+- **SSH disguise** (`upstream.disguise_port`): `disguiseDialTLS` exchanges SSH
+  banner then does TLS handshake. Bypasses HTTPS-targeted DPI throttling.
+
+### Speedtest
+
+`GET /speedtest/{mb}?passthrough=n` — when `passthrough > 0`, proxies to upstream
+with `passthrough - 1`; when 0 or absent, serves random bytes locally.
+
+### Key files
+
+- `tools/relay/server/server.go` — Server, routers, proxy, `stripRelayPrefix`.
+- `tools/relay/server/certmagic.go` — TLS with per-domain DNS-01 or cert-pack.
+- `tools/relay/server/disguise.go` — SSH banner exchange (listener + dialer).
+- `tools/relay/server/speedtest.go` — `/speedtest/{mb}` handler with passthrough.
+- `tools/relay/forward/forward.go` — `relay forward` L4 TCP forwarder.
+- `tools/relay/install/install.go` — `relay install` systemd setup.
+- `tools/relay/uninstall.sh` — clean removal (handles old + new installs).
+
+### Build
+
+```bash
+cd tools/relay && go build -o relay
+```
