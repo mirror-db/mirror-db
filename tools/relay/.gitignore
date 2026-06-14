@@ -1,2 +1,5 @@
 # Go build output
 relay
+
+# Config
+.env
