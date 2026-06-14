@@ -6,18 +6,24 @@ vi.mock("@server/pkgs/fetch", () => ({
 }));
 
 import { npm } from "./index";
-import { cachedfetch, sanitizeResponse } from "@server/pkgs/fetch";
+import { cachedfetch } from "@server/pkgs/fetch";
 
 const mockCachedfetch = cachedfetch as ReturnType<typeof vi.fn>;
-const mockSanitize = sanitizeResponse as ReturnType<typeof vi.fn>;
 
 function makeRequest(path: string): Request {
   return new Request(`https://mirs.uk${path}`);
 }
 
+/** Extract the URL string from the first argument of a cachedfetch call. */
+function fetchedUrl(callIndex = 0): string {
+  const arg = mockCachedfetch.mock.calls[callIndex][0];
+  if (arg instanceof Request) return arg.url;
+  if (arg instanceof URL) return arg.toString();
+  return String(arg);
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
-  mockSanitize.mockImplementation((res: Response) => res);
 });
 
 describe("npm mirror", () => {
@@ -49,7 +55,7 @@ describe("npm mirror", () => {
     expect(parsed.versions["4.17.21"].dist.tarball).toBe(
       "https://mirs.uk/npm/lodash/-/lodash-4.17.21.tgz",
     );
-    expect(mockCachedfetch).toHaveBeenCalledWith("https://registry.npmjs.org/lodash");
+    expect(fetchedUrl()).toBe("https://registry.npmjs.org/lodash");
   });
 
   it("rewrites scoped package tarball URLs", async () => {
@@ -85,19 +91,19 @@ describe("npm mirror", () => {
 
     const res = await npm.fetch(makeRequest("/npm/lodash/-/lodash-4.17.21.tgz"));
     expect(await res.text()).toBe("binary-data");
-    expect(mockCachedfetch).toHaveBeenCalledWith(
+    expect(fetchedUrl()).toBe(
       "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
     );
   });
 
-  it("passes through search API", async () => {
+  it("passes through search API with query string", async () => {
     const results = JSON.stringify({ objects: [] });
     mockCachedfetch.mockResolvedValue(
       new Response(results, { headers: { "content-type": "application/json" } }),
     );
 
     await npm.fetch(makeRequest("/npm/-/v1/search?text=lodash"));
-    expect(mockCachedfetch).toHaveBeenCalledWith(
+    expect(fetchedUrl()).toBe(
       "https://registry.npmjs.org/-/v1/search?text=lodash",
     );
   });

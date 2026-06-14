@@ -1,6 +1,7 @@
 import { MdbCacheName, MdbCacheSizeLimit } from "./const";
 import { buildRequest, ezfetch, mdbfetch } from "./fetch";
 import { parseContentLength, parseRange } from "./http";
+import { waitUntil } from "cloudflare:workers";
 
 export type MdbCache = string | Cache | undefined | Promise<Cache>;
 
@@ -81,13 +82,20 @@ export const mdbCache = new MdbCacheManager();
 export const cachedfetch = (async (reqInfo, arg2, arg3) => {
   const req = buildRequest(reqInfo, arg2, arg3);
 
-  let resp = await mdbCache.match(req);
-  if (resp) return resp;
+  // Skip cache for range requests — a 206 partial keyed by full URL would
+  // serve incomplete content to subsequent non-range requests.
+  const hasRange = req.headers.has("range");
 
-  resp = await mdbfetch(req);
-  // Don't await — both sides of the tee must be consumed in parallel.
-  // Awaiting here would block the client read, causing tee buffer overflow
-  // on large responses.
-  if (resp) mdbCache.save(req, resp.clone());
+  if (!hasRange) {
+    const cached = await mdbCache.match(req);
+    if (cached) return cached;
+  }
+
+  const resp = await mdbfetch(req);
+
+  // Only cache successful, complete responses.
+  if (resp.ok && !hasRange) {
+    waitUntil(mdbCache.save(req, resp.clone()));
+  }
   return resp;
 }) as typeof ezfetch;

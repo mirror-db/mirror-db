@@ -10,9 +10,8 @@
 import { WebListProxy } from "@server/pkgs/web-list/proxy";
 import { defaultRender } from "@server/pkgs/web-list/render";
 import type { WebListParserFactory } from "@server/pkgs/web-list/parsers";
-import { cachedfetch, sanitizeResponse } from "@server/pkgs/fetch";
+import { upstreamProxy } from "./proxy";
 import type { Mirror } from "@server/types";
-import urlJoin from "url-join";
 
 export interface WebMirrorConfig {
   /** Mirror name — determines the path as `/<name>/`. */
@@ -57,17 +56,12 @@ export function createWebListMirror(config: WebMirrorConfig): Mirror {
  * upstream. No directory listing — just cached fetch + header sanitization.
  */
 export function createPassthroughMirror(config: WebMirrorConfig): Mirror {
-  const prefix = `/${config.name}/`;
+  const prefix = `/${config.name}`;
+  const proxy = upstreamProxy({ url: config.base, prefix });
 
   return {
     name: config.name,
     path: config.name,
-    async fetch(request) {
-      const url = new URL(request.url);
-      const rel = url.pathname.slice(prefix.length);
-      const target = urlJoin(config.base, rel) + url.search;
-      const upstream = await cachedfetch(target);
-      return sanitizeResponse(upstream);
-    },
+    fetch: (request) => proxy.apply(request),
   };
 }

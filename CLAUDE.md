@@ -122,21 +122,22 @@ through these, not bare `fetch`, so user-agent + rate-limiting are uniform.
   a `Request`, sets `user-agent: mirror-db/0.0.0-dev` ([`MdbUserAgent`](server/pkgs/fetch/const.ts))
   if absent, and runs every call through a shared `p-limit` gate
   (`MdbMaxConcurrentRequests` = 64 concurrent). It is the default `fetchImpl`
-  for both proxies ([oci/registry-proxy.ts](server/pkgs/oci/registry-proxy.ts),
-  [apt/proxy.ts](server/pkgs/apt/proxy.ts)) and `AptRepo`. **Gotcha:** it hands a
+  for OCI registry-proxy and Docker credential validation. **Gotcha:** it hands a
   `Request` to global `fetch`, not `(url, init)` — a `fetch` stub must read
   `input.url`, not `input.toString()`.
 - **`ezfetch(reqInfo, parts?, init?)`** — ergonomic `mdbfetch`. `buildRequest`
   `url-join`s any `parts` onto the URL and defaults `redirect: "follow"`. Use
   when joining path segments to a base; returns the `Response`.
+  `cachedfetch` shares the same overloaded signature.
 - **`cachedfetch`** — `ezfetch` + read-through Cache API via the module-level
-  `mdbCache` (`MdbCacheManager`): `match` first, on miss `mdbfetch` then `save` a
-  clone. Keyed by **`req.url`** (not digest), guarded by `isCacheable`
-  (size ≤ `MdbCacheSizeLimit`, no `content-range`, bounded `range`), with
-  in-flight write dedup. Used by the **APT proxy** ([apt/proxy.ts](server/pkgs/apt/proxy.ts))
-  and `AptRepo`'s Release fetch — both key on the bare upstream URL. The **OCI
-  proxy** does *not* use it: it needs digest-keyed entries + immutable
-  `Cache-Control` rewriting, so it calls `mdbfetch` + an injected `cache` directly.
+  `mdbCache` (`MdbCacheManager`): `match` first, on miss `mdbfetch` then
+  `waitUntil(save(clone))`. Keyed by **`req.url`** (not digest). Guards: only
+  caches 2xx, skips Range requests (206 partial would poison full-URL key),
+  size ≤ `MdbCacheSizeLimit`, no `content-range`, in-flight write dedup. Used by
+  the **APT proxy** ([apt/proxy.ts](server/pkgs/apt/proxy.ts)), `AptRepo`'s
+  Release fetch, **`upstreamProxy`**, and PyPI. The **OCI proxy** does *not* use
+  it: it needs digest-keyed entries + immutable `Cache-Control` rewriting, so it
+  calls `mdbfetch` + an injected `cache` directly.
 - **`sanitizeResponse(upstream, opts?)`** — strip dangerous headers
   (`STRIP_RESPONSE_HEADERS`: `www-authenticate`, `set-cookie`, `vary`, `age`,
   hop-by-hop) from an upstream response before serving to clients. Optional
@@ -151,6 +152,7 @@ through these, not bare `fetch`, so user-agent + rate-limiting are uniform.
   host factory). `server/pkgs/apt/` — APT repo index + proxy + status.
   `server/pkgs/fetch/` — shared upstream fetch + cache + sanitize helpers.
   `server/pkgs/web-list/` — upstream directory-listing proxy (see below).
+- `server/mirrors/proxy/` — composable hook-based HTTP proxy builder (see below).
 - `server/relay/` — relay middleware (request rewrite for single-domain access).
 - `server/api/` — Hono API routes.
 - `server/mirrors/<name>/` — per-mirror logic + `index.ts` exporting a `Mirror`
@@ -159,6 +161,35 @@ through these, not bare `fetch`, so user-agent + rate-limiting are uniform.
 - `tools/relay/` — Go relay server (domestic proxy that talks to the Worker via
   `/@relay/`).
 - Path alias: `@server/*` → `./server/*`.
+
+## Upstream proxy builder — [server/mirrors/proxy/](server/mirrors/proxy/)
+
+Composable hook chain for non-OCI mirrors that just need prefix-strip + base-URL
++ cache + sanitize. Used by `createPassthroughMirror` (web-mirrors) and npm.
+
+- **`upstreamProxy(upstream)`** — factory returning a `ProxyRequest` pre-wired
+  with: `stripPrefix` → `setBaseUrl` → `filterHeaders` (Range + extras) →
+  `standardizeUserAgent` → `followRedirects` → `sanitize` (post). Fetches via
+  `cachedfetch` internally.
+- **`Upstream`** interface: `{ url, prefix?, passthroughHeaders? }`.
+- **`ProxyRequest`** class: `.pre(hook)` / `.post(hook)` / `.apply(req)`.
+  Pre-hooks transform the outbound Request; post-hooks transform the Response.
+  Post-hooks receive the **original** request (pre-rewrite), useful for URL
+  rewriting in response bodies.
+- Pre-hooks: `rewritePath(fn)`, `stripPrefix`, `setBaseUrl` (preserves query),
+  `stripSearch`, `filterHeaders`, `standardizeUserAgent`, `followRedirects`.
+- Post-hooks: `sanitize` (strips dangerous headers), `rewriteBody(fn)` (streaming
+  text transform via `TransformStream`; skips non-text; deletes `content-length`).
+
+Example — npm mirror in full:
+```ts
+const proxy = upstreamProxy({ url: UPSTREAM, prefix: PREFIX })
+  .post(rewriteBody((body, req) => {
+    const mirrorBase = `${new URL(req.url).origin}${PREFIX}/`;
+    return body.replaceAll(`${UPSTREAM}/`, mirrorBase);
+  }));
+export const npm: Mirror = { name: "npm", path: PATH, fetch: (r) => proxy.apply(r) };
+```
 
 ## Web listing proxy — [server/pkgs/web-list/](server/pkgs/web-list/)
 

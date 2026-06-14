@@ -41,13 +41,13 @@ export const pypi: Mirror = {
 
     // pypi/* — JSON API
     if (rel.startsWith("pypi/") || rel === "pypi") {
-      const upstream = await cachedfetch(`${PYPI_ORIGIN}/${rel}`);
+      const upstream = await cachedfetch(PYPI_ORIGIN, [rel]);
       return sanitizeResponse(upstream);
     }
 
     // packages/* — file downloads
     if (rel.startsWith("packages/")) {
-      const upstream = await cachedfetch(`${FILES_ORIGIN}/${rel}`);
+      const upstream = await cachedfetch(FILES_ORIGIN, [rel]);
       return sanitizeResponse(upstream);
     }
 
@@ -57,7 +57,7 @@ export const pypi: Mirror = {
 
 /** Fetch the Simple index and rewrite `/simple/pkg/` hrefs to relative `pkg/`. */
 async function handleSimpleIndex(): Promise<Response> {
-  const res = await cachedfetch(`${PYPI_ORIGIN}/simple/`);
+  const res = await cachedfetch(PYPI_ORIGIN, ["simple/"]);
   if (!res.ok) return sanitizeResponse(res);
 
   return new HTMLRewriter()
@@ -76,7 +76,7 @@ async function handleSimpleIndex(): Promise<Response> {
 
 /** Fetch a package's file list and rewrite file URLs to local `../../packages/`. */
 async function handleSimplePackage(pkg: string): Promise<Response> {
-  const res = await cachedfetch(`${PYPI_ORIGIN}/simple/${pkg}/`);
+  const res = await cachedfetch(PYPI_ORIGIN, ["simple", `${pkg}/`]);
   if (!res.ok) return sanitizeResponse(res);
 
   const replaceFrom = `${FILES_ORIGIN}/packages/`;

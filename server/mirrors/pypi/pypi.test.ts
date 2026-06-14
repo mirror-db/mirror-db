@@ -33,7 +33,7 @@ describe("pypi mirror", () => {
 
     const res = await pypi.fetch(makeRequest("/pypi/pypi/requests/json"));
 
-    expect(mockCachedfetch).toHaveBeenCalledWith("https://pypi.org/pypi/requests/json");
+    expect(mockCachedfetch).toHaveBeenCalledWith("https://pypi.org", ["pypi/requests/json"]);
     expect(res.status).toBe(200);
   });
 
@@ -45,7 +45,8 @@ describe("pypi mirror", () => {
     );
 
     expect(mockCachedfetch).toHaveBeenCalledWith(
-      "https://files.pythonhosted.org/packages/ab/cd/requests-2.31.0.tar.gz",
+      "https://files.pythonhosted.org",
+      ["packages/ab/cd/requests-2.31.0.tar.gz"],
     );
     expect(res.status).toBe(200);
   });

@@ -13,39 +13,22 @@
  * us rather than hitting the origin directly.
  */
 
-import { cachedfetch, sanitizeResponse } from "@server/pkgs/fetch";
+import { upstreamProxy, rewriteBody } from "@server/mirrors/proxy";
 import type { Mirror } from "@server/types";
 
 const UPSTREAM = "https://registry.npmjs.org";
 const PATH = "npm";
-const PREFIX = `/${PATH}/`;
+const PREFIX = `/${PATH}`;
+
+const proxy = upstreamProxy({ url: UPSTREAM, prefix: PREFIX })
+  .post(rewriteBody((body, req) => {
+    const origin = new URL(req.url).origin;
+    const mirrorBase = `${origin}${PREFIX}/`;
+    return body.replaceAll(`${UPSTREAM}/`, mirrorBase);
+  }));
 
 export const npm: Mirror = {
   name: "npm",
   path: PATH,
-  async fetch(request) {
-    const url = new URL(request.url);
-    const rel = url.pathname.slice(PREFIX.length);
-    const target = `${UPSTREAM}/${rel}${url.search}`;
-
-    const upstream = await cachedfetch(target);
-    const sanitized = sanitizeResponse(upstream);
-
-    // Only rewrite JSON metadata responses — tarballs and other content pass through.
-    const ct = sanitized.headers.get("content-type") ?? "";
-    if (!ct.includes("json")) {
-      return sanitized;
-    }
-
-    // Rewrite tarball URLs from registry.npmjs.org to our mirror prefix.
-    const origin = new URL(request.url).origin;
-    const mirrorBase = `${origin}${PREFIX}`;
-    const body = await sanitized.text();
-    const rewritten = body.replaceAll(`${UPSTREAM}/`, mirrorBase);
-
-    return new Response(rewritten, {
-      status: sanitized.status,
-      headers: sanitized.headers,
-    });
-  },
+  fetch: (request) => proxy.apply(request),
 };
