@@ -6,13 +6,18 @@ import { createAptProxy } from "./proxy";
 const HASH = "a".repeat(64);
 const BASE = "https://up.example/debian/";
 
-// The proxy fetches upstream through `cachedfetch`; mock it to drive responses.
-const { cachedfetchMock } = vi.hoisted(() => ({ cachedfetchMock: vi.fn() }));
+// The proxy fetches upstream through `cachedfetch` (by-hash) or `ezfetch`
+// (mutable dists/pool files); mock both to drive responses.
+const { cachedfetchMock, ezfetchMock } = vi.hoisted(() => ({
+  cachedfetchMock: vi.fn(),
+  ezfetchMock: vi.fn(),
+}));
 vi.mock("@server/pkgs/fetch", async (importOriginal) => {
   const orig: any = await importOriginal();
   return {
     ...orig,
     cachedfetch: cachedfetchMock,
+    ezfetch: ezfetchMock,
   };
 });
 
@@ -32,10 +37,11 @@ vi.mock("@server/pkgs/web-list/parse", async (importOriginal) => {
 
 beforeEach(() => {
   cachedfetchMock.mockReset();
-  cachedfetchMock.mockImplementation(
-    async () =>
-      new Response("data", { status: 200, headers: { "content-length": "4" } }),
-  );
+  ezfetchMock.mockReset();
+  const ok = async () =>
+    new Response("data", { status: 200, headers: { "content-length": "4" } });
+  cachedfetchMock.mockImplementation(ok);
+  ezfetchMock.mockImplementation(ok);
 });
 
 /** A repo with a hand-set index for direct enforcement testing. */
@@ -69,7 +75,7 @@ describe("createAptProxy — file enforcement", () => {
     const res = await proxy.fetch(get("dists/trixie/does-not-exist"));
 
     expect(res.status).toBe(200);
-    expect(cachedfetchMock).toHaveBeenCalled();
+    expect(ezfetchMock).toHaveBeenCalled();
   });
 
   it("404s an unknown by-hash file once ready, without fetching", async () => {
@@ -106,7 +112,7 @@ describe("createAptProxy — file enforcement", () => {
     const res = await proxy.fetch(get("pool/main/n/nginx/nginx_1.0_amd64.deb"));
 
     expect(res.status).toBe(200);
-    expect(cachedfetchMock).toHaveBeenCalledTimes(1);
+    expect(ezfetchMock).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -130,6 +136,7 @@ describe("createAptProxy — cache-control", () => {
     });
     const res = await proxy.fetch(get("dists/trixie/InRelease"));
 
+    expect(ezfetchMock).toHaveBeenCalled();
     const cc = res.headers.get("cache-control") ?? "";
     const maxAge = Number(cc.match(/max-age=(\d+)/)?.[1]);
     expect(maxAge).toBeGreaterThan(3500);
@@ -137,7 +144,7 @@ describe("createAptProxy — cache-control", () => {
   });
 
   it("strips set-cookie from upstream responses", async () => {
-    cachedfetchMock.mockImplementation(async () =>
+    ezfetchMock.mockImplementation(async () =>
       new Response("x", {
         status: 200,
         headers: { "set-cookie": "foo=bar", "content-length": "1" },

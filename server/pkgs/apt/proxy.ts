@@ -14,7 +14,7 @@
  * Upstream fetches go through `cachedfetch`, which owns the read-through cache.
  */
 
-import { cachedfetch, sanitizeResponse } from "@server/pkgs/fetch";
+import { cachedfetch, ezfetch, sanitizeResponse } from "@server/pkgs/fetch";
 import { WebListProxy, defaultRender } from "@server/pkgs/web-list";
 
 import type { AptRepo } from "./repo";
@@ -82,8 +82,13 @@ async function aptFetchHook(
     }
   }
 
-  // Fetch the file from upstream through the shared cache.
-  const upstream = await cachedfetch(repo.url(rel));
+  // By-hash files are content-addressed: safe to cache indefinitely.
+  // Mutable dists/ files (Packages.gz, etc.) must be fetched fresh — the CF
+  // Cache API can hold a stale copy after upstream rotates its index, causing
+  // size/hash mismatches for APT clients validating against the new Release.
+  const upstream = hash !== null
+    ? await cachedfetch(repo.url(rel))
+    : await ezfetch(repo.url(rel));
   return sanitizeResponse(upstream, {
     cacheControl: hash !== null ? IMMUTABLE_CACHE_CONTROL : sourceCacheControl(repo),
   });
