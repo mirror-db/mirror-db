@@ -1,36 +1,50 @@
 /**
  * Default HTML listing renderer for {@link WebListProxy}.
  *
- * Produces a minimal `<ul>` page from structured entries. Mirrors that don't
- * need custom rendering can use this directly as the `render` callback.
+ * Fetches the static HTML shell from assets and injects entry data as JSON
+ * into a `<script>` block. Client-side Vue app picks it up and renders.
  */
 
+import { env } from "cloudflare:workers";
 import type { WebListEntry } from "./parse";
 
-/** Minimal HTML entity escaping. */
-function esc(s: string): string {
-  return s
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
+let shellCache: string | null = null;
+
+async function getShell(): Promise<string> {
+  if (shellCache) return shellCache;
+  const res = await env.ASSETS.fetch("http://localhost/weblist/index.html");
+  shellCache = await res.text();
+  return shellCache;
 }
 
 /**
- * Render a directory listing as a simple HTML `<ul>` page.
+ * Render a directory listing page.
  *
- * Usable as the `render` option for {@link WebListProxy}. The signature matches
- * `WebListProxyOptions["render"]`.
+ * Injects `{ path, entries }` as `PAGE_META` into the HTML shell.
+ * The client-side Vue app hydrates from this data.
  */
-export function defaultRender(entries: WebListEntry[], path: string): Response {
-  const rows = entries
+export async function defaultRender(
+  entries: WebListEntry[],
+  path: string,
+): Promise<Response> {
+  const shell = await getShell();
+
+  const meta = JSON.stringify({ path, entries });
+  const title = `/${path}`;
+
+  // Fallback: plain list for no-JS / crawlers
+  const fallbackHtml = entries
     .map((e) => {
-      const href = esc(e.type === "directory" ? `${e.name}/` : e.name);
-      return `<li><a href="${href}">${href}</a></li>`;
+      const href = e.type === "directory" ? `${e.name}/` : e.name;
+      return `<a href="${href}">${href}</a>`;
     })
     .join("\n");
-  const title = esc(`/${path}`);
-  const html = `<!doctype html><meta charset="utf-8"><title>${title}</title><h1>${title}</h1><ul>\n${rows}\n</ul>`;
+
+  const html = shell
+    .replace("<!--title-->", title)
+    .replace("__PAGE_META__", meta)
+    .replace("<!--app-html-->", fallbackHtml);
+
   return new Response(html, {
     status: 200,
     headers: { "content-type": "text/html; charset=utf-8" },
