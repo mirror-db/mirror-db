@@ -315,6 +315,13 @@ Selection priority: `proxy` > `disguise` > CF fastest-node.
 - **SSH disguise** (`upstream.disguise_port`): `disguiseDialTLS` exchanges SSH
   banner then does TLS handshake. Bypasses HTTPS-targeted DPI throttling.
 
+**No `http.Client.Timeout`.** It caps the *whole* request including body read,
+so any download longer than the timeout is cut mid-stream (e.g. a 755MB ISO at
+1MB/s dies at ~30s). Streaming proxies must bound only the setup phases:
+`TLSHandshakeTimeout` + `ResponseHeaderTimeout` (30s) on the proxy/disguise
+transports, dial timeout (`EliminateDelay`, 5s) on the CF transport. Once
+response headers arrive, transfer runs untimed.
+
 ### Speedtest
 
 `GET /speedtest/{mb}?passthrough=n` — when `passthrough > 0`, proxies to upstream
