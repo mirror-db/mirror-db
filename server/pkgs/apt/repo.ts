@@ -45,6 +45,8 @@ export class AptRepo {
   state: RepoState = "idle";
   knownPaths = new Set<string>();
   knownHashes = new Set<string>();
+  /** Suites the index actually resolved — the scope enforcement is authoritative over. */
+  knownSuites = new Set<string>();
   /** Parsed `Release` per resolved suite — drives {@link status}. */
   suites: Release[] = [];
   validUntil = 0;
@@ -132,12 +134,14 @@ export class AptRepo {
 
     const knownPaths = new Set<string>();
     const knownHashes = new Set<string>();
+    const knownSuites = new Set<string>();
     const resolved: Release[] = [];
     let validUntil = Infinity;
 
     for (const { suite, idx } of indexes) {
       if (!idx) continue;
       resolved.push(idx);
+      knownSuites.add(suite);
 
       const prefix = `dists/${suite}/`;
       // The signed index files themselves are always valid paths.
@@ -168,6 +172,7 @@ export class AptRepo {
 
     this.knownPaths = knownPaths;
     this.knownHashes = knownHashes;
+    this.knownSuites = knownSuites;
     this.suites = resolved;
     this.validUntil =
       validUntil === Infinity ? Date.now() + DEFAULT_TTL_MS : validUntil;

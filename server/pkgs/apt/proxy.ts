@@ -68,7 +68,11 @@ async function aptFetchHook(
   if (repo.ready) {
     if (hash !== null) {
       if (!repo.knownHashes.has(hash)) return notFound();
-    } else if (rel.startsWith("dists/") || rel === "dists") {
+    } else if (rel === "dists" || isInKnownSuite(repo, rel)) {
+      // Curated mirrors only resolve a subset of suites; the index has no
+      // knowledge of the rest. Enforcement applies only to the `dists` root and
+      // to suites we actually indexed — paths under an un-indexed suite pass
+      // through unjudged so a curated suite list never blocks reachable suites.
       if (!repo.knownPaths.has(rel)) {
         // A directory addressed without a trailing slash → redirect so the
         // proxy serves it as a proper directory listing.
@@ -98,6 +102,13 @@ async function aptFetchHook(
 function sourceCacheControl(repo: AptRepo): string {
   const seconds = Math.max(0, Math.floor((repo.validUntil - Date.now()) / 1000));
   return `public, max-age=${seconds}`;
+}
+
+/** True if `rel` (a `dists/...` path) sits inside a suite the index resolved. */
+function isInKnownSuite(repo: AptRepo, rel: string): boolean {
+  if (!rel.startsWith("dists/")) return false;
+  const suite = rel.slice("dists/".length).split("/")[0];
+  return repo.knownSuites.has(suite);
 }
 
 /** True if any known path sits under `prefix` (i.e. `prefix` is a directory). */

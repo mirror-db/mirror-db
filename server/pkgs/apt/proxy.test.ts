@@ -49,12 +49,21 @@ function makeRepo(opts: {
   ready: boolean;
   paths?: string[];
   hashes?: string[];
+  suites?: string[];
   validUntil?: number;
 }): AptRepo {
   const repo = new AptRepo({ base: BASE });
   repo.state = opts.ready ? "ready" : "idle";
   repo.knownPaths = new Set(opts.paths ?? []);
   repo.knownHashes = new Set(opts.hashes ?? []);
+  // Default the resolved-suite set to whatever the seeded paths imply, so most
+  // tests don't have to spell it out; an explicit list overrides.
+  repo.knownSuites = new Set(
+    opts.suites ??
+      (opts.paths ?? [])
+        .filter((p) => p.startsWith("dists/"))
+        .map((p) => p.slice("dists/".length).split("/")[0]),
+  );
   repo.validUntil = opts.validUntil ?? Date.now() + 3_600_000;
   // Prevent the proxy's awaitResolved from triggering a real resolve that would
   // mutate the hand-set state.
@@ -105,6 +114,16 @@ describe("createAptProxy — file enforcement", () => {
 
     expect(res.status).toBe(404);
     expect(cachedfetchMock).not.toHaveBeenCalled();
+  });
+
+  it("passes through a dists path under an un-indexed suite", async () => {
+    // Curated mirrors resolve only a subset of suites; a request for a suite the
+    // index never touched (e.g. bullseye) must reach upstream, not 404.
+    const proxy = makeProxy({ ready: true, paths: ["dists/trixie/Release"] });
+    const res = await proxy.fetch(get("dists/bullseye/InRelease"));
+
+    expect(res.status).toBe(200);
+    expect(ezfetchMock).toHaveBeenCalledTimes(1);
   });
 
   it("always passes through pool/ paths (not in Release)", async () => {
