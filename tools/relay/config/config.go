@@ -63,6 +63,7 @@ func GetCfNodesFile() string       { return ResolveConfig("cf-nodes.csv") }
 func GetDisguisePort() int         { return viper.GetInt("relay.disguise_port") }
 func GetUpstreamURL() string       { return viper.GetString("upstream.url") }
 func GetUpstreamDisguisePort() int { return viper.GetInt("upstream.disguise_port") }
+func GetUpstreamProxy() string     { return strings.TrimSpace(viper.GetString("upstream.proxy")) }
 func GetAcmeSource() string        { return viper.GetString("acme.source") }
 func GetAcmeEmail() string         { return viper.GetString("acme.email") }
 func GetAcmeCA() string            { return viper.GetString("acme.ca") }

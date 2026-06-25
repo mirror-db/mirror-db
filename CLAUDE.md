@@ -291,6 +291,7 @@ upstream:
   url: "https://mirs.uk"
   # pool_size: 25            # CF edge node pool (default 25, active rotation 3)
   # disguise_port: 344       # connect via SSH-disguised TLS
+  # proxy: ""                # http(s)/socks5 proxy; bypasses CF optimizer
 
 acme:
   source: acme               # "acme" | "upstream" | URL origin
@@ -303,6 +304,12 @@ acme:
 
 ### Upstream transport
 
+Selection priority: `proxy` > `disguise` > CF fastest-node.
+
+- **Proxy** (`upstream.proxy`): when set, all upstream traffic routes through an
+  `http`/`https`/`socks5` proxy and the CF node optimizer is skipped entirely.
+  `buildProxyTransport` uses `http.Transport.Proxy` for http(s) and
+  `golang.org/x/net/proxy` for socks5(h).
 - **CF fastest-node** (default): `NewPoolManagerWithFile(poolSize, cf-nodes.csv)`,
   `UpstreamCount: 3`. Pool auto-refreshes when depleted.
 - **SSH disguise** (`upstream.disguise_port`): `disguiseDialTLS` exchanges SSH

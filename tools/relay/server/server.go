@@ -18,6 +18,7 @@ import (
 	"github.com/mirror-db/mirror-db/tools/relay/certsrv"
 	"github.com/mirror-db/mirror-db/tools/relay/config"
 	"github.com/mirror-db/mirror-db/tools/relay/guard"
+	"golang.org/x/net/proxy"
 	"resty.dev/v3"
 )
 
@@ -58,9 +59,17 @@ func NewServer() (*Server, error) {
 		return nil, fmt.Errorf("parse upstream: %w", err)
 	}
 
-	// Upstream transport: disguise or CF fastest-node.
+	// Upstream transport: proxy > disguise > CF fastest-node.
+	// When a proxy is configured, skip the CF node optimizer entirely.
 	var transport http.RoundTripper
-	if dp := config.GetUpstreamDisguisePort(); dp != 0 {
+	if px := config.GetUpstreamProxy(); px != "" {
+		t, err := buildProxyTransport(px)
+		if err != nil {
+			return nil, fmt.Errorf("proxy transport: %w", err)
+		}
+		transport = t
+		log.Printf("upstream via proxy %s", px)
+	} else if dp := config.GetUpstreamDisguisePort(); dp != 0 {
 		transport = buildDisguiseTransport(u.Hostname(), dp)
 	} else {
 		t, err := buildTransport(config.GetPoolSize())
@@ -70,7 +79,10 @@ func NewServer() (*Server, error) {
 		transport = t
 	}
 
-	httpClient := &http.Client{Transport: transport, Timeout: 30 * time.Second}
+	// No Client.Timeout: it caps the WHOLE request including body read, which
+	// kills large-file streaming (>30s downloads get cut mid-stream). Phase
+	// timeouts (connect / TLS / response-header) live on the transports instead.
+	httpClient := &http.Client{Transport: transport}
 
 	s := &Server{
 		upstream:    u,
@@ -317,6 +329,47 @@ func buildTransport(poolSize int) (http.RoundTripper, error) {
 	return transport, nil
 }
 
+// buildProxyTransport creates an http.RoundTripper that routes all upstream
+// traffic through an http/https or socks5 proxy. When set, the CF fastest-node
+// optimizer is bypassed entirely.
+//
+// Supported schemes: http, https, socks5, socks5h.
+func buildProxyTransport(rawURL string) (http.RoundTripper, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("parse proxy url: %w", err)
+	}
+
+	t := &http.Transport{
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+	}
+
+	switch strings.ToLower(u.Scheme) {
+	case "http", "https":
+		t.Proxy = http.ProxyURL(u)
+	case "socks5", "socks5h":
+		dialer, err := proxy.FromURL(u, proxy.Direct)
+		if err != nil {
+			return nil, fmt.Errorf("socks5 dialer: %w", err)
+		}
+		if cd, ok := dialer.(proxy.ContextDialer); ok {
+			t.DialContext = cd.DialContext
+		} else {
+			t.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return dialer.Dial(network, addr)
+			}
+		}
+	default:
+		return nil, fmt.Errorf("unsupported proxy scheme %q (want http/https/socks5)", u.Scheme)
+	}
+
+	return t, nil
+}
+
 // buildDisguiseTransport creates an http.RoundTripper that dials upstream via
 // SSH-banner-disguised TLS on the given port.
 func buildDisguiseTransport(host string, port int) http.RoundTripper {
@@ -325,9 +378,10 @@ func buildDisguiseTransport(host string, port int) http.RoundTripper {
 		DialTLSContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
 			return disguiseDialTLS(ctx, addr, &tls.Config{ServerName: host})
 		},
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 100,
-		IdleConnTimeout:     90 * time.Second,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   100,
+		IdleConnTimeout:       90 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
 	}
 }
 
