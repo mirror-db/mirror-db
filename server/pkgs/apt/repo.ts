@@ -24,7 +24,7 @@ import { analyzeApt, toSuiteMeta, type AptMirrorStatus } from "./status";
 export type RepoState = "idle" | "resolving" | "ready";
 
 export interface AptRepoOptions {
-  /** Full upstream prefix, ending in `/`, e.g. `https://cloudflaremirrors.com/debian/`. */
+  /** Full upstream prefix, ending in `/`, e.g. `http://ftp.us.debian.org/debian/`. */
   base: string;
   /** Fallback suite list when the `dists/` listing can't be parsed. */
   suites?: string[];

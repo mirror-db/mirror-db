@@ -25,9 +25,9 @@ const fsFor = (base: string, html: string) => {
 const byName = (entries: WebListEntry[]) =>
   Object.fromEntries(entries.map((e) => [e.name, e]));
 
-describe("WebListFs.readdir — cloudflaremirrors.com/debian", () => {
+describe("WebListFs.readdir — ftp.hk.debian.org/debian", () => {
   it("parses every listing row into a typed entry", async () => {
-    const { fs } = fsFor("https://cloudflaremirrors.com/debian/", debianHtml);
+    const { fs } = fsFor("http://ftp.us.debian.org/debian/", debianHtml);
     const entries = await fs.readdir();
     const map = byName(entries);
 
@@ -80,14 +80,14 @@ describe("WebListFs.readdir — nl.archive.ubuntu.com/ubuntu", () => {
 
 describe("WebListFs url/fetch", () => {
   it("joins relative paths onto the base and adds a trailing slash for readdir", async () => {
-    const { fs, lastUrl } = fsFor("https://cloudflaremirrors.com/debian", debianHtml);
-    expect(fs.url("pool/")).toBe("https://cloudflaremirrors.com/debian/pool/");
+    const { fs, lastUrl } = fsFor("http://ftp.us.debian.org/debian", debianHtml);
+    expect(fs.url("pool/")).toBe("http://ftp.us.debian.org/debian/pool/");
 
     await fs.readdir("dists");
-    expect(lastUrl()).toBe("https://cloudflaremirrors.com/debian/dists/");
+    expect(lastUrl()).toBe("http://ftp.us.debian.org/debian/dists/");
 
     await fs.fetch("README");
-    expect(lastUrl()).toBe("https://cloudflaremirrors.com/debian/README");
+    expect(lastUrl()).toBe("http://ftp.us.debian.org/debian/README");
   });
 });
 

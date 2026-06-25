@@ -1,6 +1,6 @@
 /**
  * Read-only view over an upstream directory-listing site (Apache/nginx
- * autoindex), e.g. `new WebListFs("https://cloudflaremirrors.com/debian/")`.
+ * autoindex), e.g. `new WebListFs("http://ftp.us.debian.org/debian/")`.
  *
  * `readdir` fetches + parses a listing page into structured entries; `fetch`
  * grabs an individual file/path. Both go through {@link cachedfetch} so repeated

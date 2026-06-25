@@ -10,7 +10,7 @@ import { createAptMirror, type AptMirrorConfig } from "./apt-mirror";
 const aptConfigs: AptMirrorConfig[] = [
   {
     name: "debian",
-    base: "https://cloudflaremirrors.com/debian/",
+    base: "http://ftp.us.debian.org/debian/",
     suites: [
       "stable",
       "testing",

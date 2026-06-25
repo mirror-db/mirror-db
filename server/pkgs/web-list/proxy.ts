@@ -9,7 +9,7 @@
  * Usage:
  * ```ts
  * const proxy = new WebListProxy({
- *   baseURL: "https://cloudflaremirrors.com/debian/",
+ *   baseURL: "http://ftp.us.debian.org/debian/",
  *   render(entries, path) { return new Response(html) },
  * });
  * // Mount under a path prefix; strip the prefix before handing to fetch:
@@ -33,7 +33,7 @@ export type WebListFetchHook = (
 ) => Response | null | undefined | Promise<Response | null | undefined>;
 
 export interface WebListProxyOptions {
-  /** Upstream base URL, e.g. `"https://cloudflaremirrors.com/debian/"`. */
+  /** Upstream base URL, e.g. `"http://ftp.us.debian.org/debian/"`. */
   baseURL: string;
   /**
    * Render structured entries into an HTML Response for the web listing mode.

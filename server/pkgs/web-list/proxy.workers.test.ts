@@ -45,7 +45,7 @@ function req(url: string, method = "GET", headers?: Record<string, string>) {
 // ── JSON API ────────────────────────────────────────────────────────────────
 
 describe("WebListProxy — JSON API", () => {
-  const proxy = makeProxy("https://cloudflaremirrors.com/debian/", debianHtml);
+  const proxy = makeProxy("http://ftp.us.debian.org/debian/", debianHtml);
 
   it("GET /?format=json returns structured entries", async () => {
     const res = await proxy.fetch(req("http://localhost/?format=json"));
@@ -71,7 +71,7 @@ describe("WebListProxy — JSON API", () => {
 // ── Web listing (render) ────────────────────────────────────────────────────
 
 describe("WebListProxy — Web listing", () => {
-  const proxy = makeProxy("https://cloudflaremirrors.com/debian/", debianHtml);
+  const proxy = makeProxy("http://ftp.us.debian.org/debian/", debianHtml);
 
   it("GET / calls the render callback", async () => {
     const res = await proxy.fetch(req("http://localhost/"));
@@ -93,7 +93,7 @@ describe("WebListProxy — Web listing", () => {
 // ── File passthrough ────────────────────────────────────────────────────────
 
 describe("WebListProxy — File passthrough", () => {
-  const proxy = makeProxy("https://cloudflaremirrors.com/debian/", debianHtml);
+  const proxy = makeProxy("http://ftp.us.debian.org/debian/", debianHtml);
 
   it("GET /README proxies the file from upstream", async () => {
     const res = await proxy.fetch(req("http://localhost/README"));
@@ -107,7 +107,7 @@ describe("WebListProxy — File passthrough", () => {
 // ── WebDAV ──────────────────────────────────────────────────────────────────
 
 describe("WebListProxy — WebDAV", () => {
-  const proxy = makeProxy("https://cloudflaremirrors.com/debian/", debianHtml);
+  const proxy = makeProxy("http://ftp.us.debian.org/debian/", debianHtml);
 
   it("OPTIONS returns DAV:1 and correct Allow", async () => {
     const res = await proxy.fetch(req("http://localhost/", "OPTIONS"));
@@ -158,7 +158,7 @@ describe("WebListProxy — WebDAV", () => {
 describe("WebListProxy — fetchHook", () => {
   it("intercepts a request when hook returns a Response", async () => {
     const proxy = new WebListProxy({
-      baseURL: "https://cloudflaremirrors.com/debian/",
+      baseURL: "http://ftp.us.debian.org/debian/",
       fetchImpl: stubFetch(debianHtml),
       render(entries, path) {
         return new Response("default render");
@@ -184,7 +184,7 @@ describe("WebListProxy — fetchHook", () => {
   it("hook receives the relative path without leading slash", async () => {
     let captured = "";
     const proxy = new WebListProxy({
-      baseURL: "https://cloudflaremirrors.com/debian/",
+      baseURL: "http://ftp.us.debian.org/debian/",
       fetchImpl: stubFetch(debianHtml),
       render() { return new Response(""); },
       fetchHook(path) {
