@@ -6,6 +6,7 @@ import {
 } from "./mirrors";
 import { relayMiddleware } from "./relay";
 import { api } from "./api";
+import { keys } from "./keys";
 import { handleSpeedtest } from "./speedtest";
 import type { MirrorContext } from "./types";
 
@@ -40,6 +41,8 @@ export default {
 
       const pathMirror = firstSeg && mirrorsByPath.get(firstSeg);
       if (pathMirror) return pathMirror.fetch(request, mctx);
+
+      if (firstSeg === "keys") return keys.fetch(request);
 
       if (firstSeg === "api") return api.fetch(request);
     }
