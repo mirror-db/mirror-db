@@ -35,6 +35,9 @@ without redirect), `fetch(request, ctx?)`, optional `status()`.
 
 ### Relay — [server/relay/index.ts](server/relay/index.ts)
 
+**DEPRECATED**: The `/@relay/` rewrite mechanism is no longer used by the Go relay server.
+The Worker still supports it for backward compatibility, but new deployments should not rely on it.
+
 `relayMiddleware(request): Request` — pure request rewrite for domestic relay
 servers that access all mirrors through a single domain.
 
@@ -325,23 +328,20 @@ post-deploy).
 
 Go binary (`relay serve`) — domestic reverse proxy sitting between end-users and
 the Worker. Discovers mirrors from upstream, terminates TLS via certmagic, proxies
-all traffic through the `/@relay/` convention.
+all traffic by replacing relay domain with upstream domain while preserving paths.
 
 ### Architecture
 
 ```
 Client → relay (HTTPS) → Worker (CF edge)
-Client → relay A → relay B → Worker   (multi-tier)
+Client → relay A → relay B → Worker   (multi-tier, not yet supported)
 ```
 
-Each relay layer:
-1. **Entry**: `stripRelayPrefix` — if path starts with `/@relay/`, rewrite host/path
-   (same logic as Worker's `relayMiddleware`). This lets multi-tier chains work
-   without double-prefixing.
-2. **Handler**: normal routing (subdomain check, path match).
-3. **Exit**: construct `/@relay/` path, proxy to upstream.
-
-`X-MDB-Relay-Host` set only on the first relay (not overwritten by upper relays).
+Relay routing:
+1. Client requests `dcr.relay.example.com/v2/library/nginx/manifests/latest`
+2. Relay replaces host: `dcr.relay.example.com` → `dcr.mirs.uk`
+3. Relay forwards to upstream with Host: `dcr.mirs.uk`, original path, and `X-MDB-Relay-Host: relay.example.com`
+4. Worker routes normally based on subdomain, uses `X-MDB-Relay-Host` for script generation
 
 ### Config — [tools/relay/config/](tools/relay/config/)
 

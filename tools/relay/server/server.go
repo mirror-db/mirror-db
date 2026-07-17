@@ -133,11 +133,8 @@ func (s *Server) buildRouters() {
 	s.HTTPRouter = httpRouter
 }
 
-// handleRequest is the main proxy handler — determines relay path and proxies.
+// handleRequest is the main proxy handler — replaces host and proxies.
 func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
-	// Relay middleware: strip /@relay/ prefix from incoming requests (sent by lower relays).
-	s.stripRelayPrefix(r)
-
 	host := requestHost(r)
 
 	// Filter: subdomain must be a known mirror host
@@ -149,31 +146,7 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	relayPath := s.resolveRelayPath(host, r.URL.Path)
-	s.proxy(w, r, relayPath)
-}
-
-// stripRelayPrefix rewrites the request in-place if its path starts with /@relay/.
-//   - /@relay/@<sub>/<path> → Host = <sub>.<base_domain>, path = /<path>
-//   - /@relay/<path>        → strip prefix, keep host
-func (s *Server) stripRelayPrefix(r *http.Request) {
-	path := r.URL.Path
-	if !strings.HasPrefix(path, "/@relay/") {
-		return
-	}
-	rest := path[len("/@relay/"):]
-
-	if strings.HasPrefix(rest, "@") {
-		// /@relay/@<sub>/<path>
-		sub, subPath, _ := strings.Cut(rest[1:], "/")
-		if sub != "" && len(s.baseDomains) > 0 {
-			r.Host = sub + "." + s.baseDomains[0]
-			r.URL.Path = "/" + subPath
-		}
-	} else {
-		// /@relay/<path>
-		r.URL.Path = "/" + rest
-	}
+	s.proxy(w, r)
 }
 
 // matchBaseDomain checks if host is a subdomain of any configured base domain.
@@ -189,18 +162,24 @@ func (s *Server) matchBaseDomain(host string) (sub string, base string) {
 	return "", ""
 }
 
-// resolveRelayPath determines the /@relay/... path for this request.
-func (s *Server) resolveRelayPath(host, path string) string {
-	if sub, _ := s.matchBaseDomain(host); sub != "" {
-		return "/@relay/@" + sub + path
-	}
-	return "/@relay" + path
-}
-
-func (s *Server) proxy(w http.ResponseWriter, r *http.Request, relayPath string) {
+func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
+	// Build upstream URL: replace relay host with upstream host, keep path and query
 	upstreamURL := *s.upstream
-	upstreamURL.Path = relayPath
+	upstreamURL.Path = r.URL.Path
 	upstreamURL.RawQuery = r.URL.RawQuery
+
+	// Rewrite Host: replace relay domain with upstream domain
+	host := requestHost(r)
+	if sub, _ := s.matchBaseDomain(host); sub != "" {
+		// Subdomain request: dcr.relay.example.com → dcr.mirs.uk
+		upstreamURL.Host = sub + "." + s.upstream.Hostname()
+	} else if _, base := s.matchBaseDomain(host); base != "" {
+		// Bare domain request: relay.example.com → mirs.uk
+		upstreamURL.Host = s.upstream.Host
+	} else {
+		// Unknown host
+		upstreamURL.Host = s.upstream.Host
+	}
 
 	req, err := http.NewRequestWithContext(r.Context(), r.Method, upstreamURL.String(), r.Body)
 	if err != nil {
@@ -209,11 +188,9 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request, relayPath string)
 	}
 
 	copyHeaders(req.Header, r.Header)
-	req.Header.Set("Host", s.upstream.Host)
 
-	// Only set X-MDB-Relay-Host if not already present (a lower relay may have set it).
+	// Set X-MDB-Relay-Host if not already present (lower relay may have set it)
 	if r.Header.Get("X-MDB-Relay-Host") == "" {
-		host := requestHost(r)
 		if _, base := s.matchBaseDomain(host); base != "" {
 			req.Header.Set("X-MDB-Relay-Host", base)
 		}

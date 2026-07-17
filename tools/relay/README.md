@@ -1,7 +1,7 @@
 # Mirror Relay
 
 Domestic reverse proxy for mirror-db. Discovers mirrors from upstream Worker,
-proxies all requests via `/@relay/` convention on a single upstream domain.
+replaces relay domain with upstream domain while preserving paths.
 Uses Cloudflare fastest-node discovery to optimize edge routing.
 
 ## Build
@@ -52,10 +52,10 @@ sudo ./relay install
 1. On startup, loads CF edge nodes from `cf-nodes.csv` in config dir (pool size default 25, active rotation 3 IPs)
 2. Fetches mirror manifest from `GET <upstream>/api/mirrors`
 3. Listens on :443 (HTTPS) + :80 (HTTP redirect/keepHTTP)
-4. Routes by Host header:
-   - `<sub>.<base-domain>` → proxies to `<upstream>/@relay/@<sub>/<path>`
-   - bare domain → proxies to `<upstream>/@relay/<path>`
-5. Sends `X-MDB-Relay-Host` header so upstream can rewrite absolute URLs
+4. Routes by Host header, replacing relay domain with upstream domain:
+   - `<sub>.<relay-domain>` → proxies to `<sub>.<upstream-domain>` with same path
+   - `<relay-domain>` → proxies to `<upstream-domain>` with same path
+5. Sets `X-MDB-Relay-Host` header so upstream can generate correct script URLs
 6. Refreshes mirror list every 10 minutes
 
 ## SSH Disguise (anti-DPI)

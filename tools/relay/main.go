@@ -1,8 +1,8 @@
 // Package main — mirror-db relay server.
 //
 // Fetches the mirror manifest from the upstream Worker's /api/mirrors endpoint,
-// then proxies requests for each mirror through /@relay/<target>/... on a
-// single upstream domain. Designed to run behind a domestic reverse proxy.
+// then proxies requests by replacing the relay domain with the upstream domain.
+// Designed to run behind a domestic reverse proxy.
 package main
 
 import (
