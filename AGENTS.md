@@ -16,7 +16,7 @@ without redirect), `fetch(request, ctx?)`, optional `status()`.
 - [server/index.ts](server/index.ts) — entry. Runs `relayMiddleware` first,
   then parses subdomain from host header. Subdomain mirror wins; on bare `@`
   splits pathname, looks up first segment in `mirrorsByPath`, then falls through
-  to Hono API (`/api/`), then static SPA.
+  to the key proxy (`/keys/`), Hono API (`/api/`), then static SPA.
 - [server/mirrors/index.ts](server/mirrors/index.ts) — aggregates every mirror
   into `mirrors` array plus lookups: `mirrorsBySubdomain`, `mirrorsByName`,
   `mirrorsByPath`. Simple passthrough registries declared inline via
@@ -26,6 +26,9 @@ without redirect), `fetch(request, ctx?)`, optional `status()`.
   - `GET /api/mirrors` — JSON manifest of all mirrors (for relay discovery).
     Includes `keepHTTP` flag for mirrors that allow plain HTTP.
   - `GET /api/status/:name` — per-mirror status snapshot.
+- [server/keys/index.ts](server/keys/index.ts) — Hono app at `/keys/` on the
+  bare domain. Proxies common signing keys (PGP + SSH) so domestic clients fetch
+  them through the mirror. See [Key proxy](#key-proxy--serverkeys) below.
 - [server/speedtest.ts](server/speedtest.ts) — `GET /speedtest/{mb}` on bare
   domain. Streams random bytes (1–1024 MB) via `ReadableStream` +
   `crypto.getRandomValues`. Ignores `?passthrough` (Worker is always origin).
@@ -159,6 +162,7 @@ through these, not bare `fetch`, so user-agent + rate-limiting are uniform.
 - `server/mirrors/proxy/` — composable hook-based HTTP proxy builder (see below).
 - `server/relay/` — relay middleware (request rewrite for single-domain access).
 - `server/api/` — Hono API routes.
+- `server/keys/` — PGP/SSH key proxy at `/keys/` (see above).
 - `server/mirrors/<name>/` — per-mirror logic + `index.ts` exporting a `Mirror`
   (`{ name, host? | path?, fetch, status? }`). `server/mirrors/index.ts`
   aggregates them.
@@ -220,6 +224,69 @@ the APT mirror but reusable for any directory-listing upstream.
   between `<td>` and nested `<a>` via `inAnchor` depth tracking.
 - **`webdav.ts`** — hand-crafted RFC 4918 class 1 responses (no XML library
   needed). `propfindResponse`, `optionsResponse`, `methodNotAllowed`.
+
+## Helm chart mirror — [server/mirrors/charts/](server/mirrors/charts/)
+
+Single path-routed mirror (`/charts/`) hosting many Helm repos, one per entry in
+[repos.ts](server/mirrors/charts/repos.ts). Add a repo with
+`helm repo add <name> https://mirs.uk/charts/<name>`.
+
+- **`HelmRepoKeeper`** ([keeper.ts](server/mirrors/charts/keeper.ts)) — one
+  isolate-scoped instance per repo. `refresh()` fetches upstream `index.yaml`
+  (via `ezfetch`), resolves every chart `urls` entry to an absolute URL, hashes
+  it with `uuidv5` into an opaque `res/<uuid>/<filename>` **relative** path, and
+  records `uuid → absolute url` in `resMap`. The index is re-dumped with
+  `js-yaml` under **`FAILSAFE_SCHEMA`** (`lineWidth: -1`) — critical: the default
+  YAML-1.1 schema coerces unquoted scalars and would rewrite a chart
+  `version: 1.10` into the float `1.1` (and truncate large integer digests),
+  silently corrupting the served index. FAILSAFE keeps every scalar a string so
+  the load → mutate-urls → dump roundtrip is lossless. The relative `res/` path
+  makes `helm` pull tarballs back through the mirror.
+- `res/<uuid>/*` responses pass through `sanitizeResponse` (strip
+  `set-cookie`/`www-authenticate`/etc.) before serving — chart tarballs come
+  from arbitrary CDNs (S3, GitHub). Upstream index fetch failures surface as 502.
+- Routes (under `/charts/<repo>/`): `index.yaml` (rewritten index),
+  `generated` (upstream timestamp), `res/<uuid>/info` (original url),
+  `res/<uuid>/*` (tarball, streamed + cached via `cachedfetch`). Bare `<repo>`
+  returns the repo metadata JSON.
+- `resMap` is rebuilt deterministically from the same index, so a `res` request
+  landing on a cold isolate just re-derives the map (`waitInitialized`). Same
+  `uuid` for the same absolute url across isolates → cache hits are stable.
+- Why rewrite to opaque uuids instead of passing urls through: chart urls can be
+  cross-host (e.g. gitlab → `gitlab-charts.s3.amazonaws.com`), and only urls
+  present in a fetched index ever enter `resMap` → not an open proxy.
+- Deps: `js-yaml` (pure-ESM, **named** `load`/`dump` exports — no default),
+  `uuid` (`v5` + `NIL`).
+
+## Key proxy — [server/keys/](server/keys/)
+
+Hono app at `/keys/` on the bare domain. Fronts common PGP signing keys and SSH
+public-key lists so domestic clients fetch them through the mirror instead of
+reaching upstreams directly. Mounted in [server/index.ts](server/index.ts) via
+`firstSeg === "keys"`, before the `/api` fallthrough.
+
+- **`SrvPGPKey(urlProvider)`** ([utils/pgp-key.ts](server/keys/utils/pgp-key.ts))
+  — sub-app serving one PGP key per `:keyname`, resolved to an upstream URL by
+  `urlProvider`. `PGPPubKeyHandler` (via `openpgp`) parses the armored key.
+  Routes: `GET /:keyname` (raw bytes; `.pgp`/`.asc` ext switches format),
+  `/:keyname/pgp` (binary), `/:keyname/asc` (armored), `/:keyname/info`
+  (`{ algorithm, bits, fingerprint, creationTime }`), `POST /:keyname` (verify a
+  cleartext-signed message body against the key).
+- **`SrvSSHKeyList(urlProvider)`** ([utils/ssh-key.ts](server/keys/utils/ssh-key.ts))
+  — sub-app serving a user's SSH `authorized_keys` list. `GET /:keyname` returns
+  raw text; `/:keyname/info` returns parsed keys with md5 (via `spark-md5`) +
+  sha256 (`crypto.subtle`) fingerprints.
+- Key providers under [pgp/](server/keys/pgp/): `debianKeyName2Url` maps a
+  codename/version (`bookworm`, `13`, `-security`, `-release`) to a
+  `ftp-master.debian.org` archive key; `repo2KeyUrl` is a static table of
+  well-known APT signing keys (covers the repo's own APT mirrors + a few common
+  third-party repos).
+- Routes mounted: `/debian/:codename`, `/apt/:repo`, `/keybase/:user`,
+  `/gh|github/:user`, `/gitlab/:user`.
+- Upstream fetch goes through `ezfetch` (no read-through cache yet — these keys
+  are highly cacheable, so `cachedfetch` is a candidate swap).
+- Deps: `openpgp` (heaviest single dependency — drives bundle to ~755 KB;
+  needed for `/info` + `POST` verify), `spark-md5` (SSH md5 fingerprints).
 
 ## Commands
 
