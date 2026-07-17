@@ -32,10 +32,7 @@ const aptConfigs: AptMirrorConfig[] = [
   {
     name: "debian-security",
     base: "https://security.debian.org/debian-security/",
-    suites: [
-      "trixie-security",
-      "bookworm-security",
-    ],
+    suites: ["trixie-security", "bookworm-security"],
   },
   {
     name: "ubuntu",
@@ -87,6 +84,16 @@ const aptConfigs: AptMirrorConfig[] = [
     name: "opentofu",
     base: "https://packages.opentofu.org/opentofu/tofu/any/",
     suites: ["any"],
+  },
+  {
+    name: "github-cli",
+    base: "https://cli.github.com/packages/",
+    suites: ["stable"],
+  },
+  {
+    name: "gitlab-runner-deb",
+    base: "https://packages.gitlab.com/runner/gitlab-runner/debian/",
+    suites: ["bookworm", "trixie"],
   },
 ];
 
