@@ -4,6 +4,7 @@ import type { Mirror } from "@server/types";
 import docker from "./docker";
 import { npm } from "./npm";
 import { pypi } from "./pypi";
+import { charts } from "./charts";
 import { aptMirrors } from "./apt-mirrors";
 import { webMirrors } from "./web-mirrors";
 
@@ -22,7 +23,7 @@ const simpleRegistries: Mirror[] = [
 ];
 
 /** Every mirror, regardless of how it is routed (subdomain or path prefix). */
-export const mirrors: Mirror[] = [docker, ...simpleRegistries, ...aptMirrors, ...webMirrors, pypi, npm];
+export const mirrors: Mirror[] = [docker, ...simpleRegistries, ...aptMirrors, ...webMirrors, pypi, npm, charts];
 
 /** Subdomain-routed mirrors, keyed by subdomain (e.g. `"dcr"`). */
 export const mirrorsBySubdomain: Map<string, Mirror> = new Map(
