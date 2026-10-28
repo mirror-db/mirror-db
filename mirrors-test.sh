@@ -397,11 +397,11 @@ http_ok "https://$BASE/debian-cd/current/amd64/iso-cd/"
 
 echo "── Ubuntu CD images mirror ──────────────────────────────────────────────────"
 
-http_ok "https://$BASE/ubuntu-cdimages/noble/"
+http_ok "https://$BASE/ubuntu-cd/noble/"
 
-echo "── Ubuntu Cloud Images mirror ───────────────────────────────────────────────"
+echo "── Ubuntu Cloud mirror ──────────────────────────────────────────────────────"
 
-http_ok "https://$BASE/ubuntu-cloud-images/noble/"
+http_ok "https://$BASE/ubuntu-cloud/noble/"
 
 echo "── Ubuntu Releases mirror ───────────────────────────────────────────────────"
 

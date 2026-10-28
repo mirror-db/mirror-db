@@ -25,11 +25,11 @@ const webListConfigs: WebMirrorConfig[] = [
     base: "https://download.docker.com/",
   },
   {
-    name: "ubuntu-cdimages",
+    name: "ubuntu-cd",
     base: "https://cdimage.ubuntu.com/",
   },
   {
-    name: "ubuntu-cloud-images",
+    name: "ubuntu-cloud",
     base: "https://cloud-images.ubuntu.com/",
   },
   {
