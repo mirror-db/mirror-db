@@ -17,9 +17,10 @@
  */
 
 import { cachedfetch, sanitizeResponse } from "@server/pkgs/fetch";
-import type { Mirror, MirrorContext } from "@server/types";
+import type { Mirror } from "@server/types";
 
 import { registry } from "./registry";
+import { relayInfo } from "@server/relay";
 
 const PATH = "charts";
 const PREFIX = `/${PATH}/`;
@@ -29,14 +30,14 @@ const notFound = () => new Response("Not Found", { status: 404 });
 export const charts: Mirror = {
   name: "charts",
   path: PATH,
-  async fetch(request, ctx?: MirrorContext) {
+  async fetch(request) {
     const url = new URL(request.url);
     if (!url.pathname.startsWith(PREFIX)) return notFound();
 
     // Origin the client actually reached us on: the relay's public host when
     // proxied, else this request's own origin. Rewritten urls point here so
     // they route back through the same host (never straight to the upstream).
-    const mirrorBase = ctx?.relay?.host ? `https://${ctx.relay.host}` : url.origin;
+    const { origin } = relayInfo(request);
 
     const rel = url.pathname.slice(PREFIX.length);
     const [repoName, ...rest] = rel.split("/");
@@ -62,7 +63,7 @@ export const charts: Mirror = {
         // triggering a download (YAML has no registered MIME type, so
         // application/yaml makes some UAs offer a "save as" dialog).
         const isBrowser = (request.headers.get("accept") ?? "").includes("text/html");
-        return new Response(keeper.render(mirrorBase), {
+        return new Response(keeper.render(origin), {
           headers: { "content-type": isBrowser ? "text/plain; charset=utf-8" : "application/yaml" },
         });
       }

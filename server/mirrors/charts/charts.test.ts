@@ -14,8 +14,8 @@ import { ezfetch, cachedfetch } from "@server/pkgs/fetch";
 const mockEzfetch = ezfetch as ReturnType<typeof vi.fn>;
 const mockCachedfetch = cachedfetch as ReturnType<typeof vi.fn>;
 
-function makeRequest(path: string): Request {
-  return new Request(`https://mirs.uk${path}`);
+function makeRequest(path: string, headers?: Record<string, string>): Request {
+  return new Request(`https://mirs.uk${path}`, { headers });
 }
 
 // A minimal upstream index.yaml with one cross-host absolute url and one
@@ -132,9 +132,11 @@ describe("charts mirror", () => {
   });
 
   it("resolves chart urls to the relay host when relayed", async () => {
-    const res = await charts.fetch(makeRequest("/charts/gitlab/index.yaml"), {
-      relay: { host: "cn.example.com" },
-    });
+    const res = await charts.fetch(
+      makeRequest("/charts/gitlab/index.yaml", {
+        "x-mdb-relay-host": "cn.example.com",
+      }),
+    );
     const body = await res.text();
     expect(body).toMatch(
       /https:\/\/cn\.example\.com\/charts\/gitlab\/res\/[0-9a-f-]+\/gitlab-runner-0\.66\.0\.tgz/,
@@ -171,9 +173,11 @@ describe("charts mirror", () => {
   });
 
   it("resolves dependency repositories to the relay host when relayed", async () => {
-    const res = await charts.fetch(makeRequest("/charts/gitlab/index.yaml"), {
-      relay: { host: "cn.example.com" },
-    });
+    const res = await charts.fetch(
+      makeRequest("/charts/gitlab/index.yaml", {
+        "x-mdb-relay-host": "cn.example.com",
+      }),
+    );
     const body = await res.text();
     expect(body).toContain(
       "repository: https://cn.example.com/charts/cert-manager",

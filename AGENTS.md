@@ -11,12 +11,12 @@ challenges never reach clients.
 ([server/types.ts](server/types.ts)): `name`, optional `host` (subdomain route,
 e.g. `dcr.mirs.uk` → Docker Hub) or `path` (single word, matched as the first
 URL segment, e.g. `mirs.uk/npm/...`), optional `keepHTTP` (serve over plain HTTP
-without redirect), `fetch(request, ctx?)`, optional `status()`.
+without redirect), `fetch(request)`, optional `status()`.
 
-- [server/index.ts](server/index.ts) — entry. Runs `relayMiddleware` first,
-  then parses subdomain from host header. Subdomain mirror wins; on bare `@`
-  splits pathname, looks up first segment in `mirrorsByPath`, then falls through
-  to the key proxy (`/keys/`), Hono API (`/api/`), then static SPA.
+- [server/index.ts](server/index.ts) — entry. Parses subdomain from host header.
+  Subdomain mirror wins; on bare `@` splits pathname, looks up first segment in
+  `mirrorsByPath`, then falls through to the key proxy (`/keys/`), Hono API
+  (`/api/`), scripts (`/scripts/`), then static SPA.
 - [server/mirrors/index.ts](server/mirrors/index.ts) — aggregates every mirror
   into `mirrors` array plus lookups: `mirrorsBySubdomain`, `mirrorsByName`,
   `mirrorsByPath`. Simple passthrough registries declared inline via
@@ -29,28 +29,25 @@ without redirect), `fetch(request, ctx?)`, optional `status()`.
 - [server/keys/index.ts](server/keys/index.ts) — Hono app at `/keys/` on the
   bare domain. Proxies common signing keys (PGP + SSH) so domestic clients fetch
   them through the mirror. See [Key proxy](#key-proxy--serverkeys) below.
+- [server/scripts/](server/scripts/) — Hono app at `/scripts/` on the bare
+  domain. Generates install scripts for OCI registries that return correct
+  mirror URLs based on `X-MDB-Relay-Host` header.
 - [server/speedtest.ts](server/speedtest.ts) — `GET /speedtest/{mb}` on bare
   domain. Streams random bytes (1–1024 MB) via `ReadableStream` +
   `crypto.getRandomValues`. Ignores `?passthrough` (Worker is always origin).
 
-### Relay — [server/relay/index.ts](server/relay/index.ts)
+### Relay info — [server/relay.ts](server/relay.ts)
 
-**DEPRECATED**: The `/@relay/` rewrite mechanism is no longer used by the Go relay server.
-The Worker still supports it for backward compatibility, but new deployments should not rely on it.
+`relayInfo(request)` — extracts relay context from `X-MDB-Relay-Host` header.
 
-`relayMiddleware(request): Request` — pure request rewrite for domestic relay
-servers that access all mirrors through a single domain.
+The relay server (Go binary) sets `X-MDB-Relay-Host` to its own base domain when
+proxying requests to the Worker. Mirrors that generate absolute URLs (Helm charts,
+npm, pypi, install scripts) use this to emit URLs pointing back through the relay
+instead of directly to the upstream Worker.
 
-Convention:
-- `/@relay/@<subdomain>/<path>` → rewrites host to `<subdomain>.<BASE_DOMAIN>`,
-  path to `/<path>`. E.g. `/@relay/@dcr/v2/...` → `dcr.mirs.uk/v2/...`.
-- `/@relay/<path>` → strips prefix, keeps same host.
-  E.g. `/@relay/npm/react` → `mirs.uk/npm/react`.
-
-After rewrite, request is indistinguishable from a direct request — downstream
-routing works unchanged. Relay client sends `X-MDB-Relay-Host: <its-domain>` so
-mirrors that rewrite absolute URLs (npm, pypi) can emit correct links via
-`MirrorContext.relay.host`.
+Returns `{ baseDomain, origin }`:
+- `baseDomain`: relay's domain if present, else `env.BASE_DOMAIN`
+- `origin`: `https://${baseDomain}` or request's own origin
 
 ### Mirrors
 
@@ -140,9 +137,10 @@ through these, not bare `fetch`, so user-agent + rate-limiting are uniform.
   when joining path segments to a base; returns the `Response`.
   `cachedfetch` shares the same overloaded signature.
 - **`cachedfetch`** — `ezfetch` + read-through Cache API via the module-level
-  `mdbCache` (`MdbCacheManager`): `match` first, on miss `mdbfetch` then
-  `waitUntil(save(clone))`. Keyed by **`req.url`** (not digest). Guards: only
-  caches 2xx, skips Range requests (206 partial would poison full-URL key),
+  `mdbCache` (`MdbCacheManager`): cache strategy by method: GET full cache (match
+  → fetch → save); HEAD match with `ignoreMethod: true` (reuse GET cache), miss
+  fetches directly without save; other methods bypass cache entirely. Guards: only
+  caches 2xx GET, skips Range requests (206 partial would poison full-URL key),
   size ≤ `MdbCacheSizeLimit`, no `content-range`, in-flight write dedup. Used by
   the **APT proxy** ([apt/proxy.ts](server/pkgs/apt/proxy.ts)), `AptRepo`'s
   Release fetch, **`upstreamProxy`**, and PyPI. The **OCI proxy** does *not* use
