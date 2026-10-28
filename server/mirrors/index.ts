@@ -20,6 +20,7 @@ const simpleRegistries: Mirror[] = [
   createRegistryHost({ host: "mcr", upstream: "mcr.microsoft.com" }),
   createRegistryHost({ host: "nvcr", upstream: "nvcr.io" }),
   createRegistryHost({ host: "ocr", upstream: "container-registry.oracle.com" }),
+  createRegistryHost({ host: "lscr", upstream: "lscr.io" })
 ];
 
 /** Every mirror, regardless of how it is routed (subdomain or path prefix). */
