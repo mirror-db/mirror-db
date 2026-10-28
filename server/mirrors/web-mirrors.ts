@@ -17,6 +17,10 @@ const webListConfigs: WebMirrorConfig[] = [
     base: "https://cdimage.debian.org/debian-cd/",
   },
   {
+    name: "debian-cloud",
+    base: "https://cloud.debian.org/images/cloud/",
+  },
+  {
     name: "docker-ce",
     base: "https://download.docker.com/",
   },
