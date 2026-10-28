@@ -45,7 +45,7 @@ export const filterHeaders = (whitelist: string[]): PreProxyHook => (req) => {
     const value = req.headers.get(h);
     if (value) headers.set(h, value);
   }
-  return new Request(req.url, { ...req, headers });
+  return new Request(req, { headers });
 };
 
 export const standardizeUserAgent: PreProxyHook = (req) => {

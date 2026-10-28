@@ -122,6 +122,17 @@ describe("filterHeaders", () => {
     ) as Request;
     expect(r.headers.get("range")).toBe("bytes=0-10");
   });
+
+  it("preserves request method", () => {
+    const hook = filterHeaders(["Range"]);
+    const r = hook(
+      req("https://x.com/", {
+        method: "HEAD",
+        headers: { range: "bytes=0-10" },
+      }),
+    ) as Request;
+    expect(r.method).toBe("HEAD");
+  });
 });
 
 describe("standardizeUserAgent", () => {
@@ -254,6 +265,24 @@ describe("upstreamProxy", () => {
     const p = upstreamProxy({ url: "https://upstream.com" });
     const resp = await p.apply(req("https://mirs.uk/some/path"));
     expect(await resp.text()).toBe("upstream:/some/path");
+  });
+
+  it("HEAD request preserves method through full chain", async () => {
+    const p = upstreamProxy({ url: "https://upstream.com" });
+    
+    // Capture the request that reaches cachedfetch
+    let capturedMethod: string | null = null;
+    const origPre = p.prehooks;
+    p.prehooks = [
+      ...origPre,
+      (r) => {
+        capturedMethod = r.method;
+        return r;
+      },
+    ];
+    
+    await p.apply(req("https://mirs.uk/path", { method: "HEAD" }));
+    expect(capturedMethod).toBe("HEAD");
   });
 
   it("passes extra headers from passthroughHeaders", async () => {

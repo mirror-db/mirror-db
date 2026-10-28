@@ -41,7 +41,9 @@ export function buildRequest(
 
   if (arg3 != undefined) init = arg3;
 
-  return new Request(urlJoin(req.url, ...parts), init);
+  // Inherit method/headers/body/signal from original request, then apply overrides
+  const base = new Request(urlJoin(req.url, ...parts), req);
+  return new Request(base, init);
 }
 
 export function ezfetch(reqInfo: RequestInfo | URL, init?: RequestInit): Promise<Response>;
