@@ -49,6 +49,8 @@ export class MdbCacheManager {
   }
 
   async save(req: Request, resp: Response) {
+    // Only cache GET requests (Cache API behavior for other methods is undefined)
+    if (req.method !== "GET") return;
     if (!this.isCacheable(req)) return;
     if (!this.isCacheable(resp)) return;
 
@@ -82,20 +84,39 @@ export const mdbCache = new MdbCacheManager();
 export const cachedfetch = (async (reqInfo, arg2, arg3) => {
   const req = buildRequest(reqInfo, arg2, arg3);
 
-  // Skip cache for range requests — a 206 partial keyed by full URL would
-  // serve incomplete content to subsequent non-range requests.
-  const hasRange = req.headers.has("range");
+  // Cache strategy by method:
+  // - GET: full cache (match → fetch → save)
+  // - HEAD: match with ignoreMethod (reuse GET cache), no save on miss
+  // - Other methods: bypass cache entirely
+  
+  if (req.method === "GET") {
+    // Skip cache for range requests — a 206 partial keyed by full URL would
+    // serve incomplete content to subsequent non-range requests.
+    const hasRange = req.headers.has("range");
 
-  if (!hasRange) {
-    const cached = await mdbCache.match(req);
+    if (!hasRange) {
+      const cached = await mdbCache.match(req);
+      if (cached) return cached;
+    }
+
+    const resp = await mdbfetch(req);
+
+    // Only cache successful, complete responses.
+    if (resp.ok && !hasRange) {
+      waitUntil(mdbCache.save(req, resp.clone()));
+    }
+    return resp;
+  }
+  
+  if (req.method === "HEAD") {
+    // Try to reuse GET cache (ignoreMethod allows HEAD to match GET entries)
+    const cached = await mdbCache.match(req, { ignoreMethod: true });
     if (cached) return cached;
+    
+    // Miss: fetch directly but don't cache (HEAD responses have no body)
+    return mdbfetch(req);
   }
-
-  const resp = await mdbfetch(req);
-
-  // Only cache successful, complete responses.
-  if (resp.ok && !hasRange) {
-    waitUntil(mdbCache.save(req, resp.clone()));
-  }
-  return resp;
+  
+  // Other methods (POST, PUT, etc.): bypass cache entirely
+  return mdbfetch(req);
 }) as typeof ezfetch;

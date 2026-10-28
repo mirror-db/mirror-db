@@ -6,6 +6,22 @@ import { createAptProxy } from "./proxy";
 const HASH = "a".repeat(64);
 const BASE = "https://up.example/debian/";
 
+// Mock env.ASSETS for defaultRender
+vi.mock("cloudflare:workers", () => ({
+  env: {
+    ASSETS: {
+      fetch: vi.fn(() => 
+        Promise.resolve(
+          new Response(
+            "<html><head><title><!--title--></title></head><body><!--app-html--></body></html>"
+          )
+        )
+      ),
+    },
+    BASE_DOMAIN: "mirs.uk",
+  },
+}));
+
 // The proxy fetches upstream through `cachedfetch` (by-hash) or `ezfetch`
 // (mutable dists/pool files); mock both to drive responses.
 const { cachedfetchMock, ezfetchMock } = vi.hoisted(() => ({
