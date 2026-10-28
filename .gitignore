@@ -46,3 +46,9 @@ __screenshots__/
 !.env.example
 
 reference
+# codegraph index (machine-local)
+.codegraph
+
+# Go workspace file used for cross-module dev
+/go.work
+/go.work.sum
