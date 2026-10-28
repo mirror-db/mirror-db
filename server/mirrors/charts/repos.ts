@@ -80,9 +80,4 @@ export const HelmReposList: HelmRepo[] = [
     url: "https://helm.ngc.nvidia.com/nvidia",
     example_charts: ["gpu-operator", "gpu-feature-discovery", "dcgm-exporter"],
   },
-  {
-    name: "kubevirt",
-    url: "https://geektheripper.github.io/kubevirt-helm",
-    example_charts: ["kubevirt-operator", "kubevirt-cr", "cdi-operator", "cdi-cr"]
-  }
 ];
