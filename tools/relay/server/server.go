@@ -3,11 +3,13 @@ package server
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
-	"io"
 	"log"
+	"math/rand/v2"
 	"net"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"strings"
 	"sync/atomic"
@@ -36,6 +38,7 @@ type Server struct {
 	client      *http.Client
 	resty       *resty.Client
 	baseDomains []string
+	proxy       *httputil.ReverseProxy
 
 	// Routers (gorilla/mux, SkipClean preserves raw paths like OCI digests)
 	Router     *mux.Router // HTTPS (all requests)
@@ -44,6 +47,10 @@ type Server struct {
 	mirrors      atomic.Pointer[[]Mirror]
 	allowedHosts atomic.Pointer[map[string]bool]
 	keepHTTP     atomic.Pointer[map[string]bool]
+
+	// ready is closed after the first successful manifest fetch. Until then the
+	// proxy answers 502 instead of an empty allow-list.
+	ready atomic.Bool
 }
 
 // mirrorsResponse matches the JSON shape from GET /api/mirrors.
@@ -57,6 +64,9 @@ func NewServer() (*Server, error) {
 	u, err := url.Parse(config.GetUpstreamURL())
 	if err != nil {
 		return nil, fmt.Errorf("parse upstream: %w", err)
+	}
+	if u.Scheme == "" || u.Host == "" {
+		return nil, fmt.Errorf("upstream url %q needs scheme and host", u.String())
 	}
 
 	// Upstream transport: proxy > disguise > CF fastest-node.
@@ -90,18 +100,25 @@ func NewServer() (*Server, error) {
 		resty:       resty.NewWithClient(httpClient).SetBaseURL(config.GetUpstreamURL()),
 		baseDomains: config.AllDomainNames(),
 	}
+	if len(s.baseDomains) == 0 {
+		return nil, fmt.Errorf("no relay.base_domains configured")
+	}
+
+	s.proxy = s.newReverseProxy()
 
 	s.buildRouters()
 
+	// A transient upstream failure must not turn into a systemd restart loop:
+	// log it, serve 502 until the watcher succeeds.
 	if err := s.refreshMirrors(); err != nil {
-		return nil, fmt.Errorf("initial mirror fetch: %w", err)
+		log.Printf("initial mirror fetch failed (serve 502 until it succeeds): %v", err)
 	}
 
 	go s.watchMirrors(10 * time.Minute)
 	return s, nil
 }
 
-// buildRouters sets up the mux routers (like old relay/server.go).
+// buildRouters sets up the mux routers.
 func (s *Server) buildRouters() {
 	// --- HTTPS router (serves all traffic) ---
 	router := mux.NewRouter().SkipClean(true)
@@ -109,8 +126,8 @@ func (s *Server) buildRouters() {
 	// Internal relay endpoints
 	relayRouter := router.PathPrefix("/.mirror-relay").Subrouter()
 	g := &guard.Guard{SecretKey: config.GetSecretKey()}
-	storage := GetCertMagicStorage()
-	relayRouter.Handle("/cert-pack", g.Wrap(certsrv.New(storage)))
+	relayRouter.Handle("/cert-pack", g.Wrap(certsrv.New(CertMagicStorage())))
+	relayRouter.Handle("/mirrors", g.Wrap(http.HandlerFunc(s.handleMirrors)))
 
 	// Speedtest endpoint
 	router.HandleFunc("/speedtest/{mb}", s.handleSpeedtest)
@@ -135,18 +152,88 @@ func (s *Server) buildRouters() {
 
 // handleRequest is the main proxy handler — replaces host and proxies.
 func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
-	host := requestHost(r)
+	if !s.ready.Load() {
+		http.Error(w, "relay has no upstream manifest yet", http.StatusBadGateway)
+		return
+	}
+	s.proxy.ServeHTTP(w, r)
+}
 
-	// Filter: subdomain must be a known mirror host
-	if sub, _ := s.matchBaseDomain(host); sub != "" {
-		hosts := s.allowedHosts.Load()
-		if hosts == nil || !(*hosts)[sub] {
-			http.Error(w, "unknown mirror host", http.StatusForbidden)
-			return
+// newReverseProxy wires httputil.ReverseProxy. Using the stdlib proxy gives us
+// RFC 9110 hop-by-hop handling (including tokens named in Connection), correct
+// Trailer / 1xx handling and X-Forwarded-For for free.
+func (s *Server) newReverseProxy() *httputil.ReverseProxy {
+	return &httputil.ReverseProxy{
+		Rewrite:       s.rewriteUpstream,
+		Transport:     s.client.Transport,
+		FlushInterval: 100 * time.Millisecond,
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			// Client cancellations are normal; don't spam the log.
+			if r.Context().Err() != nil {
+				return
+			}
+			log.Printf("upstream error for %s %s: %v", r.Method, r.URL.Redacted(), err)
+			http.Error(w, "upstream error", http.StatusBadGateway)
+		},
+	}
+}
+
+// rewriteUpstream maps a client request onto the upstream origin, preserving
+// the exact request URI (fresh: URL escape sequences, `//`, `..` are not
+// re-encoded) and passing X-MDB-Relay-Host through untouched.
+func (s *Server) rewriteUpstream(pr *httputil.ProxyRequest) {
+	in, out := pr.In, pr.Out
+
+	basePath, baseRawPath := s.upstream.Path, s.upstream.RawPath
+	if basePath == "" || basePath == "/" {
+		basePath, baseRawPath = "", ""
+	}
+
+	outURL := *s.upstream
+	outURL.Host = s.upstreamHostFor(requestHost(in))
+	outURL.Path, outURL.RawPath, outURL.RawQuery = "", "", ""
+
+	// SetXForwarded first: it only touches headers.
+	pr.SetXForwarded()
+
+	// X-MDB-Relay-Host: trust the client's value (open project — anyone may
+	// proxy) and only fill it in when absent, so a multi-level chain keeps the
+	// origin closest to the user.
+	if in.Header.Get(RelayHostHeader) == "" {
+		if _, base := s.matchBaseDomain(requestHost(in)); base != "" {
+			out.Header.Set(RelayHostHeader, base)
 		}
 	}
 
-	s.proxy(w, r)
+	// Out.URL.Path must not be touched before this: SetURL appends the inbound
+	// path onto the target.
+	pr.SetURL(&outURL)
+
+	// Restore the upstream's base path: SetURL overwrote it.
+	if basePath != "" {
+		out.URL.Path = strings.TrimSuffix(basePath, "/") + in.URL.Path
+		if baseRawPath != "" {
+			out.URL.RawPath = strings.TrimSuffix(baseRawPath, "/") + in.URL.EscapedPath()
+		}
+	}
+	out.Host = outURL.Host
+}
+
+// RelayHostHeader is the header the Worker reads to build absolute URLs that
+// point back through the relay (see server/relay.ts).
+const RelayHostHeader = "X-MDB-Relay-Host"
+
+// upstreamHostFor maps a relay-facing host onto the upstream host:
+//
+//	dcr.relay.example.com → dcr.<upstream>
+//	relay.example.com     → <upstream>
+//	anything else         → <upstream>  (bare passthrough)
+func (s *Server) upstreamHostFor(host string) string {
+	sub, base := s.matchBaseDomain(host)
+	if sub != "" && base != "" {
+		return sub + "." + s.upstream.Hostname()
+	}
+	return s.upstream.Host
 }
 
 // matchBaseDomain checks if host is a subdomain of any configured base domain.
@@ -162,57 +249,13 @@ func (s *Server) matchBaseDomain(host string) (sub string, base string) {
 	return "", ""
 }
 
-func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
-	// Build upstream URL: replace relay host with upstream host, keep path and query
-	upstreamURL := *s.upstream
-	upstreamURL.Path = r.URL.Path
-	upstreamURL.RawQuery = r.URL.RawQuery
-
-	// Rewrite Host: replace relay domain with upstream domain
-	host := requestHost(r)
-	if sub, _ := s.matchBaseDomain(host); sub != "" {
-		// Subdomain request: dcr.relay.example.com → dcr.mirs.uk
-		upstreamURL.Host = sub + "." + s.upstream.Hostname()
-	} else if _, base := s.matchBaseDomain(host); base != "" {
-		// Bare domain request: relay.example.com → mirs.uk
-		upstreamURL.Host = s.upstream.Host
-	} else {
-		// Unknown host
-		upstreamURL.Host = s.upstream.Host
-	}
-
-	req, err := http.NewRequestWithContext(r.Context(), r.Method, upstreamURL.String(), r.Body)
-	if err != nil {
-		http.Error(w, "bad request", http.StatusBadRequest)
-		return
-	}
-
-	copyHeaders(req.Header, r.Header)
-
-	// Set X-MDB-Relay-Host if not already present (lower relay may have set it)
-	if r.Header.Get("X-MDB-Relay-Host") == "" {
-		if _, base := s.matchBaseDomain(host); base != "" {
-			req.Header.Set("X-MDB-Relay-Host", base)
-		}
-	}
-
-	resp, err := s.client.Do(req)
-	if err != nil {
-		log.Printf("upstream error: %v", err)
-		http.Error(w, "upstream error", http.StatusBadGateway)
-		return
-	}
-	defer resp.Body.Close()
-
-	copyHeaders(w.Header(), resp.Header)
-	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
-}
-
 // refreshMirrors fetches /api/mirrors from upstream.
 func (s *Server) refreshMirrors() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
 	var result mirrorsResponse
-	resp, err := s.resty.R().SetResult(&result).Get("/api/mirrors")
+	resp, err := s.resty.R().SetContext(ctx).SetResult(&result).Get("/api/mirrors")
 	if err != nil {
 		return err
 	}
@@ -239,14 +282,36 @@ func (s *Server) refreshMirrors() error {
 	s.mirrors.Store(&mirrors)
 	s.allowedHosts.Store(&hosts)
 	s.keepHTTP.Store(&httpOK)
+	s.ready.Store(true)
 	log.Printf("loaded %d mirrors (%d hosts) from upstream", len(mirrors), len(hosts))
 	return nil
 }
 
+// Mirrors returns the current manifest as JSON, for operators debugging
+// upstream discovery. Served at /.mirror-relay/mirrors.
+func (s *Server) Mirrors() ([]Mirror, error) {
+	p := s.mirrors.Load()
+	if p == nil {
+		return nil, nil
+	}
+	return *p, nil
+}
+
+func (s *Server) handleMirrors(w http.ResponseWriter, r *http.Request) {
+	m, err := s.Mirrors()
+	if err != nil {
+		http.Error(w, "no manifest", http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(mirrorsResponse{Mirrors: m})
+}
+
 func (s *Server) watchMirrors(interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for range ticker.C {
+	for {
+		// Jitter each cycle so a fleet of relays doesn't stampede the Worker.
+		next := interval + time.Duration(rand.Int64N(int64(interval/3))) - interval/6
+		time.Sleep(next)
 		if err := s.refreshMirrors(); err != nil {
 			log.Printf("mirror refresh failed: %v", err)
 		}
@@ -271,11 +336,13 @@ func (s *Server) ShouldKeepHTTP(r *http.Request) bool {
 	return false
 }
 
+// httpRedirectHandler upgrades plain HTTP to HTTPS. 308 preserves the method
+// and body across the redirect; 301 would silently turn a POST into a GET.
 func httpRedirectHandler(w http.ResponseWriter, r *http.Request) {
 	host := hostOnly(r.Host)
 	target := "https://" + host + r.URL.RequestURI()
 	w.Header().Set("Connection", "close")
-	http.Redirect(w, r, target, http.StatusMovedPermanently)
+	http.Redirect(w, r, target, http.StatusPermanentRedirect)
 }
 
 func hostOnly(hostport string) string {
@@ -285,12 +352,17 @@ func hostOnly(hostport string) string {
 	return hostport
 }
 
+// requestHost is the host the client addressed us on. X-Forwarded-Host is
+// trusted unconditionally: the relay is an open proxy by design.
 func requestHost(r *http.Request) string {
 	host := r.Host
 	if h := r.Header.Get("X-Forwarded-Host"); h != "" {
-		host = h
+		if i := strings.IndexByte(h, ','); i >= 0 {
+			h = h[:i]
+		}
+		host = strings.TrimSpace(h)
 	}
-	return hostOnly(host)
+	return strings.ToLower(strings.TrimSuffix(hostOnly(host), "."))
 }
 
 // buildTransport creates an http.RoundTripper using CF fastest-node discovery.
@@ -350,7 +422,7 @@ func buildProxyTransport(rawURL string) (http.RoundTripper, error) {
 // buildDisguiseTransport creates an http.RoundTripper that dials upstream via
 // SSH-banner-disguised TLS on the given port.
 func buildDisguiseTransport(host string, port int) http.RoundTripper {
-	addr := fmt.Sprintf("%s:%d", host, port)
+	addr := net.JoinHostPort(host, fmt.Sprint(port))
 	return &http.Transport{
 		DialTLSContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
 			return disguiseDialTLS(ctx, addr, &tls.Config{ServerName: host})
@@ -359,27 +431,5 @@ func buildDisguiseTransport(host string, port int) http.RoundTripper {
 		MaxIdleConnsPerHost:   100,
 		IdleConnTimeout:       90 * time.Second,
 		ResponseHeaderTimeout: 30 * time.Second,
-	}
-}
-
-var hopHeaders = map[string]bool{
-	"connection":          true,
-	"keep-alive":          true,
-	"proxy-authenticate":  true,
-	"proxy-authorization": true,
-	"te":                  true,
-	"trailers":            true,
-	"transfer-encoding":   true,
-	"upgrade":             true,
-}
-
-func copyHeaders(dst, src http.Header) {
-	for k, vv := range src {
-		if hopHeaders[strings.ToLower(k)] {
-			continue
-		}
-		for _, v := range vv {
-			dst.Add(k, v)
-		}
 	}
 }

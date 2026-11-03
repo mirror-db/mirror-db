@@ -7,7 +7,9 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/caddyserver/certmagic"
@@ -16,20 +18,18 @@ import (
 	"github.com/mirror-db/mirror-db/tools/relay/config"
 )
 
-// buildCertMagicStorage returns either file-based or upstream cert-client storage.
-func buildCertMagicStorage() certmagic.Storage {
-	if config.IsAcmeUpstream() {
-		client := &certclient.CertClient{
-			CertPackURL: config.CertPackURL(),
-			SecretKey:   config.GetSecretKey(),
-		}
-		if err := client.Refresh(); err != nil {
-			log.Fatalf("failed to fetch cert-pack from upstream: %v", err)
-		}
-		return client
+// CertMagicStorage returns the storage backend for this process:
+//   - ACME mode: a local file store under the config dir.
+//   - cert-pack mode: the shared CertClient snapshot of the upstream pack.
+//
+// Resolved once per process; every caller (TLS config, /cert-pack endpoint,
+// renewals) must see the same instance.
+var CertMagicStorage = sync.OnceValue(func() certmagic.Storage {
+	if c := buildCertClient(); c != nil {
+		return c
 	}
 	return &certmagic.FileStorage{Path: config.ResolveConfig("certmagic")}
-}
+})
 
 // domainTokenMap builds a mapping from domain suffix to CF API token.
 // For a config like [{domain:"a.com", cf_api_token:"tok-a"}, {domain:"b.com", cf_api_token:"tok-b"}],
@@ -90,7 +90,7 @@ func makeIssuer(cfg *certmagic.Config, cfToken string) certmagic.Issuer {
 // buildCertMagicConfig creates a certmagic config with per-domain DNS-01 solver.
 // Returns both the config (for TLS) and the cache (for ManageSync per-token).
 func buildCertMagicConfig() (*certmagic.Config, *certmagic.Cache) {
-	storage := buildCertMagicStorage()
+	storage := CertMagicStorage()
 	tokens := domainTokenMap()
 
 	// GetConfigForCert is called per-certificate for renewal.
@@ -168,13 +168,16 @@ func manageDomainsPerToken(ctx context.Context, cache *certmagic.Cache, storage 
 func ListenAndServeHTTPS(srv *Server) error {
 	ctx := context.Background()
 	cm, cache := buildCertMagicConfig()
-	storage := buildCertMagicStorage()
+	storage := CertMagicStorage()
 
-	// Manage certs per-token group so each domain uses the correct CF API token.
-	if err := manageDomainsPerToken(ctx, cache, storage); err != nil {
-		return fmt.Errorf("certmagic manage: %w", err)
+	// ACME mode is the only one that needs to acquire/keep certificates; in
+	// cert-pack mode the parent owns them and this relay is a pure consumer.
+	if !config.IsAcmeUpstream() {
+		// Manage certs per-token group so each domain uses the correct CF API token.
+		if err := manageDomainsPerToken(ctx, cache, storage); err != nil {
+			return fmt.Errorf("certmagic manage: %w", err)
+		}
 	}
-
 	// HTTP listener
 	httpLn, err := net.Listen("tcp", fmt.Sprintf(":%d", certmagic.HTTPPort))
 	if err != nil {
@@ -190,9 +193,11 @@ func ListenAndServeHTTPS(srv *Server) error {
 		return fmt.Errorf("https listen: %w", err)
 	}
 
-	// HTTP handler: ACME challenge wraps the HTTPRouter (keepHTTP + redirect)
+	// HTTP handler: ACME challenge wraps the HTTPRouter (keepHTTP + redirect).
+	// In cert-pack mode this relay issues nothing, so it must not advertise an
+	// ACME challenge endpoint.
 	var httpHandler http.Handler = srv.HTTPRouter
-	if len(cm.Issuers) > 0 {
+	if !config.IsAcmeUpstream() && len(cm.Issuers) > 0 {
 		if am, ok := cm.Issuers[0].(*certmagic.ACMEIssuer); ok {
 			httpHandler = am.HTTPChallengeHandler(srv.HTTPRouter)
 		}
@@ -226,6 +231,8 @@ func ListenAndServeHTTPS(srv *Server) error {
 			return fmt.Errorf("disguise listen: %w", err)
 		}
 		log.Printf("Disguise (SSH+TLS) on :%d", port)
+		// Same handler set as :443, so HTTP/2 (already in tlsConfig.NextProtos)
+		// works identically on the disguised port.
 		go httpsSrv.Serve(dLn)
 	}
 
@@ -243,7 +250,36 @@ func resolveCertAuthority(ca string) string {
 	}
 }
 
-// GetCertMagicStorage exposes the storage (used by cert-pack endpoint).
-func GetCertMagicStorage() certmagic.Storage {
-	return buildCertMagicStorage()
+// buildCertClient returns the cert-pack client for this process, or nil in
+// ACME mode. The instance is shared so the deferred TLS config, the cert-pack
+// endpoint and the certmagic storage all read the same snapshot.
+var buildCertClient = sync.OnceValue(func() *certclient.CertClient {
+	if !config.IsAcmeUpstream() {
+		return nil
+	}
+	c := &certclient.CertClient{
+		CertPackURL: config.CertPackURL(),
+		SecretKey:   config.GetSecretKey(),
+		Transport:   certTransport(),
+	}
+	if err := c.Refresh(); err != nil {
+		log.Fatalf("failed to fetch cert-pack from upstream: %v", err)
+	}
+	return c
+})
+
+// certTransport follows the same upstream path rules as proxying, so a relay
+// that can only reach its parent through the SSH disguise can still sync certs.
+func certTransport() http.RoundTripper {
+	if px := config.GetUpstreamProxy(); px != "" {
+		if t, err := buildProxyTransport(px); err == nil {
+			return t
+		}
+	}
+	if dp := config.GetUpstreamDisguisePort(); dp != 0 {
+		if u, err := url.Parse(config.CertPackURL()); err == nil {
+			return buildDisguiseTransport(u.Hostname(), dp)
+		}
+	}
+	return http.DefaultTransport
 }

@@ -104,3 +104,7 @@ func clientBannerExchange(conn net.Conn) error {
 	}
 	return nil
 }
+
+// ClientBannerExchange exposes the client half of the disguise handshake so
+// `relay forward` uses exactly the same wire protocol as `relay serve`.
+func ClientBannerExchange(conn net.Conn) error { return clientBannerExchange(conn) }

@@ -64,7 +64,15 @@ func (s *Server) proxySpeedtest(w http.ResponseWriter, r *http.Request, mb, pass
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	req.Header.Set("Host", s.upstream.Host)
+	// req.Host is what net/http sends as the Host header; setting the header key
+	// directly is a silent no-op. SetURL semantics: the URL already carries the
+	// host, this keeps it explicit.
+	req.Host = s.upstream.Host
+	// Keep the chain's public origin visible to the Worker, as the main proxy
+	// path does — the passthrough hop is user-facing too.
+	if v := r.Header.Get(RelayHostHeader); v != "" {
+		req.Header.Set(RelayHostHeader, v)
+	}
 
 	resp, err := s.client.Do(req)
 	if err != nil {
