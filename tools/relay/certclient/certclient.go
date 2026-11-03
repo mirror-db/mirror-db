@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"net/http"
 	"path"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -227,6 +228,7 @@ func (c *CertClient) List(_ context.Context, prefix string, recursive bool) ([]s
 	}
 
 	prefix = strings.TrimSuffix(prefix, "/")
+	seen := make(map[string]struct{}, len(files))
 	keys := make([]string, 0, len(files))
 	for k := range files {
 		if prefix != "" && k != prefix && !strings.HasPrefix(k, prefix+"/") {
@@ -236,11 +238,23 @@ func (c *CertClient) List(_ context.Context, prefix string, recursive bool) ([]s
 		if rel == "" {
 			continue
 		}
-		if !recursive && strings.Contains(rel, "/") {
+		if !recursive {
+			// The storage contract reports the immediate children of prefix —
+			// a directory counts as a key of its own. Returning every file below
+			// the prefix instead made the listing look empty to callers that
+			// stop at the first path separator.
+			if i := strings.IndexByte(rel, '/'); i >= 0 {
+				rel = rel[:i]
+			}
+		}
+		key := path.Join(prefix, rel)
+		if _, dup := seen[key]; dup {
 			continue
 		}
-		keys = append(keys, k)
+		seen[key] = struct{}{}
+		keys = append(keys, key)
 	}
+	sort.Strings(keys)
 	return keys, nil
 }
 

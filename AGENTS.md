@@ -556,6 +556,12 @@ with `passthrough - 1`; when 0 or absent, serves random bytes locally.
 - `tools/relay/server/certmagic.go` — `CertMagicStorage()` is a `sync.OnceValue`:
   file storage in ACME mode, the shared `certclient.CertClient` in cert-pack
   mode. ACME issuance is skipped entirely in cert-pack mode.
+- `packCache` (same file) — certmagic only reads Storage for names it manages or
+  when on-demand TLS is on, so a consumer's pack would never be looked at and
+  every handshake answered `no certificate available`. The pack is loaded into
+  the cache as **unmanaged** certificates at startup and re-loaded every 30
+  minutes, dropping hashes that left the pack so a renewal replaces its
+  predecessor. See [ADR 0008](docs/adr/0008-cert-pack-consumer-caches-the-pack.md).
 - `tools/relay/server/disguise.go` — SSH banner exchange
   (`ClientBannerExchange` is exported for `forward`).
 - `tools/relay/server/speedtest.go` — `/speedtest/{mb}` handler with passthrough.

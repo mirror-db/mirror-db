@@ -3,7 +3,9 @@ package server
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log"
 	"net"
 	"net/http"
@@ -177,6 +179,19 @@ func ListenAndServeHTTPS(srv *Server) error {
 		if err := manageDomainsPerToken(ctx, cache, storage); err != nil {
 			return fmt.Errorf("certmagic manage: %w", err)
 		}
+	} else {
+		// certmagic consults Storage on its own only for names it manages, or
+		// when on-demand TLS is enabled. A cert-pack consumer does neither, so
+		// without an explicit load the pack sits in storage and every handshake
+		// answers "no certificate available"
+		// (docs/adr/0008-cert-pack-consumer-caches-the-pack.md).
+		pc := newPackCache(cache, cm, storage)
+		if n, err := pc.reload(ctx); err != nil {
+			log.Printf("cert-pack: %v (no TLS until it can be read)", err)
+		} else {
+			log.Printf("cert-pack: %d certificates loaded", n)
+		}
+		go pc.run(ctx)
 	}
 	// HTTP listener
 	httpLn, err := net.Listen("tcp", fmt.Sprintf(":%d", certmagic.HTTPPort))
@@ -282,4 +297,123 @@ func certTransport() http.RoundTripper {
 		}
 	}
 	return http.DefaultTransport
+}
+
+// packCache loads a certificate pack into certmagic's in-memory cache and keeps
+// it in step with what the upstream publishes.
+//
+// This exists because certmagic will not do it: `getCertificate` only reads
+// Storage when it is managing the name itself (which a cert-pack consumer does
+// not) or when on-demand TLS is enabled (which would try to issue). Without an
+// explicit load, a pack that is perfectly present in storage produces
+// "no certificate available for 'example.com'" on every handshake.
+type packCache struct {
+	cache   *certmagic.Cache
+	cm      *certmagic.Config
+	storage certmagic.Storage
+
+	mu     sync.Mutex
+	hashes []string
+}
+
+func newPackCache(cache *certmagic.Cache, cm *certmagic.Config, storage certmagic.Storage) *packCache {
+	return &packCache{cache: cache, cm: cm, storage: storage}
+}
+
+// reload loads every certificate in the pack, and drops any that has left it.
+func (p *packCache) reload(ctx context.Context) (int, error) {
+	// Recursive on purpose: the pack is keyed by issuer directory
+	// (certificates/<issuer>/<name>/), so a non-recursive listing of
+	// "certificates" stops above the names we want.
+	keys, err := p.storage.List(ctx, "certificates", true)
+	if errors.Is(err, fs.ErrNotExist) {
+		// A pack with no certificates yet is not a failure: the parent may still
+		// be issuing. Serving nothing is correct until it does.
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("list certificates: %w", err)
+	}
+
+	var (
+		loaded int
+		hashes []string
+	)
+	for _, key := range keys {
+		if !strings.HasSuffix(key, ".crt") {
+			continue
+		}
+		// certmagic pairs <name>.crt with <name>.key in the same directory.
+		keyFile := strings.TrimSuffix(key, ".crt") + ".key"
+
+		certPEM, err := p.storage.Load(ctx, key)
+		if err != nil {
+			log.Printf("cert-pack: read %s: %v", key, err)
+			continue
+		}
+		keyPEM, err := p.storage.Load(ctx, keyFile)
+		if err != nil {
+			log.Printf("cert-pack: read %s: %v", keyFile, err)
+			continue
+		}
+
+		hash, err := p.cm.CacheUnmanagedCertificatePEMBytes(ctx, certPEM, keyPEM, nil)
+		if err != nil {
+			log.Printf("cert-pack: cache %s: %v", key, err)
+			continue
+		}
+		hashes = append(hashes, hash)
+		loaded++
+	}
+
+	p.mu.Lock()
+	previous := p.hashes
+	p.hashes = hashes
+	p.mu.Unlock()
+
+	// A renewed certificate hashes differently; without this the old one would
+	// linger in the cache beside its replacement and could still be selected.
+	if stale := missingFrom(hashes, previous); len(stale) > 0 {
+		p.cache.Remove(stale)
+	}
+
+	return loaded, nil
+}
+
+// run re-reads the pack on a timer. The storage refreshes itself lazily on
+// access, so this is what turns "the parent renewed a certificate" into "this
+// relay serves the renewed one" — within half an hour, which is far inside any
+// renewal window.
+func (p *packCache) run(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			n, err := p.reload(ctx)
+			if err != nil {
+				log.Printf("cert-pack sync: %v (keeping what is cached)", err)
+				continue
+			}
+			log.Printf("cert-pack: %d certificates loaded", n)
+		}
+	}
+}
+
+// missingFrom returns the hashes in previous that are absent from current.
+func missingFrom(current, previous []string) []string {
+	keep := make(map[string]struct{}, len(current))
+	for _, h := range current {
+		keep[h] = struct{}{}
+	}
+	var stale []string
+	for _, h := range previous {
+		if _, ok := keep[h]; !ok {
+			stale = append(stale, h)
+		}
+	}
+	return stale
 }

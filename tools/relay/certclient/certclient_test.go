@@ -198,3 +198,48 @@ func TestCertClientKeepsOldSnapshotOnFailure(t *testing.T) {
 }
 
 var _ = io.Discard
+
+// A non-recursive listing reports the immediate children — directories as their
+// own keys — not every file buried below the prefix. certmagic's own storage
+// implementations behave this way, and a consumer that walks the pack one level
+// at a time needs it to.
+func TestCertClientListNonRecursive(t *testing.T) {
+	pack := tarWith(t, map[string]string{
+		"certificates/issuer-a/anitya.net/anitya.net.crt": "a",
+		"certificates/issuer-a/anitya.net/anitya.net.key": "b",
+		"certificates/issuer-b/netx.ink/netx.ink.crt":     "c",
+		"acme/issuer-a/users/me/acme.key":                 "d",
+	})
+	c, _ := newClient(t, pack, "s3cret")
+	if err := c.Refresh(); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	got, err := c.List(ctx, "certificates", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"certificates/issuer-a", "certificates/issuer-b"}
+	if len(got) != len(want) {
+		t.Fatalf("List(certificates, false) = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("List(certificates, false) = %v, want %v", got, want)
+		}
+	}
+
+	// One level deeper reports the certificate directories, which is how the
+	// pack is walked to find <name>.crt / <name>.key.
+	got, _ = c.List(ctx, "certificates/issuer-a", false)
+	if len(got) != 1 || got[0] != "certificates/issuer-a/anitya.net" {
+		t.Fatalf("List(certificates/issuer-a, false) = %v", got)
+	}
+
+	// Recursive still returns the files themselves.
+	got, _ = c.List(ctx, "certificates", true)
+	if len(got) != 3 {
+		t.Fatalf("List(certificates, true) = %v, want 3 files", got)
+	}
+}
