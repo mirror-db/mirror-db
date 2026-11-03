@@ -92,7 +92,7 @@ describe("MdbCacheManager (workerd)", () => {
     expect(hit!.headers.get("set-cookie")).toBeNull();
   });
 
-  it("stamps the store time and lifts the advertised lifetime", async () => {
+  it("stamps the store time and keeps the client lifetime beside the entry", async () => {
     const request = new Request(uniqueUrl("stamped"));
     await mgr.save(
       request,
@@ -103,7 +103,23 @@ describe("MdbCacheManager (workerd)", () => {
 
     const hit = await mgr.match(request);
     expect(Number(hit!.headers.get("x-mdb-stored-at"))).toBeGreaterThan(0);
-    expect(hit!.headers.get("cache-control")).toBe("public, max-age=600");
+    // The client-facing value is lifted to the revalidation floor…
+    expect(hit!.headers.get("x-mdb-client-cc")).toBe("public, max-age=600");
+    // …while the stored copy keeps a long lifetime, because `cache.match`
+    // honours `max-age`: at 600s the entry would stop matching exactly when its
+    // revalidation came due, and the re-check would never run.
+    expect(hit!.headers.get("cache-control")).toBe("public, max-age=31536000");
+  });
+
+  it("does not store a response the upstream marked no-store", async () => {
+    const request = new Request(uniqueUrl("no-store"));
+    await mgr.save(
+      request,
+      new Response("secret", {
+        headers: { "content-type": "text/plain", "cache-control": "no-store" },
+      }),
+    );
+    expect(await mgr.match(request)).toBeUndefined();
   });
 
   it("skips responses over the size limit", async () => {

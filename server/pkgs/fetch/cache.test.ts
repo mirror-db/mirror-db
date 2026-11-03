@@ -161,6 +161,9 @@ describe("cachedfetch — periodic revalidation", () => {
     };
     if (opts.etag) headers.etag = opts.etag;
     if (opts.maxAge !== undefined) headers["cache-control"] = `public, max-age=${opts.maxAge}`;
+    // Entries written by `save()` carry the client lifetime here; a hand-made
+    // fixture must mirror that shape.
+    headers["x-mdb-client-cc"] = "public, max-age=600";
     return new Response(opts.body ?? "v1", { headers });
   };
 
@@ -258,6 +261,15 @@ describe("cachedfetch — periodic revalidation", () => {
     state.now = STORED_AT + 365 * 24 * 3600 * 1000;
     expect(await (await cachedfetch(url)).text()).toBe("legacy");
     expect(state.fetch).not.toHaveBeenCalled();
+  });
+
+  it("serves the client lifetime, not the store's long one", async () => {
+    cache.entries.set(url, stored({ etag: '"a"', maxAge: 60 }));
+    state.now = STORED_AT + 1_000;
+    const res = await cachedfetch(url);
+    expect(res.headers.get("x-mdb-cache")).toBe("hit");
+    expect(res.headers.get("x-mdb-client-cc")).toBeNull();
+    expect(res.headers.get("cache-control")).toBe("public, max-age=600");
   });
 
   it("does not leak the bookkeeping headers to the client", async () => {

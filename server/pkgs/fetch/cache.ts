@@ -31,6 +31,21 @@ export const MDB_STORED_AT = "x-mdb-stored-at";
 export const MDB_REVALIDATE_AFTER = "x-mdb-revalidate-after";
 
 /**
+ * The lifetime to advertise to clients, kept beside the stored copy.
+ *
+ * The store's own `Cache-Control` cannot express this: `cache.match()` honours
+ * `max-age`, so an entry stored with the client-facing 10 minutes stopped
+ * matching exactly when its revalidation was due — the entry expired instead of
+ * being re-checked, and the revalidation branch never ran in production. The
+ * stored copy therefore gets a long lifetime and the client value travels in
+ * this header, applied when the entry is served.
+ */
+export const MDB_CLIENT_CACHE_CONTROL = "x-mdb-client-cc";
+
+/** Lifetime given to the stored copy, so it survives until revalidation. */
+const STORE_CACHE_CONTROL = "public, max-age=31536000";
+
+/**
  * Lift the advertised lifetime up to the revalidation floor, leaving every
  * other directive alone.
  *
@@ -144,6 +159,10 @@ export class MdbCacheManager {
     if (!this.isCacheable(req)) return;
     if (!this.isCacheable(resp)) return;
 
+    // An upstream that forbade caching stays uncached: its `Cache-Control` is
+    // neither lifted nor ignored.
+    if (isUncacheable(resp.headers.get("cache-control"))) return;
+
     await this.dedupExec(req, async () => {
       const cache = await ResolveCache(this.cache);
       const headers = new Headers(resp.headers);
@@ -156,7 +175,16 @@ export class MdbCacheManager {
       if (!headers.has(MDB_REVALIDATE_AFTER)) {
         headers.set(MDB_REVALIDATE_AFTER, String(MdbRevalidateIntervalMs));
       }
-      headers.set("cache-control", liftCacheControl(headers.get("cache-control")));
+      // The client-facing lifetime travels beside the entry; the stored copy
+      // itself keeps a long one. `cache.match` honours `max-age`, so storing
+      // the 10-minute client value made the entry expire exactly when its
+      // revalidation came due — the re-check never ran and every hit became a
+      // miss.
+      headers.set(
+        MDB_CLIENT_CACHE_CONTROL,
+        liftCacheControl(headers.get("cache-control")),
+      );
+      headers.set("cache-control", STORE_CACHE_CONTROL);
 
       let body: ReadableStream<Uint8Array> | ArrayBuffer | null = resp.body;
       if (shouldMaterialise(resp)) {
@@ -264,6 +292,13 @@ const mark = (
   const headers = new Headers(resp.headers);
   headers.delete(MDB_STORED_AT);
   headers.delete(MDB_REVALIDATE_AFTER);
+  // Restore the lifetime this mirror chose for clients; the stored copy carries
+  // a long one so the entry survives until its revalidation is due.
+  const clientCC = headers.get(MDB_CLIENT_CACHE_CONTROL);
+  if (clientCC) {
+    headers.set("cache-control", clientCC);
+    headers.delete(MDB_CLIENT_CACHE_CONTROL);
+  }
   headers.set(MDB_CACHE_HEADER, outcome);
   return new Response(resp.body, {
     status: resp.status,
@@ -341,6 +376,11 @@ async function revalidate(
   } finally {
     ctx.releaseRevalidation(req.url);
   }
+}
+
+/** True when the upstream forbade storing this response. */
+export function isUncacheable(cacheControl: string | null): boolean {
+  return !!cacheControl && /(?:^|,)\s*(?:no-store|no-cache)\s*(?:,|$)/i.test(cacheControl);
 }
 
 /** `resp` with its `Cache-Control` lifted to the revalidation floor. */
