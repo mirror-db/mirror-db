@@ -4,12 +4,14 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
-	"log"
 	"net/http"
-	"path/filepath"
+	"path"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -18,11 +20,23 @@ import (
 	"github.com/mirror-db/mirror-db/tools/relay/guard"
 )
 
-// CertClient implements certmagic.Storage by fetching cert-pack tar from
-// an upstream relay instance.
+// refreshInterval is how long a fetched cert-pack is considered current.
+const refreshInterval = time.Hour
+
+// maxPackBytes bounds the cert-pack download; a full certmagic store for a
+// handful of wildcard domains is a few hundred KB.
+const maxPackBytes = 64 << 20
+
+// CertClient implements certmagic.Storage by fetching a cert-pack tar from an
+// upstream relay instance.
+//
+// It is a READ-ONLY consumer: the parent owns issuance and renewal. Mutating
+// operations return certmagic.ErrNotImplemented so certmagic never believes it
+// renewed a certificate that the pack will not carry.
 type CertClient struct {
 	CertPackURL string
 	SecretKey   []byte
+	Transport   http.RoundTripper // nil → http.DefaultTransport
 
 	mu       sync.Mutex
 	files    atomic.Pointer[map[string]fileEntry]
@@ -42,10 +56,10 @@ func (c *CertClient) isFresh() bool {
 	if ts == 0 {
 		return false
 	}
-	return time.Since(time.UnixMilli(ts)) < time.Hour
+	return time.Since(time.UnixMilli(ts)) < refreshInterval
 }
 
-// Refresh fetches cert-pack if cache expired (1 hour).
+// Refresh fetches the cert-pack if the cached snapshot is older than one hour.
 func (c *CertClient) Refresh() error {
 	if c.isFresh() {
 		return nil
@@ -67,23 +81,28 @@ func (c *CertClient) fetch() error {
 		return fmt.Errorf("sign token: %w", err)
 	}
 
-	req, err := http.NewRequest("GET", c.CertPackURL, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.CertPackURL, nil)
 	if err != nil {
 		return fmt.Errorf("new request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+tokenStr)
 
-	resp, err := http.DefaultClient.Do(req)
+	client := &http.Client{Transport: c.Transport, Timeout: 0}
+	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("fetch cert-pack: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		// Do not echo the body: it may contain upstream internals.
 		return fmt.Errorf("cert-pack returned %s", resp.Status)
 	}
 
-	data, err := io.ReadAll(resp.Body)
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxPackBytes))
 	if err != nil {
 		return fmt.Errorf("read cert-pack: %w", err)
 	}
@@ -92,13 +111,17 @@ func (c *CertClient) fetch() error {
 	if err != nil {
 		return fmt.Errorf("untar cert-pack: %w", err)
 	}
+	if _, ok := files["certificates"]; !ok && len(files) == 0 {
+		return fmt.Errorf("cert-pack is empty")
+	}
 
 	c.files.Store(&files)
 	c.updateAt.Store(time.Now().UnixMilli())
-	log.Printf("cert-pack refreshed: %d entries", len(files))
 	return nil
 }
 
+// untar parses a cert-pack tar into storage-keyed entries, stripping the
+// leading "certmagic/" directory the server adds.
 func untar(data []byte) (map[string]fileEntry, error) {
 	files := make(map[string]fileEntry)
 	tr := tar.NewReader(bytes.NewReader(data))
@@ -112,78 +135,77 @@ func untar(data []byte) (map[string]fileEntry, error) {
 			return nil, err
 		}
 
-		// Strip "certmagic/" prefix to get storage key
-		key := hdr.Name
-		if rest, ok := cutPrefix(key, "certmagic/"); ok {
-			key = rest
+		key := path.Clean(strings.TrimPrefix(hdr.Name, "certmagic/"))
+		if key == "." || key == "" {
+			continue
 		}
-		key = filepath.Clean(key)
+		// Reject absolute or parent-escaping entries outright.
+		if path.IsAbs(key) || strings.HasPrefix(key, "../") {
+			return nil, fmt.Errorf("unsafe path in cert-pack: %q", hdr.Name)
+		}
 
 		if hdr.Typeflag == tar.TypeDir {
 			files[key] = fileEntry{isDir: true, modTime: hdr.ModTime}
-		} else {
-			content, err := io.ReadAll(tr)
-			if err != nil {
-				return nil, err
-			}
-			files[key] = fileEntry{content: content, modTime: hdr.ModTime}
+			continue
 		}
+
+		content, err := io.ReadAll(tr)
+		if err != nil {
+			return nil, err
+		}
+		files[key] = fileEntry{content: content, modTime: hdr.ModTime}
 	}
 	return files, nil
 }
 
-func cutPrefix(s, prefix string) (string, bool) {
-	if len(s) >= len(prefix) && s[:len(prefix)] == prefix {
-		return s[len(prefix):], true
-	}
-	return s, false
-}
-
 func (c *CertClient) getFiles() map[string]fileEntry {
-	p := c.files.Load()
-	if p == nil {
-		return nil
+	if p := c.files.Load(); p != nil {
+		return *p
 	}
-	return *p
+	return nil
 }
 
-// certmagic.Storage implementation
+// --- certmagic.Storage ---
 
-func (c *CertClient) Store(_ context.Context, _ string, _ []byte) error { return nil }
-func (c *CertClient) Delete(_ context.Context, _ string) error          { return nil }
-func (c *CertClient) Lock(_ context.Context, _ string) error            { return nil }
-func (c *CertClient) Unlock(_ context.Context, _ string) error          { return nil }
+// ErrReadOnly is returned by mutating operations. certmagic surfaces it to the
+// caller instead of pretending the write succeeded.
+var ErrReadOnly = errors.New("certclient: storage is read-only")
+
+// Mutating operations are not supported: this relay consumes the parent's
+// certificates, it never issues its own.
+func (c *CertClient) Store(context.Context, string, []byte) error {
+	return ErrReadOnly
+}
+
+func (c *CertClient) Delete(context.Context, string) error {
+	return ErrReadOnly
+}
+
+// Lock / Unlock are no-ops that succeed: nothing here is shared state, so
+// refusing would only stall certmagic's read-side bookkeeping.
+
+func (c *CertClient) Lock(context.Context, string) error   { return nil }
+func (c *CertClient) Unlock(context.Context, string) error { return nil }
 
 func (c *CertClient) Exists(_ context.Context, key string) bool {
-	c.Refresh()
-	files := c.getFiles()
-	if files == nil {
-		return false
-	}
-	_, ok := files[key]
+	_ = c.Refresh()
+	_, ok := c.getFiles()[key]
 	return ok
 }
 
 func (c *CertClient) Load(_ context.Context, key string) ([]byte, error) {
-	c.Refresh()
-	files := c.getFiles()
-	if files == nil {
-		return nil, fs.ErrNotExist
-	}
-	f, ok := files[key]
+	_ = c.Refresh()
+	f, ok := c.getFiles()[key]
 	if !ok {
 		return nil, fs.ErrNotExist
 	}
-	return f.content, nil
+	// Return a copy: certmagic may hold the slice while we replace the map.
+	return bytes.Clone(f.content), nil
 }
 
 func (c *CertClient) Stat(_ context.Context, key string) (certmagic.KeyInfo, error) {
-	c.Refresh()
-	files := c.getFiles()
-	if files == nil {
-		return certmagic.KeyInfo{}, fs.ErrNotExist
-	}
-	f, ok := files[key]
+	_ = c.Refresh()
+	f, ok := c.getFiles()[key]
 	if !ok {
 		return certmagic.KeyInfo{}, fs.ErrNotExist
 	}
@@ -195,43 +217,38 @@ func (c *CertClient) Stat(_ context.Context, key string) (certmagic.KeyInfo, err
 	}, nil
 }
 
+// List returns keys under prefix. Like certmagic.FileStorage, keys are returned
+// relative to prefix when the prefix names a directory.
 func (c *CertClient) List(_ context.Context, prefix string, recursive bool) ([]string, error) {
-	c.Refresh()
+	_ = c.Refresh()
 	files := c.getFiles()
 	if files == nil {
 		return nil, nil
 	}
-	var keys []string
+
+	prefix = strings.TrimSuffix(prefix, "/")
+	keys := make([]string, 0, len(files))
 	for k := range files {
-		if k == prefix || hasPathPrefix(k, prefix) {
-			rel := k
-			if prefix != "" {
-				rel = k[len(prefix):]
-				if len(rel) > 0 && rel[0] == '/' {
-					rel = rel[1:]
-				}
-			}
-			if !recursive && containsSlash(rel) {
-				continue
-			}
-			keys = append(keys, k)
+		if prefix != "" && k != prefix && !strings.HasPrefix(k, prefix+"/") {
+			continue
 		}
+		rel := strings.TrimPrefix(strings.TrimPrefix(k, prefix), "/")
+		if rel == "" {
+			continue
+		}
+		if !recursive && strings.Contains(rel, "/") {
+			continue
+		}
+		keys = append(keys, k)
 	}
 	return keys, nil
 }
 
-func hasPathPrefix(path, prefix string) bool {
-	if prefix == "" || prefix == "." {
-		return true
+// String is handy in logs and satisfies fmt.Stringer.
+func (c *CertClient) String() string {
+	n := 0
+	if f := c.getFiles(); f != nil {
+		n = len(f)
 	}
-	return len(path) > len(prefix) && path[:len(prefix)] == prefix && path[len(prefix)] == '/'
-}
-
-func containsSlash(s string) bool {
-	for _, c := range s {
-		if c == '/' {
-			return true
-		}
-	}
-	return false
+	return "certclient(" + c.CertPackURL + ", " + strconv.Itoa(n) + " entries)"
 }
