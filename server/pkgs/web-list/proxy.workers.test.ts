@@ -88,6 +88,25 @@ describe("WebListProxy — Web listing", () => {
     expect(body.rendered).toBe(true);
     expect(body.path).toBe("pool/");
   });
+
+  it("GET /pool (no trailing slash) still lists pool, not its parent", async () => {
+    const seen: string[] = [];
+    const tracking = new WebListProxy({
+      baseURL: "http://ftp.us.debian.org/debian/",
+      fetchImpl: async (input: string | URL | Request) => {
+        const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+        seen.push(url);
+        return new Response(debianHtml, { headers: { "content-type": "text/html" } });
+      },
+      render(entries: WebListEntry[], path: string) {
+        return new Response(JSON.stringify({ rendered: true, path, count: entries.length }));
+      },
+    });
+
+    const res = await tracking.fetch(req("http://localhost/pool?format=json"));
+    expect(res.status).toBe(200);
+    expect(seen).toEqual(["http://ftp.us.debian.org/debian/pool/"]);
+  });
 });
 
 // ── File passthrough ────────────────────────────────────────────────────────

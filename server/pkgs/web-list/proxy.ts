@@ -132,7 +132,11 @@ export class WebListProxy {
   }
 
   private async handleDirectory(rel: string, json: boolean): Promise<Response> {
-    const entries = await this.fs.readdir(rel);
+    // A trailing `/` means "this directory", so listing `2024/` must request
+    // `2024/` upstream — without the slash the base join collapses it and the
+    // parent is listed instead.
+    const dirRel = rel === "" || rel.endsWith("/") ? rel : `${rel}/`;
+    const entries = await this.fs.readdir(dirRel);
 
     if (json) {
       return Response.json({ path: rel, entries });
