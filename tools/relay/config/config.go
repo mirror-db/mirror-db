@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -128,6 +129,48 @@ func GetCfPatrolSpeedInterval() time.Duration {
 }
 func GetCfRecruitInterval() time.Duration {
 	return viper.GetDuration("cf.recruit_interval")
+}
+
+// GetCfPatrolIntensity scales how much a patrol measures: 1 re-measures every
+// pool member once, 0.5 measures half, above 1 averages repeated samples.
+func GetCfPatrolIntensity() float64 {
+	if v := viper.GetFloat64("cf.patrol_intensity"); v > 0 {
+		return v
+	}
+	return 1
+}
+
+// GetCfCandidatesFile is where the candidate snapshot lives. It lets a restart
+// skip exploring every published range, and it is the successor to the old
+// cf-nodes.csv (which nothing reads any more).
+func GetCfCandidatesFile() string {
+	if p := strings.TrimSpace(viper.GetString("cf.candidates_file")); p != "" {
+		return p
+	}
+	return ResolveConfig("cf-candidates.csv")
+}
+
+// GetCfSnapshotInterval is how often the candidate snapshot is refreshed. It is
+// also written on shutdown.
+func GetCfSnapshotInterval() time.Duration {
+	if d := viper.GetDuration("cf.snapshot_interval"); d > 0 {
+		return d
+	}
+	return time.Hour
+}
+
+// GetCfBootstrapHost is resolved when no snapshot exists, to seed the first
+// candidate list. Defaults to the upstream hostname: the name clients actually
+// use is a better prior than a random IP per subnet.
+func GetCfBootstrapHost() string {
+	if h := strings.TrimSpace(viper.GetString("cf.bootstrap_host")); h != "" {
+		return h
+	}
+	u, err := url.Parse(GetUpstreamURL())
+	if err != nil {
+		return ""
+	}
+	return u.Hostname()
 }
 
 // GetCfInitTimeout bounds how long startup waits for the edge pools to fill.

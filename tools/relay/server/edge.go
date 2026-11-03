@@ -83,6 +83,11 @@ func engineConfig() engine.Config {
 		PatrolLatencyInterval: config.GetCfPatrolLatencyInterval(),
 		PatrolSpeedInterval:   config.GetCfPatrolSpeedInterval(),
 		RecruitInterval:       config.GetCfRecruitInterval(),
+
+		PatrolIntensity:  config.GetCfPatrolIntensity(),
+		SnapshotPath:     config.GetCfCandidatesFile(),
+		SnapshotInterval: config.GetCfSnapshotInterval(),
+		BootstrapHost:    config.GetCfBootstrapHost(),
 	}
 
 	if n := config.GetCfPoolCapacity(); n > 0 {
