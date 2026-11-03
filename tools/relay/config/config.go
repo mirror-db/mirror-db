@@ -115,7 +115,6 @@ func GetCfSpeedURL() string         { return strings.TrimSpace(viper.GetString("
 func GetCfLatencyMinScore() float64 { return viper.GetFloat64("cf.latency_min_score") }
 func GetCfSpeedMinScore() float64   { return viper.GetFloat64("cf.speed_min_score") }
 func GetCfPenalty() float64         { return viper.GetFloat64("cf.penalty") }
-func GetCfScanSamples() int         { return viper.GetInt("cf.scan_samples") }
 func GetCfRecruitSamples() int      { return viper.GetInt("cf.recruit_samples") }
 
 func GetCfScanInterval() time.Duration {

@@ -38,15 +38,15 @@ cf:                          # edge selection; every key is optional
   # speed_seed_count: 3      # bootstrap IPs speed-probed during Initialize
   # latency_url: ""          # default: cloudflare.com/cdn-cgi/trace
   # speed_url: ""            # default: speed.cloudflare.com/__down
-  # latency_min_score: 200   # = slower than 800ms is discarded
+  # latency_min_score: 250   # reciprocal score; 250 ≈ "answers within 4s"
   # speed_min_score: 65536   # = below 64KiB/s is discarded
   # penalty: 0.5             # score multiplier for a failed request
-  # scan_interval: 1h
-  # patrol_latency_interval: 30m   # cadence of a full pass (patrol explores too)
+  # scan_interval: 1h        # discover new candidates (expensive)
+  # patrol_latency_interval: 5m    # re-measure members (cheap)
   # patrol_speed_interval: 30m
   # recruit_interval: 10m
   # init_timeout: 30s        # startup wait; exceeding it is not fatal
-  # patrol_intensity: 1      # exploration volume vs the pre-rewrite Refresh
+  # patrol_intensity: 1      # scan budget ceiling vs the pre-rewrite Refresh
   #                          # (≈6k candidates); 0.5 = half, capped at 4
   # candidates_file: ""      # default: <config dir>/cf-candidates.csv
   # snapshot_interval: 1h    # also written on shutdown
@@ -140,16 +140,21 @@ Measurements are gated: while this host cannot reach the canary
 (`223.5.5.5:443`), nothing is probed and in-flight results are discarded. A local
 outage must not look like "every Cloudflare IP got worse".
 
-A patrol re-measures every pool member and explores the address pools for new
-candidates. `cf.patrol_intensity` scales that exploration against the volume the
-pre-rewrite pool manager generated — one candidate per `/24`, about 6000 — so
-`1` reproduces the old intensity, `0.5` halves it, and it is capped at 4. The
-member pass is never scaled, so a low intensity costs freshness of the *pool*,
-not of the scores.
+Three jobs share the work. A **patrol** re-measures every member, which is bounded
+by the pools' capacity and therefore cheap — every five minutes. A **scan**
+explores the address pools for addresses nobody holds yet; it is the expensive
+one, on an hourly cadence. A **recruit** is a small scan on a short cadence, aimed
+at replenishment.
 
-Because a patrol at intensity 1 is several thousand probes, its interval is the
-cadence of a full pass (default 30 minutes), not a liveness check. Raising the
-intensity without raising the interval turns the relay into a crawler.
+`cf.patrol_intensity` sets the scan's candidate budget, measured against the
+volume the pre-rewrite pool manager generated — one candidate per `/24`, about
+6000 — so `1` allows the old intensity, `0.5` allows half, and it is capped at 4.
+
+It is a **ceiling, not a quota**: a scan stops as soon as the latency pool has
+taken as many admissible results as it has capacity, because past that point more
+probes only reshuffle a ranking that is already stocked, at the cost of the link
+the relay is meant to be accelerating. The budget is spent in full only when most
+candidates fail — which is exactly when looking longer pays off.
 
 A recruit waits for a patrol in progress — both are bulk measurements of the
 same links, and running them together makes both numbers wrong.

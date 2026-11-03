@@ -77,7 +77,6 @@ func engineConfig() engine.Config {
 		SeedCount:             config.GetCfSeedCount(),
 		SpeedSeedCount:        config.GetCfSpeedSeedCount(),
 		Penalty:               config.GetCfPenalty(),
-		ScanSamples:           config.GetCfScanSamples(),
 		RecruitSamples:        config.GetCfRecruitSamples(),
 		ScanInterval:          config.GetCfScanInterval(),
 		PatrolLatencyInterval: config.GetCfPatrolLatencyInterval(),
@@ -90,12 +89,17 @@ func engineConfig() engine.Config {
 		BootstrapHost:    config.GetCfBootstrapHost(),
 	}
 
-	if n := config.GetCfPoolCapacity(); n > 0 {
-		cfg.Latency = pool.Config{Capacity: n, MinimumScore: config.GetCfLatencyMinScore(), MaxPerPool: 4}
-	}
-	if n := config.GetCfSpeedCapacity(); n > 0 {
-		cfg.Speed = pool.Config{Capacity: n, MinimumScore: config.GetCfSpeedMinScore(), MaxPerPool: 2}
-	}
+	// Set the fields individually: a pool is allowed to configure only its floor
+	// or only its capacity, and the engine fills in whatever is left at zero.
+	// Previously a capacity-gated assignment silently dropped a configured floor.
+	cfg.Latency.Capacity = config.GetCfPoolCapacity()
+	cfg.Latency.MinimumScore = config.GetCfLatencyMinScore()
+	cfg.Latency.MaxPerPool = 4
+
+	cfg.Speed.Capacity = config.GetCfSpeedCapacity()
+	cfg.Speed.MinimumScore = config.GetCfSpeedMinScore()
+	cfg.Speed.MaxPerPool = 2
+
 	return cfg
 }
 
