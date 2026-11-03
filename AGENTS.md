@@ -523,7 +523,7 @@ Startup order: `Start` runs **one full scan immediately**, then starts the
 periodic jobs. Initialization only seeds a handful of addresses, and every timer
 is anchored at `Start` — so a relay restarting more often than `scan_interval`
 would otherwise never scan at all (ADR-0014 in `cft/docs/adr/`). The scan logs one
-line when it finishes: `scan: N/M candidates responded, K admitted in Xs`.
+line when it finishes: `scan: P probed, N responded, K admitted in Xs`.
 
 Two startup paths must tolerate a transient: the cert-pack fetch retries three
 times before giving up (a parent restarting at that exact second used to kill the

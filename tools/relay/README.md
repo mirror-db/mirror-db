@@ -150,8 +150,11 @@ addresses, so **one full scan runs immediately** and the periodic jobs start onc
 it finishes. It logs what it did:
 
 ```
-scan: 32/5956 candidates responded, 14 admitted in 49.6s (latency=14 speed=7)
-``` Deferring exploration by a whole interval would leave the relay on a
+scan: 245 probed, 32 responded, 18 admitted in 48.8s (latency=16 speed=7)
+```
+
+`probed` sits far below the budget because a scan stops once the pool is
+stocked; the budget is a ceiling, not a quota. Deferring exploration by a whole interval would leave the relay on a
 bootstrap-sized pool for the hour it is most likely to be restarted — and a
 restart resets every timer, so a process that restarts more often than
 `scan_interval` never scans at all.
