@@ -176,6 +176,16 @@ through these, not bare `fetch`, so user-agent + rate-limiting are uniform.
   it: it needs digest-keyed entries + immutable `Cache-Control` rewriting, so it
   calls `mdbfetch` + an injected `cache` directly.
 
+  **What can be stored (learned the hard way):** the Cache API keys by URL
+  only and **silently refuses to store a response carrying `Vary`** — verified
+  in workerd, `cache.match` returns nothing. `save()` therefore stores the
+  sanitised header set (`STRIP_RESPONSE_HEADERS`), not whatever the upstream
+  sent. It also materialises document bodies before `put` (≤8 MB, or any
+  textual body): a caller that transforms the response consumes the original
+  body, and putting the unread branch of that tee never completes. Binary
+  bodies keep streaming. Both failure modes are silent — the cache simply stays
+  empty — so `cache.workers.test.ts` covers them.
+
   **Freshness (ADR 0003):** `save()` stamps the entry with `x-mdb-stored-at` and
   `x-mdb-revalidate-after` (default `MdbRevalidateIntervalMs` = 10 min) and lifts
   the advertised `max-age` up to that floor (`liftCacheControl`; `no-store` /
