@@ -1,6 +1,6 @@
 import { MdbCacheName, MdbCacheSizeLimit, MdbRevalidateIntervalMs } from "./const";
 import { buildRequest, ezfetch, mdbfetch } from "./fetch";
-import { parseContentLength, parseRange } from "./http";
+import { parseContentLength, parseRange, STRIP_RESPONSE_HEADERS } from "./http";
 import { waitUntil } from "cloudflare:workers";
 
 export type MdbCache = string | Cache | undefined | Promise<Cache>;
@@ -58,6 +58,25 @@ export function liftCacheControl(cacheControl: string | null): string {
   );
 }
 
+/** Max body size that is materialised before storing (documents only). */
+const MATERIALISE_LIMIT = 8 * 1024 * 1024;
+
+/** Content types whose bodies are cheap to materialise and worth caching. */
+const TEXTUAL = /^(?:text\/|application\/(?:json|xml|xhtml|javascript|yaml|toml|x-yaml))/i;
+
+/**
+ * Whether `save` should read the body into memory instead of storing a stream.
+ *
+ * True for documents with a known, modest length, and for textual bodies
+ * without a length (autoindex pages are chunked). Binary bodies stay streamed
+ * so a large layer or ISO never sits in the Worker's heap twice.
+ */
+const shouldMaterialise = (resp: Response): boolean => {
+  const len = parseContentLength(resp.headers);
+  if (len !== undefined) return len <= MATERIALISE_LIMIT;
+  return TEXTUAL.test(resp.headers.get("content-type") ?? "");
+};
+
 export class MdbCacheManager {
   private dedupSet: Set<string> = new Set();
   private readonly cache: MdbCache;
@@ -110,6 +129,12 @@ export class MdbCacheManager {
    * the mirror re-checks the source every {@link revalidateInterval}. Lifting
    * the floor only makes the copy *usable longer*, never staler than the
    * revalidation the mirror performs anyway.
+   *
+   * The body is materialised for documents before `cache.put`. A caller that
+   * transforms the response (npm metadata URL rewriting, PyPI's HTMLRewriter)
+   * consumes the original body, leaving the cloned stream unread — and a `put`
+   * of an unread stream never completes, which silently drops the entry.
+   * Large binary bodies keep streaming.
    */
   async save(req: Request, resp: Response) {
     // Only cache GET requests (Cache API behavior for other methods is undefined)
@@ -120,12 +145,25 @@ export class MdbCacheManager {
     await this.dedupExec(req, async () => {
       const cache = await ResolveCache(this.cache);
       const headers = new Headers(resp.headers);
+      // The Cache API keys by URL only and **refuses to store a response that
+      // carries `Vary`** (verified in workerd: `cache.match` returns nothing).
+      // It also must not hold auth challenges or cookies. Store the sanitised
+      // header set instead of whatever the upstream sent.
+      for (const name of STRIP_RESPONSE_HEADERS) headers.delete(name);
       headers.set(MDB_STORED_AT, String(this.now()));
       if (!headers.has(MDB_REVALIDATE_AFTER)) {
         headers.set(MDB_REVALIDATE_AFTER, String(MdbRevalidateIntervalMs));
       }
       headers.set("cache-control", liftCacheControl(headers.get("cache-control")));
-      const stamped = new Response(resp.body, {
+
+      let body: ReadableStream<Uint8Array> | ArrayBuffer | null = resp.body;
+      if (shouldMaterialise(resp)) {
+        const buf = await resp.arrayBuffer();
+        if (buf.byteLength > this.sizeLimit) return;
+        body = buf;
+      }
+
+      const stamped = new Response(body, {
         status: resp.status,
         statusText: resp.statusText,
         headers,
@@ -274,6 +312,19 @@ async function revalidate(
   return mark(cached, "hit");
 }
 
+/** `resp` with its `Cache-Control` lifted to the revalidation floor. */
+const liftable = (resp: Response): Response => {
+  const lifted = liftCacheControl(resp.headers.get("cache-control"));
+  if (lifted === resp.headers.get("cache-control")) return resp;
+  const headers = new Headers(resp.headers);
+  headers.set("cache-control", lifted);
+  return new Response(resp.body, {
+    status: resp.status,
+    statusText: resp.statusText,
+    headers,
+  });
+};
+
 export const cachedfetch = (async (reqInfo, arg2, arg3) => {
   const req = buildRequest(reqInfo, arg2, arg3);
 
@@ -301,6 +352,10 @@ export const cachedfetch = (async (reqInfo, arg2, arg3) => {
     // Only cache successful, complete responses.
     if (resp.ok && !hasRange) {
       waitUntil(mdbCache.save(req, resp.clone()));
+      // Advertise the same lifetime the stored copy carries, so a client and a
+      // later cache hit see the same value instead of an upstream figure that
+      // disappears after the first request.
+      return mark(liftable(resp), "miss");
     }
     return mark(resp, hasRange ? "bypass" : "miss");
   }
