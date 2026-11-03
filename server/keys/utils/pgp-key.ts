@@ -9,6 +9,8 @@ export interface PGPPubKeyInfo {
   bits: number;
   fingerprint: string;
   creationTime: Date;
+  /** Every served certificate, in order (the first is the one detailed above). */
+  fingerprints: string[];
 }
 
 /** True when the bytes are an ASCII-armored key rather than binary packets. */
@@ -56,6 +58,7 @@ export class PGPPubKeyHandler {
       bits: algo.bits || 0,
       fingerprint: key.getFingerprint(),
       creationTime: key.getCreationTime(),
+      fingerprints: this.keys.map((k) => k.getFingerprint()),
     };
   }
 
@@ -70,26 +73,27 @@ export class PGPPubKeyHandler {
     );
 
     const keys: openpgp.Key[] = [];
+    let allParsed = true;
     for (const bytes of fetched) {
       try {
-        // `readKey` takes one certificate; upstream key files are single-key.
-        keys.push(
-          isArmored(bytes)
-            ? await openpgp.readKey({ armoredKey: new TextDecoder().decode(bytes) })
-            : await openpgp.readKey({ binaryKey: bytes }),
-        );
+        // `readKeys` (plural): a published keyring may hold several
+        // certificates — Ubuntu's archive keyring has three.
+        const parsed = isArmored(bytes)
+          ? await openpgp.readKeys({ armoredKeys: new TextDecoder().decode(bytes) })
+          : await openpgp.readKeys({ binaryKeys: bytes });
+        keys.push(...parsed);
       } catch {
-        // Unparseable key (unknown algorithm, no user ID, several certificates):
-        // keep going, and fall back to the published bytes when serving.
+        // Unparseable key (unknown algorithm, no user ID): keep going, and fall
+        // back to the published bytes when serving.
+        allParsed = false;
       }
     }
 
     // A keyring is one binary packet stream: normalising every certificate keeps
     // a mixed armored/binary pair from producing a malformed file.
-    const raw =
-      keys.length === fetched.length
-        ? concat(keys.map((k) => k.write()))
-        : concat(fetched);
+    const raw = allParsed && keys.length
+      ? concat(keys.map((k) => k.write()))
+      : concat(fetched);
 
     const armoredText = fetched.every(isArmored)
       ? fetched.map((b) => new TextDecoder().decode(b).trimEnd()).join("\n")

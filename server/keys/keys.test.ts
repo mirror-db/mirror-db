@@ -99,6 +99,33 @@ describe("toSourcesFormat", () => {
   });
 });
 
+describe("well-known APT keys cover the APT mirrors", () => {
+  // Every APT mount should be resolvable from `/keys/apt/<name>`, so a client
+  // can write one sources file per repo without consulting a table.
+  const noKey = new Set(["debian-ports"]);
+
+  it("resolves a key for every apt mirror", async () => {
+    const { aptMirrors } = await import("@server/mirrors/apt-mirrors");
+    for (const mirror of aptMirrors) {
+      if (noKey.has(mirror.name)) continue;
+      expect(() => repo2KeyUrl(mirror.name), mirror.name).not.toThrow();
+    }
+  });
+
+  it("documents the exception", () => {
+    // debian-ports publishes its archive key only inside a .deb keyring package.
+    expect(() => repo2KeyUrl("debian-ports")).toThrow();
+  });
+
+  it("merges Debian's release keys, because the index is signed by all of them", () => {
+    const urls = repo2KeyUrl("debian");
+    expect(Array.isArray(urls)).toBe(true);
+    expect(urls).toContain("https://ftp-master.debian.org/keys/archive-key-12.asc");
+    expect(urls).toContain("https://ftp-master.debian.org/keys/archive-key-13.asc");
+    expect(urls).toContain("https://ftp-master.debian.org/keys/release-13.asc");
+  });
+});
+
 describe("keys app routing", () => {
   function get(path: string): Promise<Response> {
     return Promise.resolve(keys.fetch(new Request(`https://mirs.uk${path}`)));
