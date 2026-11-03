@@ -17,6 +17,17 @@
    步骤及其 `if:` 条件。
 3. 恢复 docker job 的条件（去掉 `&& false`）。
 
+## 升级注意：`cf-nodes.csv` 已废弃
+
+旧引擎的池子持久化（`/etc/mirror-relay/cf-nodes.csv`）**现在没有任何代码读写**，
+`upstream.pool_size` 也已被 `cf.latency_capacity` / `cf.speed_capacity` 取代。
+
+- 老部署上的 `cf-nodes.csv` 可以删除；留着不会报错，只是不再被看到。
+- 新的持久化是 `cf-candidates.csv`（`cf.candidates_file`），
+  内容是两个池子的 TopN，每小时 + 退出时写入。
+- 老配置里的 `upstream.pool_size: 25` 会**静默失效**（viper 不校验未知键），
+  升级时需手工改成 `cf.latency_capacity`。
+
 ---
 
 # Worker 侧（relay 审计发现）

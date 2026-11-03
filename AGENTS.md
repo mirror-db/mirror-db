@@ -456,6 +456,10 @@ cf:                          # edge selection; every key is optional
   # recruit_samples: 2
   # scan_samples: 8
   # init_timeout: 30s        # startup wait; exceeding it is not fatal
+  # patrol_intensity: 1      # 1 = every member once; 0.5 = half; ≤4 = averaged
+  # candidates_file: ""      # default: <config dir>/cf-candidates.csv
+  # snapshot_interval: 1h    # also written on shutdown
+  # bootstrap_host: ""       # default: hostname of upstream.url
 
 acme:
   source: acme               # "acme" | "upstream" | URL origin
@@ -495,6 +499,20 @@ measurement problem must not become an outage.
 `GET /.mirror-relay/pool` (JWT-guarded, like `/cert-pack` and `/mirrors`) reports
 both pools, the gate verdict and which pool is serving — the answer to "why is
 traffic going to that IP".
+
+Patrol covers every pool member by default; `cf.patrol_intensity` scales that
+(0.5 = a random half; above 1 = repeated samples averaged, capped at 4). A
+**recruit waits for a patrol in progress** — both are bulk measurements of the
+same links, and a speed probe saturates the link, so concurrent runs measure
+each other.
+
+Candidate addresses survive a restart: the top of both pools is written to
+`cf-candidates.csv` every hour and on shutdown, and a restart measures those
+instead of exploring the published ranges. Without a snapshot the engine resolves
+`cf.bootstrap_host` (default: the upstream hostname) and uses what DNS says.
+**Scores in the file are never trusted** — every candidate is measured again,
+because a score describes a moment. This replaces `cf-nodes.csv`, which nothing
+reads any more.
 
 The engine lives in `tools/relay/cft/`, a **separate module** mounted here for
 development and referenced by a `replace` in `go.mod`. It is not committed to

@@ -46,6 +46,10 @@ cf:                          # edge selection; every key is optional
   # patrol_speed_interval: 30m
   # recruit_interval: 10m
   # init_timeout: 30s        # startup wait; exceeding it is not fatal
+  # patrol_intensity: 1      # 1 = every member once; 0.5 = half; ≤4 = averaged
+  # candidates_file: ""      # default: <config dir>/cf-candidates.csv
+  # snapshot_interval: 1h    # also written on shutdown
+  # bootstrap_host: ""       # default: hostname of upstream.url
 
 acme:
   source: acme                # "acme" = DNS-01; "upstream" = sync from upstream.url; or a URL origin
@@ -134,6 +138,19 @@ well again.
 Measurements are gated: while this host cannot reach the canary
 (`223.5.5.5:443`), nothing is probed and in-flight results are discarded. A local
 outage must not look like "every Cloudflare IP got worse".
+
+Patrol covers every pool member by default; `cf.patrol_intensity` scales that
+(0.5 measures a random half, above 1 averages repeated samples and is capped at
+4). A recruit waits for a patrol in progress — both are bulk measurements of the
+same links, and running them together makes both numbers wrong.
+
+Candidate addresses survive a restart: the top of both pools is written to
+`cf-candidates.csv` every hour and on shutdown, and a restart measures those
+instead of exploring the published ranges. With no snapshot, the engine resolves
+`cf.bootstrap_host` (default: the upstream hostname) and uses what DNS says.
+Scores in the file are for humans — every candidate is measured again, because a
+score describes a moment and a restart is a different one. (This replaces the old
+`cf-nodes.csv`, which nothing reads any more.)
 
 `GET /.mirror-relay/pool` (JWT-guarded) reports both pools and the gate verdict.
 
