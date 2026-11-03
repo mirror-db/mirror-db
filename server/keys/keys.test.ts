@@ -7,6 +7,7 @@ import { debianKeyName2Url } from "./pgp/debian";
 import { repo2KeyUrl } from "./pgp/well-known-apt";
 import { ParseSSHKey } from "./utils/ssh-key";
 import { toSourcesFormat } from "./utils/pgp-key";
+import { UnknownKeyError } from "./utils/errors";
 import { cachedfetch } from "@server/pkgs/fetch";
 
 const mockEzfetch = cachedfetch as ReturnType<typeof vi.fn>;
@@ -114,7 +115,7 @@ describe("well-known APT keys cover the APT mirrors", () => {
 
   it("documents the exception", () => {
     // debian-ports publishes its archive key only inside a .deb keyring package.
-    expect(() => repo2KeyUrl("debian-ports")).toThrow();
+    expect(() => repo2KeyUrl("debian-ports")).toThrow(UnknownKeyError);
   });
 
   it("merges Debian's release keys, because the index is signed by all of them", () => {

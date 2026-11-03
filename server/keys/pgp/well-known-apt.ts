@@ -10,6 +10,8 @@
  * Names match the mount where possible; the historical aliases stay so old
  * links keep working.
  */
+import { UnknownKeyError } from "../utils/errors";
+
 const DebianSecurityKeys = [
   "https://ftp-master.debian.org/keys/archive-key-12-security.asc",
   "https://ftp-master.debian.org/keys/archive-key-13-security.asc",
@@ -61,6 +63,6 @@ const WellKnownAptKeyUrl: Record<string, string | string[]> = {
 
 export function repo2KeyUrl(keyname: string) {
   const url = WellKnownAptKeyUrl[keyname];
-  if (!url) throw new Error(`Unknown apt key: ${keyname}`);
+  if (!url) throw new UnknownKeyError(keyname);
   return url;
 }

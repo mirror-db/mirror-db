@@ -1,3 +1,5 @@
+import { UnknownKeyError } from "../utils/errors";
+
 const ArchiveVersionMap: Record<string, number> = {
   jessie: 8,
   stretch: 9,
@@ -20,8 +22,8 @@ export function debianKeyName2Url(keyname: string) {
   const [codename, variant] = keyname.split("-");
 
   const version = ArchiveVersionMap[codename] || Number(codename);
-  if (isNaN(version)) throw new Error(`Invalid version: ${codename}`);
-  if (version < 8) throw new Error(`Invalid version: ${version}`);
+  if (isNaN(version)) throw new UnknownKeyError(keyname);
+  if (version < 8) throw new UnknownKeyError(keyname);
 
   let file = `archive-key-${version}.asc`;
   if (variant === "security") file = `archive-key-${version}-security.asc`;

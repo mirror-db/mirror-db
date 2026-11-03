@@ -3,6 +3,8 @@ import { Hono } from "hono";
 
 import { cachedfetch } from "@server/pkgs/fetch";
 
+import { UnknownKeyError } from "./errors";
+
 export interface PGPPubKeyInfo {
   asc: string;
   algorithm: string;
@@ -124,10 +126,20 @@ export class PGPPubKeyHandler {
  * - `GET /:keyname/info`   → `{ algorithm, bits, fingerprint, ... }`.
  * - `POST /:keyname`       → verify a cleartext-signed message body.
  */
-export function SrvPGPKey(urlProvider: (keyname: string) => URL | string | (URL | string)[]) {
+export function SrvPGPKey(
+  urlProvider: (keyname: string) => URL | string | (URL | string)[],
+) {
   const route = new Hono();
 
   const _handler = (kn: string) => PGPPubKeyHandler.fromUrls([urlProvider(kn)].flat());
+
+  // An unknown key name is the caller's mistake (404); anything else — upstream
+  // unreachable, unparseable key for a route that needs one — is a 502.
+  route.onError((err, c) =>
+    err instanceof UnknownKeyError
+      ? c.json({ error: err.message }, 404)
+      : c.json({ error: "key unavailable", detail: err.message }, 502),
+  );
 
   const param = (c: { req: { param(k: string): string | undefined } }) => {
     const kn = c.req.param("keyname");
