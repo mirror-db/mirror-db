@@ -321,21 +321,34 @@ reaching upstreams directly. Mounted in [server/index.ts](server/index.ts) via
 `firstSeg === "keys"`, before the `/api` fallthrough.
 
 - **`SrvPGPKey(urlProvider)`** ([utils/pgp-key.ts](server/keys/utils/pgp-key.ts))
-  — sub-app serving one PGP key per `:keyname`, resolved to an upstream URL by
-  `urlProvider`. `PGPPubKeyHandler` (via `openpgp`) parses the armored key.
+  — sub-app serving one PGP key per `:keyname`, resolved to upstream URLs by
+  `urlProvider`. A provider may return **several URLs**; they are fetched and
+  merged into one binary keyring, because apt/sqv reject a signature whose
+  certificate is unknown — Debian signs its index with three certificates, and
+  Ubuntu's keyring holds three of them.
+
   Routes: `GET /:keyname` (raw bytes; `.pgp`/`.asc` ext switches format),
-  `/:keyname/pgp` (binary), `/:keyname/asc` (armored), `/:keyname/info`
-  (`{ algorithm, bits, fingerprint, creationTime }`), `POST /:keyname` (verify a
-  cleartext-signed message body against the key).
+  `/:keyname/pgp` (binary), `/:keyname/asc` (armored), `/:keyname/in-sources`
+  (armored, formatted for a deb822 `Signed-By:` field — the equivalent of
+  `sed -e 's/^$/./' -e '1!s/^/ /'`), `/:keyname/info`
+  (`{ algorithm, bits, fingerprint, fingerprints, creationTime }`),
+  `POST /:keyname` (verify a cleartext-signed message body against any key).
+
+  Parsing is only needed for `/asc`, `/in-sources`, `/info` and `POST`; the
+  bytes served for `/` and `/pgp` are the published file, normalised to binary
+  when it parses. An unknown name is a **404** (`UnknownKeyError`), any other
+  failure a 502.
 - **`SrvSSHKeyList(urlProvider)`** ([utils/ssh-key.ts](server/keys/utils/ssh-key.ts))
   — sub-app serving a user's SSH `authorized_keys` list. `GET /:keyname` returns
   raw text; `/:keyname/info` returns parsed keys with md5 (via `spark-md5`) +
   sha256 (`crypto.subtle`) fingerprints.
 - Key providers under [pgp/](server/keys/pgp/): `debianKeyName2Url` maps a
   codename/version (`bookworm`, `13`, `-security`, `-release`) to a
-  `ftp-master.debian.org` archive key; `repo2KeyUrl` is a static table of
-  well-known APT signing keys (covers the repo's own APT mirrors + a few common
-  third-party repos).
+  `ftp-master.debian.org` archive key; `repo2KeyUrl` is a static table keyed by
+  **APT mount name**, so `/keys/apt/<mirror>` resolves for every mirror. The
+  only exception is `debian-ports`: its archive key ships only inside
+  `debian-ports-archive-keyring_*.deb`, and the keyserver copy has no
+  self-signature (apt answers `ERRSIG`), so it answers 404 on purpose.
 - Routes mounted: `/debian/:codename`, `/apt/:repo`, `/keybase/:user`,
   `/gh|github/:user`, `/gitlab/:user`.
 - Upstream fetch goes through `ezfetch` (no read-through cache yet — these keys
@@ -453,7 +466,7 @@ upstream:
   # proxy: ""                # http(s)/socks5 proxy; bypasses edge selection
 
 cf:                          # edge selection; every key is optional
-  # latency_capacity: 32     # entries held in the latency pool
+  # latency_capacity: 64     # entries held in the latency pool
   # speed_capacity: 8
   # top_n: 3                 # transports select randomly within Top-N
   # seed_count: 10           # latency results before Initialize returns
@@ -532,10 +545,11 @@ consumer), and until `/api/mirrors` has loaded once the watcher retries every
 everything, so one unlucky edge address at startup was ten minutes of downtime).
 
 `cf.patrol_intensity` sets the scan's candidate budget, measured against what the
-pre-rewrite pool manager generated (one per `/24`, ≈6000), capped at 4. It is a
-ceiling, not a quota: the scan stops once the pool has taken as many admissible
-results as it has capacity, so the budget is only spent in full when most
-candidates fail.
+pre-rewrite pool manager generated (one per `/24`, ≈6000), capped at 4. A scan
+**spends the whole budget**: a full pool still has a worst member worth replacing,
+and stopping at the fill level freezes the ranking at the first sweep's result
+(ADR-0015 supersedes ADR-0009's early stop). At intensity 1 that is ~6000 probes
+an hour — the knob to lower first on a metered uplink.
 
 A **recruit waits for a patrol in progress** — both are bulk measurements of the
 same links, and a speed probe saturates the link, so concurrent runs measure

@@ -32,6 +32,15 @@ The archive is dual-signed but only one certificate is published. Our key mirror
 serves both, so the mount works; the underlying upstream inconsistency is
 theirs. Recheck when they drop the 2014 signature (then the extra fetch can go).
 
+## 2c. `debian-ports` has no key endpoint
+
+`/keys/apt/debian-ports` is a 404 by design: `ftp.ports.debian.org` publishes no
+key file (only `README`, `dists/`, `doc/`, `indices/`, `pool-*`), and the
+keyserver copy of `5FFACC4B…` has no self-signature, so apt rejects it
+(`ERRSIG`). The key lives inside `debian-ports-archive-keyring_*.deb`. Options if
+this becomes important: extract the keyring at build time and ship it as a static
+asset, or accept the package install.
+
 ## 3. `packages.opentofu.org` is not an APT tree
 
 `https://packages.opentofu.org/opentofu/tofu/any/` is a packagecloud HTML UI;
