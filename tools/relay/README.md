@@ -31,7 +31,7 @@ upstream:
 
 cf:                          # edge selection; every key is optional
   # top_n: 3                 # transports select randomly within Top-N
-  # latency_capacity: 32
+  # latency_capacity: 64
   # speed_capacity: 8
   # seed_count: 10           # latency results before Initialize returns
   # speed_seed_count: 3      # bootstrap IPs speed-probed during Initialize
@@ -161,13 +161,13 @@ restart resets every timer, so a process that restarts more often than
 
 `cf.patrol_intensity` sets the scan's candidate budget, measured against the
 volume the pre-rewrite pool manager generated — one candidate per `/24`, about
-6000 — so `1` allows the old intensity, `0.5` allows half, and it is capped at 4.
+6000 — so `1` scans the old volume, `0.5` half of it, and it is capped at 4.
 
-It is a **ceiling, not a quota**: a scan stops as soon as the latency pool has
-taken as many admissible results as it has capacity, because past that point more
-probes only reshuffle a ranking that is already stocked, at the cost of the link
-the relay is meant to be accelerating. The budget is spent in full only when most
-candidates fail — which is exactly when looking longer pays off.
+A scan **spends its whole budget**: a full pool still has a worst member, and only
+a fresh measurement can replace it. Stopping at the fill level freezes the
+ranking at whatever the first sweep found. This is the knob to lower first when
+the uplink is metered — at intensity 1 a scan is ~6000 probes, roughly six
+minutes an hour on a bad path.
 
 A recruit waits for a patrol in progress — both are bulk measurements of the
 same links, and running them together makes both numbers wrong.
@@ -182,8 +182,8 @@ nominally 0.5 MB/s Cloudflare path:
 
 | job | cadence | probes/day | bytes/day |
 |---|---|---|---|
-| patrol latency | 5m × 8 members | ~2,300 | ~2.5 MB |
-| scan | 1h, stops when stocked | ~5,900 | ~6.5 MB |
+| scan | 1h × full budget | ~143,000 | ~157 MB |
+| patrol latency | 5m × 64 members | ~18,400 | ~20 MB |
 | recruit | 10m × 2 candidates | ~290 | ~0.3 MB |
 
 Both pools are maintained regardless of which one is selected, because routing is
