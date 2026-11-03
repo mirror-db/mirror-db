@@ -19,7 +19,7 @@
 
 import type { WebListEntry } from "./parse";
 import type { WebListParserFactory } from "./parsers";
-import { WebListFs, type WebListFetch } from "./web-list";
+import { WebListError, WebListFs, type WebListFetch } from "./web-list";
 import { methodNotAllowed, optionsResponse, propfindResponse } from "./webdav";
 
 /**
@@ -65,6 +65,24 @@ export interface WebListProxyOptions {
 }
 
 const ALLOWED_METHODS = new Set(["OPTIONS", "GET", "HEAD", "PROPFIND"]);
+
+/**
+ * Turn a failed listing fetch into an HTTP answer.
+ *
+ * An upstream that serves files but no autoindex answers the directory URL
+ * with 404 — that is "this directory has no listing", not a crash. Anything
+ * else is a real upstream failure and becomes a 502. Without this the
+ * exception escapes the handler and the Worker answers `500 error code: 1101`.
+ */
+function listingFailure(error: unknown): Response {
+  const status = error instanceof WebListError ? error.status : 0;
+  const notListed =
+    status === 403 || status === 404 || status === 410 || status === 405;
+  return new Response(notListed ? "Not Found" : "Bad Gateway", {
+    status: notListed ? 404 : 502,
+    headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" },
+  });
+}
 
 export class WebListProxy {
   private readonly fs: WebListFs;
@@ -136,7 +154,13 @@ export class WebListProxy {
     // `2024/` upstream — without the slash the base join collapses it and the
     // parent is listed instead.
     const dirRel = rel === "" || rel.endsWith("/") ? rel : `${rel}/`;
-    const entries = await this.fs.readdir(dirRel);
+
+    let entries: WebListEntry[];
+    try {
+      entries = await this.fs.readdir(dirRel);
+    } catch (e) {
+      return listingFailure(e);
+    }
 
     if (json) {
       return Response.json({ path: rel, entries });
@@ -152,7 +176,13 @@ export class WebListProxy {
 
     // Ensure the path is treated as a directory for readdir.
     const dirRel = rel === "" || rel.endsWith("/") ? rel : `${rel}/`;
-    const entries = await this.fs.readdir(dirRel);
+
+    let entries: WebListEntry[];
+    try {
+      entries = await this.fs.readdir(dirRel);
+    } catch (e) {
+      return listingFailure(e);
+    }
 
     return propfindResponse({ path: dirRel, baseHref: this.baseHref, entries }, depth);
   }

@@ -1,4 +1,4 @@
-export { WebListFs } from "./web-list";
+export { WebListFs, WebListError } from "./web-list";
 export type { WebListFetch, WebListFsOptions } from "./web-list";
 export { WebListProxy } from "./proxy";
 export type { WebListProxyOptions, WebListFetchHook } from "./proxy";

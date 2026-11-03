@@ -172,6 +172,60 @@ describe("WebListProxy — WebDAV", () => {
   });
 });
 
+// ── Failed listings ─────────────────────────────────────────────────────────
+
+describe("WebListProxy — upstream without a listing", () => {
+  const proxyReturning = (status: number) =>
+    new WebListProxy({
+      baseURL: "https://no-autoindex.invalid/files/",
+      fetchImpl: async () => new Response("nope", { status }),
+      render() {
+        return new Response("should not render");
+      },
+    });
+
+  it("answers 404 when the upstream has no directory listing", async () => {
+    // mise.jdx.dev and cli.github.com serve files but no autoindex. Before this
+    // was handled, the thrown readdir error escaped the handler and the Worker
+    // answered `500 error code: 1101`.
+    const proxy = proxyReturning(404);
+    for (const path of ["/dists/", "/dists/?format=json"]) {
+      const res = await proxy.fetch(req(`http://localhost${path}`));
+      expect(res.status).toBe(404);
+    }
+  });
+
+  it("answers 404 for PROPFIND on such a directory", async () => {
+    const res = await proxyReturning(404).fetch(
+      req("http://localhost/dists/", "PROPFIND", { depth: "0" }),
+    );
+    expect(res.status).toBe(404);
+  });
+
+  it("answers 502 when the upstream itself failed", async () => {
+    const res = await proxyReturning(500).fetch(req("http://localhost/dists/"));
+    expect(res.status).toBe(502);
+  });
+
+  it("answers 502 when the fetch throws", async () => {
+    const proxy = new WebListProxy({
+      baseURL: "https://down.invalid/",
+      fetchImpl: async () => {
+        throw new TypeError("network down");
+      },
+      render() {
+        return new Response("");
+      },
+    });
+    expect((await proxy.fetch(req("http://localhost/"))).status).toBe(502);
+  });
+
+  it("does not cache a failed listing", async () => {
+    const res = await proxyReturning(404).fetch(req("http://localhost/dists/"));
+    expect(res.headers.get("cache-control")).toBe("no-store");
+  });
+});
+
 // ── fetchHook ───────────────────────────────────────────────────────────────
 
 describe("WebListProxy — fetchHook", () => {

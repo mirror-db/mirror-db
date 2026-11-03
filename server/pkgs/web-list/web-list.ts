@@ -16,6 +16,23 @@ import type { WebListParserFactory } from "./parsers";
 
 export type { WebListEntry, WebListEntryType } from "./parse";
 
+/**
+ * A readdir that failed upstream, carrying the status so the proxy can turn it
+ * into an honest HTTP answer instead of an unhandled exception.
+ *
+ * The common case is an upstream that serves files but no directory listing
+ * (no autoindex): the directory URL answers 404 and there is nothing to parse.
+ */
+export class WebListError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+  ) {
+    super(message);
+    this.name = "WebListError";
+  }
+}
+
 export type WebListFetch = (
   input: string | URL | Request,
   init?: RequestInit,
@@ -71,7 +88,10 @@ export class WebListFs {
     const dir = rel === "" || rel.endsWith("/") ? rel : `${rel}/`;
     const res = await this.fetch(dir);
     if (!res.ok) {
-      throw new Error(`readdir ${this.url(dir)} failed: ${res.status}`);
+      throw new WebListError(
+        `readdir ${this.url(dir)} failed: ${res.status}`,
+        res.status,
+      );
     }
     const factories = typeof this.parsers === "function"
       ? this.parsers(dir)
