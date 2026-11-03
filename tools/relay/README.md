@@ -26,7 +26,6 @@ relay:
 
 upstream:
   url: "https://mirs.uk"     # upstream Worker or upper relay
-  transport: latency         # "latency" | "speed" — which edge pool to draw from
   # disguise_port: 344        # connect to upstream via SSH-disguised TLS
   # proxy: ""                 # http(s)/socks5 proxy; bypasses edge selection
 
@@ -128,8 +127,8 @@ domain only when the header is absent. Relay-originated requests
 
 Two pools, because the fastest IP differs by workload: **latency** (time to
 first byte — decides a manifest fetch) and **speed** (bytes/sec — decides a layer
-download). `upstream.transport` chooses which one the proxy draws from; latency
-is the default because it suits mixed traffic.
+download). Both are maintained; requests currently go through the latency pool,
+and per-request routing (manifests versus downloads) is the next step.
 
 Each pool keeps the best N scored IPs, and a transport picks randomly among the
 top few. A failed request multiplies that IP's score, so a bad edge drifts out of
@@ -173,11 +172,11 @@ nominally 0.5 MB/s Cloudflare path:
 | scan | 1h, stops when stocked | ~5,900 | ~6.5 MB |
 | recruit | 10m × 2 candidates | ~290 | ~0.3 MB |
 
-That is the whole bill with the speed pool disabled (the default, because
-`upstream.transport` defaults to `latency`). **Enabling it adds 300-500 MB a day**
-at the same cadence, against ~10 MB for everything else — which is why the engine
-only maintains the pool traffic is actually routed through
-([ADR-0012](../cft/docs/adr/0012-measure-only-the-pool-in-use.md)).
+Both pools are maintained regardless of which one is selected, because routing is
+per-request: a cold high-speed pool cannot be switched to on the first request
+that needs it. That accepts a real cost — **speed probes add 300-500 MB a day**
+against ~10 MB for latency probes at the same cadence — deliberately rather than
+by oversight ([ADR-0012](../cft/docs/adr/0012-measure-both-pools.md)).
 
 Candidate addresses survive a restart: the top of both pools is written to
 `cf-candidates.csv` every hour and on shutdown, and a restart measures those

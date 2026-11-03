@@ -28,7 +28,6 @@ func init() {
 	viper.SetDefault("relay.config_dir", "/etc/mirror-relay")
 
 	viper.SetDefault("upstream.url", "https://mirs.uk")
-	viper.SetDefault("upstream.transport", "latency")
 
 	viper.SetDefault("acme.source", "acme")
 	viper.SetDefault("acme.email", "acme@mirs.uk")
@@ -87,21 +86,6 @@ func GetAcmeCA() string            { return viper.GetString("acme.ca") }
 func GetAcmeAgree() bool           { return viper.GetBool("acme.agree") }
 
 // --- Cloudflare edge selection ---
-
-// GetUpstreamTransport selects which pool the proxy draws from: "latency"
-// (default) or "speed".
-//
-// They rank differently on purpose: latency decides a manifest fetch, where a
-// few kilobytes round-trip time dominates, while speed decides a large layer
-// download. A mirror serving mostly blobs can prefer "speed"; the default suits
-// mixed traffic.
-func GetUpstreamTransport() string {
-	v := strings.ToLower(strings.TrimSpace(viper.GetString("upstream.transport")))
-	if v == "speed" {
-		return "speed"
-	}
-	return "latency"
-}
 
 // CFConfig values for the edge-selection engine. Zero means "use the engine's
 // default"; the engine owns the defaults so they stay in one place.

@@ -73,14 +73,9 @@ func newEdgeSelection() (*edgeSelection, http.RoundTripper) {
 // engineConfig maps relay configuration onto the engine's.
 func engineConfig() engine.Config {
 	cfg := engine.Config{
-		TopN:           config.GetCfTopN(),
-		SeedCount:      config.GetCfSeedCount(),
-		SpeedSeedCount: config.GetCfSpeedSeedCount(),
-		// Only the pool the traffic is actually routed through is worth
-		// measuring. A speed probe occupies the link for a whole window where a
-		// latency probe costs a round trip, so maintaining a pool nothing selects
-		// from is the largest line item in the probe budget.
-		DisableSpeedPool:      config.GetUpstreamTransport() != "speed",
+		TopN:                  config.GetCfTopN(),
+		SeedCount:             config.GetCfSeedCount(),
+		SpeedSeedCount:        config.GetCfSpeedSeedCount(),
 		Penalty:               config.GetCfPenalty(),
 		RecruitSamples:        config.GetCfRecruitSamples(),
 		ScanInterval:          config.GetCfScanInterval(),
@@ -108,13 +103,15 @@ func engineConfig() engine.Config {
 	return cfg
 }
 
-// transport returns the RoundTripper backed by the chosen pool.
+// transport returns the RoundTripper the proxy currently sends traffic through.
+//
+// Both pools are maintained regardless: routing is per-request (manifests and
+// metadata through the low-latency pool, large downloads through the high-speed
+// one), so a pool that is not the default still has to be warm when a request
+// asks for it.
 func (e *edgeSelection) transport() http.RoundTripper {
 	if e.engine == nil {
 		return plainTransport()
-	}
-	if config.GetUpstreamTransport() == "speed" {
-		return e.engine.SpeedTransport()
 	}
 	return e.engine.LatencyTransport()
 }
@@ -139,7 +136,9 @@ func (e *edgeSelection) Snapshot() *edgeSnapshot {
 	}
 
 	snap := &edgeSnapshot{
-		Pool:     config.GetUpstreamTransport(),
+		// Literal: there is no configured single pool any more. When per-request
+		// routing lands this becomes a per-route answer.
+		Pool:     "latency",
 		TopN:     e.engine.Config().TopN,
 		Latency:  describePool(e.engine.LatencyPool()),
 		Speed:    describePool(e.engine.SpeedPool()),

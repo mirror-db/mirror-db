@@ -434,7 +434,6 @@ relay:
 
 upstream:
   url: "https://mirs.uk"
-  transport: latency         # "latency" | "speed" — which edge pool to draw from
   # disguise_port: 344       # connect via SSH-disguised TLS
   # proxy: ""                # http(s)/socks5 proxy; bypasses edge selection
 
@@ -489,7 +488,8 @@ picking a Cloudflare IP would override their intent.
 Ranks Cloudflare anycast IPs from this host's vantage point and serves through
 the best ones. Two pools, because the winner differs by workload: **latency**
 (time to first byte; decides a manifest fetch) and **speed** (bytes/sec; decides
-a layer download). `upstream.transport` picks which one the proxy draws from.
+a layer download). Both are maintained; requests currently go through the
+latency pool, and per-request routing is the next step.
 
 Startup calls `engine.Initialize` under `cf.init_timeout`. **Failure is logged,
 not fatal:** the engine keeps running, patrol and recruit fill the pools in the
@@ -516,10 +516,9 @@ each other.
 
 Probing is not free, and the two probe kinds differ by ~1000x in bytes: a latency
 probe moves ~1.1 KB, a speed probe reads for a three-second window and moves
-hundreds of KB. So the engine only maintains the pool traffic is routed through —
-`upstream.transport: latency` (the default) disables the speed pool entirely,
-which is the difference between ~10 MB/day and ~350 MB/day at default cadences.
-See ADR-0012.
+hundreds of KB. Both pools are maintained anyway — a cold pool cannot be switched
+to on the first request that needs it — so speed probes are ~350 MB/day against
+~10 MB/day for latency at default cadences. Accepted deliberately; see ADR-0012.
 
 Candidate addresses survive a restart: the top of both pools is written to
 `cf-candidates.csv` every hour and on shutdown, and a restart measures those
