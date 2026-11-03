@@ -280,8 +280,11 @@ describe("MdbCacheManager.revalidateInterval", () => {
     expect(at(400 + 60_000).revalidateInterval(entry())).toBe(540_000);
   });
 
-  it("returns 0 exactly on a boundary (check now)", () => {
+  it("returns 0 once the interval has elapsed, not only on a boundary", () => {
     expect(at(400 + 600_000).revalidateInterval(entry())).toBe(0);
+    // Late by half an interval still revalidates now: aligning to a modulo
+    // would leave the entry unchecked for almost two intervals.
+    expect(at(400 + 900_000).revalidateInterval(entry())).toBe(0);
     expect(at(400 + 1_200_000).revalidateInterval(entry())).toBe(0);
   });
 

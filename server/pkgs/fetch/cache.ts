@@ -79,6 +79,8 @@ const shouldMaterialise = (resp: Response): boolean => {
 
 export class MdbCacheManager {
   private dedupSet: Set<string> = new Set();
+  /** URLs with a revalidation HEAD in flight, so a burst sends one. */
+  private revalidating: Set<string> = new Set();
   private readonly cache: MdbCache;
   private readonly sizeLimit: number;
 
@@ -194,6 +196,17 @@ export class MdbCacheManager {
     await ResolveCache(this.cache).then((cache) => cache.delete(req));
   }
 
+  /** Mark `key` as being revalidated; returns false when one is already running. */
+  claimRevalidation(key: string): boolean {
+    if (this.revalidating.has(key)) return false;
+    this.revalidating.add(key);
+    return true;
+  }
+
+  releaseRevalidation(key: string): void {
+    this.revalidating.delete(key);
+  }
+
   /**
    * How long a stored response may be re-served before its source is re-checked.
    *
@@ -217,10 +230,12 @@ export class MdbCacheManager {
       : MdbRevalidateIntervalMs;
 
     const age = Math.max(0, this.now() - storedAt);
-    // Freshly stored (and every interval boundary after that) → check now.
-    // In between → serve, so one interval costs at most one HEAD.
-    const phase = age % interval;
-    return phase === 0 && age > 0 ? 0 : interval - phase;
+    // Past the interval → check on the next request (the check re-stamps the
+    // entry, so the following one is a full interval away). Before that → serve
+    // with the remaining time. Aligning to a modulo would let an entry whose
+    // first check lands just after a boundary go unchecked for almost two
+    // intervals.
+    return age < interval ? interval - age : 0;
   }
 }
 
@@ -257,59 +272,75 @@ const mark = (
   });
 };
 
-/** Revalidate `cached` against the source with a HEAD; resolves to the response to serve. */
+/**
+ * Revalidate `cached` against the source with a conditional HEAD, and return the
+ * response to serve.
+ *
+ * One HEAD per entry per interval: the claim set keeps a burst of concurrent
+ * requests from all asking at once, and a `304` re-stamps the entry so the next
+ * check is a full interval away.
+ */
 async function revalidate(
   req: Request,
   cached: Response,
   ctx: MdbCacheManager,
 ): Promise<Response> {
-  const probe = new Request(req.url, { method: "HEAD", headers: req.headers });
-  probe.headers.delete("range");
-  // Conditional on the stored validators: an unchanged object answers 304 and
-  // transfer nothing; the entry is simply re-stamped as fresh.
-  const etag = cached.headers.get("etag");
-  const lastModified = cached.headers.get("last-modified");
-  if (etag) probe.headers.set("if-none-match", etag);
-  if (lastModified) probe.headers.set("if-modified-since", lastModified);
-
-  let res: Response;
-  try {
-    res = await mdbfetch(probe);
-  } catch {
-    // Source unreachable: keep serving the stored copy rather than failing.
+  if (!ctx.claimRevalidation(req.url)) {
+    // Another request is already asking the source; serve what we have.
     return mark(cached, "hit");
   }
 
-  if (res.status === 304) {
-    const restamped = new Response(cached.body, {
-      status: cached.status,
-      statusText: cached.statusText,
-      headers: cached.headers,
-    });
-    restamped.headers.set(MDB_STORED_AT, String(ctx.now()));
-    waitUntil(ctx.save(req, restamped.clone()));
-    return mark(restamped, "revalidated");
-  }
+  try {
+    const probe = new Request(req.url, { method: "HEAD", headers: req.headers });
+    probe.headers.delete("range");
+    // Conditional on the stored validators: an unchanged object answers 304 and
+    // transfers nothing; the entry is simply re-stamped as fresh.
+    const etag = cached.headers.get("etag");
+    const lastModified = cached.headers.get("last-modified");
+    if (etag) probe.headers.set("if-none-match", etag);
+    if (lastModified) probe.headers.set("if-modified-since", lastModified);
 
-  // The source answers HEAD inconsistently (405/501): treat the entry as stale
-  // and fetch again through the normal path.
-  if (res.status === 405 || res.status === 501) {
+    let res: Response;
+    try {
+      res = await mdbfetch(probe);
+    } catch {
+      // Source unreachable: keep serving the stored copy rather than failing.
+      return mark(cached, "hit");
+    }
+
+    if (res.status === 304) {
+      const restamped = new Response(cached.body, {
+        status: cached.status,
+        statusText: cached.statusText,
+        headers: cached.headers,
+      });
+      restamped.headers.set(MDB_STORED_AT, String(ctx.now()));
+      waitUntil(ctx.save(req, restamped.clone()));
+      return mark(restamped, "revalidated");
+    }
+
+    // The source answers HEAD inconsistently (405/501): treat the entry as
+    // stale and fetch again through the normal path.
+    if (res.status === 405 || res.status === 501) {
+      await ctx.delete(req);
+      return mark(await mdbfetch(req), "miss");
+    }
+
+    if (res.status === 200) {
+      const fresh = await mdbfetch(req);
+      if (fresh.ok) waitUntil(ctx.save(req, fresh.clone()));
+      return mark(fresh, "miss");
+    }
+
+    // Gone upstream (404/410) or an error: drop the entry, serve the source.
     await ctx.delete(req);
-    return mark(await mdbfetch(req), "miss");
+    if (res.status === 404 || res.status === 410) {
+      return mark(await mdbfetch(req), "miss");
+    }
+    return mark(cached, "hit");
+  } finally {
+    ctx.releaseRevalidation(req.url);
   }
-
-  if (res.status === 200) {
-    const fresh = await mdbfetch(req);
-    if (fresh.ok) waitUntil(ctx.save(req, fresh.clone()));
-    return mark(fresh, "miss");
-  }
-
-  // Gone upstream (404/410) or an error: drop the entry, serve the source as-is.
-  await ctx.delete(req);
-  if (res.status === 404 || res.status === 410) {
-    return mark(await mdbfetch(req), "miss");
-  }
-  return mark(cached, "hit");
 }
 
 /** `resp` with its `Cache-Control` lifted to the revalidation floor. */
