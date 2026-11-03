@@ -52,3 +52,9 @@ reference
 # Go workspace file used for cross-module dev
 /go.work
 /go.work.sum
+
+# Local checkout of go-cloudflare-fastest-transport used via go.work
+/tools/relay/cft
+
+# Go module cache artefacts (sumdb) landing in the repo root
+/pkg
