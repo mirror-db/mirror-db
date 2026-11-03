@@ -21,6 +21,11 @@ const WellKnownAptKeyUrl: Record<string, string | string[]> = {
     "https://syncthing.net/release-key.gpg",
     "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0xD26E6ED000654A3E",
   ],
+  // GitLab's package repository (runner + others), served at
+  // `/gitlab-runner-deb/`. The published file is already armored, which is what
+  // `/in-sources` needs.
+  "gitlab-runner": "https://packages.gitlab.com/gpgkey/gpg.key",
+  gitlab: "https://packages.gitlab.com/gpgkey/gpg.key",
   docker: "https://download.docker.com/linux/debian/gpg",
   "docker-ubuntu": "https://download.docker.com/linux/ubuntu/gpg",
   nodesource: "https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key",

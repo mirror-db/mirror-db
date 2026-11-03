@@ -32,7 +32,18 @@ export class PGPPubKeyHandler {
     readonly raw: Uint8Array,
     /** Every certificate we could parse, in the order the upstreams listed them. */
     readonly keys: openpgp.Key[],
+    /**
+     * The armored form to serve. Re-armoring is lossy (packet ordering, third
+     * party certifications), so when every source was already armored its text
+     * is served as published.
+     */
+    readonly armoredText: string | undefined,
   ) {}
+
+  /** Armored key text (as published when possible), or undefined. */
+  get armored(): string | undefined {
+    return this.armoredText;
+  }
 
   /** Parsed metadata of the first certificate, or undefined when nothing parsed. */
   get info(): PGPPubKeyInfo | undefined {
@@ -80,7 +91,13 @@ export class PGPPubKeyHandler {
         ? concat(keys.map((k) => k.write()))
         : concat(fetched);
 
-    return new PGPPubKeyHandler(raw, keys);
+    const armoredText = fetched.every(isArmored)
+      ? fetched.map((b) => new TextDecoder().decode(b).trimEnd()).join("\n")
+      : keys.length
+        ? keys.map((k) => k.armor().trimEnd()).join("\n")
+        : undefined;
+
+    return new PGPPubKeyHandler(raw, keys, armoredText);
   }
 
   async verifyCleartextMessage(cleartextMessage: string) {
@@ -98,6 +115,8 @@ export class PGPPubKeyHandler {
  * - `GET /:keyname`        → key bytes; `keyname` may carry `.pgp`/`.asc` ext.
  * - `GET /:keyname/pgp`    → key as published (`application/pgp-keys`).
  * - `GET /:keyname/asc`    → armored key (parsed keys only).
+ * - `GET /:keyname/in-sources` → armored key formatted for a deb822 `Signed-By:`
+ *   field (blank lines become `.`, continuation lines are indented).
  * - `GET /:keyname/info`   → `{ algorithm, bits, fingerprint, ... }`.
  * - `POST /:keyname`       → verify a cleartext-signed message body.
  */
@@ -143,6 +162,17 @@ export function SrvPGPKey(urlProvider: (keyname: string) => URL | string | (URL 
     return c.body(toBody(h.raw));
   });
 
+  route.get("/:keyname/in-sources", async (c) => {
+    const h = await _handler(param(c));
+    const asc = armored(h);
+    if (!asc) return unparsable(c);
+    // Trailing newline: matches `sed`'s output, so a redirect to a file or a
+    // `$(...)` substitution behaves exactly like the documented pipeline.
+    return c.text(`${toSourcesFormat(asc)}\n`, 200, {
+      "content-type": "text/plain; charset=utf-8",
+    });
+  });
+
   route.get("/:keyname/asc", async (c) => {
     const h = await _handler(param(c));
     const asc = armored(h);
@@ -170,10 +200,31 @@ export function SrvPGPKey(urlProvider: (keyname: string) => URL | string | (URL 
   return route;
 }
 
+/**
+ * Format an armored key for a deb822 `Signed-By:` field.
+ *
+ * deb822 continuation lines must be indented and cannot be empty, so the
+ * equivalent shell pipeline is
+ * `sed -e 's/^$/./' -e '1!s/^/ /'`: blank lines become a lone `.`, and every
+ * line but the first is prefixed with one space. The caller supplies the indent
+ * for the first line, which is how the whole block ends up aligned:
+ *
+ *     Signed-By:
+ *      $(/keys/apt/gitlab-runner/in-sources)
+ */
+export function toSourcesFormat(armored: string): string {
+  const lines = armored.replace(/\r\n/g, "\n").trimEnd().split("\n");
+  return lines
+    .map((line, i) => {
+      const body = line === "" ? "." : line;
+      return i === 0 ? body : ` ${body}`;
+    })
+    .join("\n");
+}
+
 /** All certificates as one armored block, or undefined when nothing parsed. */
 function armored(h: PGPPubKeyHandler): string | undefined {
-  if (!h.keys.length) return;
-  return h.keys.map((k) => k.armor().trim()).join("\n") + "\n";
+  return h.armored ? `${h.armored}\n` : undefined;
 }
 
 /** 502 with a reason, for routes that need a parsed key. */

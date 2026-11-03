@@ -6,6 +6,7 @@ import { keys } from "./index";
 import { debianKeyName2Url } from "./pgp/debian";
 import { repo2KeyUrl } from "./pgp/well-known-apt";
 import { ParseSSHKey } from "./utils/ssh-key";
+import { toSourcesFormat } from "./utils/pgp-key";
 import { cachedfetch } from "@server/pkgs/fetch";
 
 const mockEzfetch = cachedfetch as ReturnType<typeof vi.fn>;
@@ -66,6 +67,35 @@ describe("ParseSSHKey", () => {
 
   it("throws on invalid base64 body", async () => {
     await expect(ParseSSHKey("ssh-rsa !!!notb64 c")).rejects.toThrow();
+  });
+});
+
+describe("toSourcesFormat", () => {
+  // Equivalent to `sed -e 's/^$/./' -e '1!s/^/ /'`.
+  it("indents continuation lines and turns blank lines into '.'", () => {
+    const armored = [
+      "-----BEGIN PGP PUBLIC KEY BLOCK-----",
+      "",
+      "mQINBF5dI2sBEACy",
+      "=abcd",
+      "-----END PGP PUBLIC KEY BLOCK-----",
+      "",
+    ].join("\n");
+
+    expect(toSourcesFormat(armored)).toBe(
+      [
+        "-----BEGIN PGP PUBLIC KEY BLOCK-----",
+        " .",
+        " mQINBF5dI2sBEACy",
+        " =abcd",
+        " -----END PGP PUBLIC KEY BLOCK-----",
+      ].join("\n"),
+    );
+  });
+
+  it("does not leave a trailing '.' line", () => {
+    // A trailing newline is not an empty line for sed either.
+    expect(toSourcesFormat("BEGIN\n\nEND\n")).toBe("BEGIN\n .\n END");
   });
 });
 
@@ -137,6 +167,13 @@ describe("keys app routing", () => {
     mockEzfetch.mockResolvedValue(new Response("not-a-real-key"));
     await get("/keys/apt/hashicorp").catch(() => {});
     expect(fetchedUrl()).toBe("https://apt.releases.hashicorp.com/gpg");
+  });
+
+  it("answers 502 for /in-sources when the key cannot be parsed", async () => {
+    mockEzfetch.mockImplementation(async () => new Response("not-a-real-key"));
+    const res = await get("/keys/apt/gitlab-runner/in-sources");
+    expect(res.status).toBe(502);
+    expect(fetchedUrl()).toBe("https://packages.gitlab.com/gpgkey/gpg.key");
   });
 
   it("debian route resolves codename to archive key URL", async () => {
