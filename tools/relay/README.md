@@ -42,11 +42,12 @@ cf:                          # edge selection; every key is optional
   # speed_min_score: 65536   # = below 64KiB/s is discarded
   # penalty: 0.5             # score multiplier for a failed request
   # scan_interval: 1h
-  # patrol_latency_interval: 5m
+  # patrol_latency_interval: 30m   # cadence of a full pass (patrol explores too)
   # patrol_speed_interval: 30m
   # recruit_interval: 10m
   # init_timeout: 30s        # startup wait; exceeding it is not fatal
-  # patrol_intensity: 1      # 1 = every member once; 0.5 = half; ≤4 = averaged
+  # patrol_intensity: 1      # exploration volume vs the pre-rewrite Refresh
+  #                          # (≈6k candidates); 0.5 = half, capped at 4
   # candidates_file: ""      # default: <config dir>/cf-candidates.csv
   # snapshot_interval: 1h    # also written on shutdown
   # bootstrap_host: ""       # default: hostname of upstream.url
@@ -139,9 +140,18 @@ Measurements are gated: while this host cannot reach the canary
 (`223.5.5.5:443`), nothing is probed and in-flight results are discarded. A local
 outage must not look like "every Cloudflare IP got worse".
 
-Patrol covers every pool member by default; `cf.patrol_intensity` scales that
-(0.5 measures a random half, above 1 averages repeated samples and is capped at
-4). A recruit waits for a patrol in progress — both are bulk measurements of the
+A patrol re-measures every pool member and explores the address pools for new
+candidates. `cf.patrol_intensity` scales that exploration against the volume the
+pre-rewrite pool manager generated — one candidate per `/24`, about 6000 — so
+`1` reproduces the old intensity, `0.5` halves it, and it is capped at 4. The
+member pass is never scaled, so a low intensity costs freshness of the *pool*,
+not of the scores.
+
+Because a patrol at intensity 1 is several thousand probes, its interval is the
+cadence of a full pass (default 30 minutes), not a liveness check. Raising the
+intensity without raising the interval turns the relay into a crawler.
+
+A recruit waits for a patrol in progress — both are bulk measurements of the
 same links, and running them together makes both numbers wrong.
 
 Candidate addresses survive a restart: the top of both pools is written to

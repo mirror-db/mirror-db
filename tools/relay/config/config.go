@@ -131,8 +131,9 @@ func GetCfRecruitInterval() time.Duration {
 	return viper.GetDuration("cf.recruit_interval")
 }
 
-// GetCfPatrolIntensity scales how much a patrol measures: 1 re-measures every
-// pool member once, 0.5 measures half, above 1 averages repeated samples.
+// GetCfPatrolIntensity scales how much a patrol explores, relative to the
+// candidate volume of the pool manager this replaced (one IP per /24, ~6k). 1 is
+// that volume; the engine clamps the value to MaxPatrolIntensity.
 func GetCfPatrolIntensity() float64 {
 	if v := viper.GetFloat64("cf.patrol_intensity"); v > 0 {
 		return v
