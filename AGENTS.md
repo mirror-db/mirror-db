@@ -15,8 +15,13 @@ without redirect), `fetch(request)`, optional `status()`.
 
 - [server/index.ts](server/index.ts) — entry. Parses subdomain from host header.
   Subdomain mirror wins; on bare `@` splits pathname, looks up first segment in
-  `mirrorsByPath`, then falls through to the key proxy (`/keys/`), Hono API
-  (`/api/`), scripts (`/scripts/`), then static SPA.
+  `mirrorsByPath`, then the mount switches: `/speedtest/`, `/keys/`, `/api/`,
+  `/scripts/`. Everything else is a static asset or a **real 404** — the SPA
+  shell is only served for `/` and `/about` (the routes `src/router/` owns).
+  An unknown first segment must never fall through to the SPA: a 404 page
+  ([server/not-found.ts](server/not-found.ts)) answers in two flavours —
+  HTML + countdown redirect home for a browser, plain text + the mount list for
+  everything else. A typo in a package manager config has to look like a typo.
 - [server/mirrors/index.ts](server/mirrors/index.ts) — aggregates every mirror
   into `mirrors` array plus lookups: `mirrorsBySubdomain`, `mirrorsByName`,
   `mirrorsByPath`. Simple passthrough registries declared inline via
@@ -45,6 +50,20 @@ proxying requests to the Worker. Mirrors that generate absolute URLs (Helm chart
 npm, pypi, install scripts) use this to emit URLs pointing back through the relay
 instead of directly to the upstream Worker.
 
+**Rule: every absolute reference in a response body or `Location` is built from
+`relayInfo().origin`, never from `request.url`.** `request.url` is always the
+Worker's origin; using it silently sends the client past the relay on its next
+request. See [ADR 0002](docs/adr/0002-absolute-references-and-relay.md).
+
+- `normalizeRelayHost()` validates the header as a bare hostname
+  (`[a-z0-9-]` labels, no port/path/userinfo, ≤253 chars, lowercase, no trailing
+  dot) and **falls back to `BASE_DOMAIN`** on anything else. The project is open,
+  so anyone can send the header; it may pick a hostname in a URL, never change
+  the URL's structure.
+- Directory redirects stay **relative** and use `308` (the APT `dists` → `dists/`
+  case). A permanent `301` to an absolute Worker URL would pin clients to the
+  Worker forever.
+
 Returns `{ baseDomain, origin }`:
 - `baseDomain`: relay's domain if present, else `env.BASE_DOMAIN`
 - `origin`: `https://${baseDomain}` or request's own origin
@@ -61,6 +80,16 @@ Returns `{ baseDomain, origin }`:
 | mcr | mcr.microsoft.com |
 | nvcr | nvcr.io |
 | ocr | container-registry.oracle.com |
+| lscr | lscr.io |
+
+Path-routed file trees ([web-mirrors.ts](server/mirrors/web-mirrors.ts)) pair
+with the APT mirrors by name: `/debian-cd/` + `/debian-cloud/`,
+`/ubuntu-cd/` + `/ubuntu-cloud/` + `/ubuntu-releases/`. A name is a label; the
+**base URL must be a listing root** (an `autoindex` page, not a redirect and not
+a 404) — `cuda` is `…/compute/cuda/repos/` and only that path lists,
+`microsoft` is `packages.microsoft.com/repos/` (the site root also exposes
+`config/`, `keys/`, `yumrepos/` as site chrome). See
+[ADR 0007](docs/adr/0007-listing-mounts-declare-their-root.md).
 
 ## Core proxy — [server/pkgs/oci/registry-proxy.ts](server/pkgs/oci/registry-proxy.ts)
 
@@ -146,13 +175,25 @@ through these, not bare `fetch`, so user-agent + rate-limiting are uniform.
   Release fetch, **`upstreamProxy`**, and PyPI. The **OCI proxy** does *not* use
   it: it needs digest-keyed entries + immutable `Cache-Control` rewriting, so it
   calls `mdbfetch` + an injected `cache` directly.
+
+  **Freshness (ADR 0003):** `save()` stamps the entry with `x-mdb-stored-at` and
+  `x-mdb-revalidate-after` (default `MdbRevalidateIntervalMs` = 10 min) and lifts
+  the advertised `max-age` up to that floor (`liftCacheControl`; `no-store` /
+  `no-cache` are never lifted, and `sanitizeResponse({cacheControl})` still wins
+  downstream). A hit whose interval has elapsed is re-checked with a conditional
+  `HEAD` (`If-None-Match` / `If-Modified-Since`): `304` re-stamps in place, `200`
+  refetches + replaces, `404`/`410` drops the entry, an unreachable source keeps
+  serving the stored copy. The Cache API has no store-time notion, so this has to
+  live in the stored headers — which are then **stripped on the way out**
+  (`mark()`), together with setting `x-mdb-cache: hit|revalidated|miss|bypass`.
 - **`sanitizeResponse(upstream, opts?)`** — strip dangerous headers
   (`STRIP_RESPONSE_HEADERS`: `www-authenticate`, `set-cookie`, `vary`, `age`,
   hop-by-hop) from an upstream response before serving to clients. Optional
   `cacheControl` override on 200s. Shared by both OCI and APT proxies.
 - Constants in [const.ts](server/pkgs/fetch/const.ts): `CFCacheLimit` (512 MB,
   CF Free/Pro per-object cap) = `MdbCacheSizeLimit`, `MdbMaxConcurrentRequests`,
-  `MdbCacheName` (`"upstream"`), `MdbUserAgent`.
+  `MdbCacheName` (`"upstream"`), `MdbUserAgent`, `MdbRevalidateIntervalMs`
+  (10 min).
 
 ## Layout
 
@@ -289,6 +330,35 @@ reaching upstreams directly. Mounted in [server/index.ts](server/index.ts) via
 - Deps: `openpgp` (heaviest single dependency — drives bundle to ~755 KB;
   needed for `/info` + `POST` verify), `spark-md5` (SSH md5 fingerprints).
 
+## Docs
+
+- [CONTEXT.md](CONTEXT.md) — the project's glossary (mirror, mount, front door,
+  listing site, res resource, relay, absolute reference, cache key…). Keep it a
+  glossary: no implementation detail.
+- [docs/adr/](docs/adr/) — decisions, including rejected ones (0001 mirror
+  kinds, 0005 registry token realm scope, 0006 external probes). A rejected ADR
+  keeps the reasoning so it is not re-proposed from scratch.
+- [TODO.md](TODO.md) — reviewed-but-open items (dead upstreams, a passthrough
+  that needs a token, the 48 MB PyPI index) with the evidence that produced
+  them.
+
+## Known limitations
+
+- `/pypi/simple/` is ~48 MB uncompressed upstream (7.6 MB gzip). The mirror
+  requests identity, so a cache miss transfers the full 48 MB once and the
+  read-through cache then serves it for the 10-minute revalidation interval.
+  Compressing the upstream hop is not implemented.
+- `gcr.io` times out from some networks (verified from a CN egress: all of
+  `gcr.io`, `eu.gcr.io`, `us.gcr.io`, `mirror.gcr.io` answer `401` + a valid
+  token realm over a working path). Not an upstream shutdown — treat as a path
+  problem when it shows up.
+- `apt.syncthing.dev` no longer resolves (NODATA/`NXDOMAIN` locally) but
+  `apt.syncthing.net` is up; the mirror config still points at `.dev`.
+- `packages.opentofu.org/opentofu/tofu/any/` is not an APT tree (packagecloud
+  web UI; `dists/` is 404 at every path tried).
+- `packages.k8s.io` returns `403` for the `isv:/kubernetes:/` prefix without a
+  token.
+
 ## Commands
 
 ```
@@ -394,13 +464,41 @@ with `passthrough - 1`; when 0 or absent, serves random bytes locally.
 
 ### Key files
 
-- `tools/relay/server/server.go` — Server, routers, proxy, `stripRelayPrefix`.
-- `tools/relay/server/certmagic.go` — TLS with per-domain DNS-01 or cert-pack.
-- `tools/relay/server/disguise.go` — SSH banner exchange (listener + dialer).
+- `tools/relay/server/server.go` — Server, routers, `httputil.ReverseProxy`
+  rewrites, `X-MDB-Relay-Host` handling (`RelayHostHeader`), manifest watcher.
+  Internal endpoints: `/.mirror-relay/cert-pack` (JWT-guarded),
+  `/.mirror-relay/mirrors` (JWT-guarded, serves the cached manifest).
+- `tools/relay/server/certmagic.go` — `CertMagicStorage()` is a `sync.OnceValue`:
+  file storage in ACME mode, the shared `certclient.CertClient` in cert-pack
+  mode. ACME issuance is skipped entirely in cert-pack mode.
+- `tools/relay/server/disguise.go` — SSH banner exchange
+  (`ClientBannerExchange` is exported for `forward`).
 - `tools/relay/server/speedtest.go` — `/speedtest/{mb}` handler with passthrough.
-- `tools/relay/forward/forward.go` — `relay forward` L4 TCP forwarder.
+- `tools/relay/certclient/` — read-only `certmagic.Storage` that snapshots the
+  parent's cert-pack hourly. Mutations return `ErrReadOnly`.
+- `tools/relay/certsrv/` — streams the cert-pack tar; skips lock files.
+- `tools/relay/guard/` — HS256 JWT (exp/nbf/iat enforced, alg pinned).
+- `tools/relay/config/` — viper + `RELAY_CONFIG_DIR` / `RELAY_BASE_DOMAINS` env.
+- `tools/relay/forward/forward.go` — `relay forward` L4 forwarder.
 - `tools/relay/install/install.go` — `relay install` systemd setup.
 - `tools/relay/uninstall.sh` — clean removal (handles old + new installs).
+
+### Config / secrets
+
+`RELAY_CONFIG_DIR` (default `/etc/mirror-relay`) is the single root for
+`config.yaml`, `secret.key` and `certmagic/` — no CWD fallback, so the env var
+can never split config from keys. `secret.key` is `0640`, the dir `0750`.
+systemd unit pins `CapabilityBoundingSet=CAP_NET_BIND_SERVICE` and enables the
+usual hardening (`ProtectHome`, `ProtectKernelTunables`, `RestrictNamespaces`,
+`MemoryDenyWriteExecute`, …).
+
+### Tests
+
+`go test -race ./...` in `tools/relay` — covers proxy rewrites (raw path,
+hop-by-hop/`Connection` tokens, `X-MDB-Relay-Host` passthrough, upgrade,
+base path), host matching, `keepHTTP`, cert-name→token mapping, cert-pack
+tar streaming/untar, guard accept/reject matrix, config precedence, and the
+`forward` half-close regression. CI runs vet + test before building.
 
 ### Build
 
