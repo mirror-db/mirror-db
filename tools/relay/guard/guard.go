@@ -1,11 +1,20 @@
 package guard
 
 import (
+	"errors"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+)
+
+// clockSkew tolerates small drift between relay tiers.
+const clockSkew = 30 * time.Second
+
+var (
+	errNoToken      = errors.New("missing bearer token")
+	errInvalidToken = errors.New("invalid token")
 )
 
 // Guard validates JWT tokens on protected endpoints.
@@ -17,52 +26,63 @@ type Guard struct {
 // Wrap returns middleware that validates JWT before passing to handler.
 func (g *Guard) Wrap(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !g.validate(w, r) {
+		if err := g.Check(r); err != nil {
+			w.Header().Set("WWW-Authenticate", `Bearer`)
+			http.Error(w, err.Error(), http.StatusUnauthorized)
 			return
 		}
 		h.ServeHTTP(w, r)
 	})
 }
 
-func (g *Guard) validate(w http.ResponseWriter, r *http.Request) bool {
+// Check validates the bearer token on r. Shared by the middleware and by
+// callers that need the verdict without a ResponseWriter.
+func (g *Guard) Check(r *http.Request) error {
 	auth := r.Header.Get("Authorization")
 	tokenStr := strings.TrimPrefix(auth, "Bearer ")
 	if tokenStr == auth || tokenStr == "" {
-		http.Error(w, "missing bearer token", http.StatusUnauthorized)
-		return false
+		return errNoToken
 	}
 
 	claims := &jwt.RegisteredClaims{}
-	token, err := jwt.ParseWithClaims(tokenStr, claims, func(t *jwt.Token) (interface{}, error) {
+	_, err := jwt.ParseWithClaims(tokenStr, claims, func(t *jwt.Token) (interface{}, error) {
 		return g.SecretKey, nil
-	})
+	},
+		// Pin the algorithm: without this a token signed with another alg (or
+		// "none") could slip through depending on library defaults.
+		jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}),
+		jwt.WithExpirationRequired(),
+		jwt.WithIssuedAt(),
+		jwt.WithLeeway(clockSkew),
+	)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusUnauthorized)
-		return false
-	}
-	if !token.Valid {
-		http.Error(w, "invalid token", http.StatusUnauthorized)
-		return false
+		// Wrapped, not returned raw: callers must not echo parser internals.
+		return errInvalidToken
 	}
 
 	iat, err := claims.GetIssuedAt()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusUnauthorized)
-		return false
+	if err != nil || iat == nil {
+		return errInvalidToken
 	}
-	if iat.Time.Before(time.Now().Add(-5 * time.Minute)) {
-		http.Error(w, "token expired", http.StatusUnauthorized)
-		return false
+	// Issued in the future beyond skew → clock tampering or replay.
+	if iat.Time.After(time.Now().Add(clockSkew)) {
+		return errInvalidToken
 	}
 
-	return true
+	return nil
 }
 
-// SignToken creates a JWT for authenticating to another relay's cert-pack.
+// SignToken creates a short-lived JWT for authenticating to another relay's
+// cert-pack endpoint.
 func SignToken(secretKey []byte) (string, error) {
+	if len(secretKey) == 0 {
+		return "", errors.New("empty secret key")
+	}
+	now := time.Now()
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.RegisteredClaims{
-		IssuedAt:  jwt.NewNumericDate(time.Now()),
-		ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+		IssuedAt:  jwt.NewNumericDate(now),
+		NotBefore: jwt.NewNumericDate(now.Add(-clockSkew)),
+		ExpiresAt: jwt.NewNumericDate(now.Add(5 * time.Minute)),
 	})
 	return token.SignedString(secretKey)
 }
