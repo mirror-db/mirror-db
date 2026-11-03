@@ -8,13 +8,18 @@ const WellKnownAptKeyUrl: Record<string, string | string[]> = {
   opentofu: "https://get.opentofu.org/opentofu.gpg",
   "opentofu-repo": "https://packages.opentofu.org/opentofu/tofu/gpgkey",
   // Syncthing signs its index with two certificates: the current release key
-  // published at syncthing.net, and the long-standing 2014 key. Upstream ships
+  // (published at syncthing.net) and the long-standing 2014 key. Upstream ships
   // only the former, so a client following their instructions still gets
-  // "Missing key 37C84554…" from `sqv` and apt drops the repository. Both are
-  // served here, as one keyring.
+  // "Missing key 37C84554…" from `sqv`, and apt drops the repository. Both are
+  // served here as one keyring.
+  //
+  // The 2014 certificate is taken from keyserver.ubuntu.com because it carries
+  // the full self-signatures (keys.openpgp.org strips them). Note its self-sig
+  // is SHA-1, which sequoia refuses to treat as bound — that is a warning, not
+  // an error: `sqv` still exits 0 and apt accepts the index.
   syncthing: [
     "https://syncthing.net/release-key.gpg",
-    "https://keys.openpgp.org/vks/v1/by-fingerprint/37C84554E7E0A261E4F76E1ED26E6ED000654A3E",
+    "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0xD26E6ED000654A3E",
   ],
   docker: "https://download.docker.com/linux/debian/gpg",
   "docker-ubuntu": "https://download.docker.com/linux/ubuntu/gpg",

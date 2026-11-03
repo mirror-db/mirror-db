@@ -26,6 +26,12 @@ real CN client, or only from the relay? Needs one test from a domestic host
 no listing upstream, so the suite list stays explicit and directory browsing on
 this mount answers 404 by design.
 
+## 2b. Syncthing's second signing certificate
+
+The archive is dual-signed but only one certificate is published. Our key mirror
+serves both, so the mount works; the underlying upstream inconsistency is
+theirs. Recheck when they drop the 2014 signature (then the extra fetch can go).
+
 ## 3. `packages.opentofu.org` is not an APT tree
 
 `https://packages.opentofu.org/opentofu/tofu/any/` is a packagecloud HTML UI;

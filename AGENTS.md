@@ -34,6 +34,9 @@ without redirect), `fetch(request)`, optional `status()`.
 - [server/keys/index.ts](server/keys/index.ts) — Hono app at `/keys/` on the
   bare domain. Proxies common signing keys (PGP + SSH) so domestic clients fetch
   them through the mirror. See [Key proxy](#key-proxy--serverkeys) below.
+  A key entry may list **several URLs**: they are fetched and merged into one
+  keyring (`PGPPubKeyHandler.fromUrls`), normalised to binary. Syncthing needs
+  this — it signs with two certificates and publishes only one.
 - [server/scripts/](server/scripts/) — Hono app at `/scripts/` on the bare
   domain. Generates install scripts for OCI registries that return correct
   mirror URLs based on `X-MDB-Relay-Host` header.
@@ -370,6 +373,13 @@ reaching upstreams directly. Mounted in [server/index.ts](server/index.ts) via
   web UI; `dists/` is 404 at every path tried).
 - `packages.k8s.io` returns `403` for the `isv:/kubernetes:/` prefix without a
   token.
+- Syncthing signs `dists/syncthing` with **two** certificates: the current one
+  (`FBA2E162…`) that `syncthing.net/release-key.gpg` ships, and the 2014 key
+  (`37C84554…`) it no longer publishes. A client with only the published key
+  gets `Missing key 37C84554…` from `sqv` and apt skips the repository, so
+  `/keys/apt/syncthing` serves both (the second from keyserver.ubuntu.com, which
+  keeps its self-signatures). Sequoi rejects that certificate as *bound* because
+  its self-signature is SHA-1 — a warning, not an error: `sqv` exits 0.
 - APT `pool/` files are proxied with `ezfetch` and **do not forward `Range`**:
   a resuming client gets `200` from byte 0 and apt restarts the download. Not
   fixed yet; `dists/` files and by-hash objects are unaffected.

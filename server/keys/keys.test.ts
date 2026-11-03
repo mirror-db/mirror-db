@@ -94,24 +94,41 @@ describe("keys app routing", () => {
 
   it("serves a binary key instead of failing to parse it", async () => {
     // syncthing.net publishes a binary key file. Parsing it used to throw
-    // (readKey was called with `armoredKey`), which surfaced as a 500 for a key
-    // apt clients need in order to trust the repository.
+    // (`readKey` was called with `armoredKey`), surfacing as a 500 for a key apt
+    // clients need in order to trust the repository.
     const binary = new Uint8Array([0xc6, 0x00, 0x00]); // not parseable on purpose
-    // A fresh Response per call: a body can only be read once, and this test
-    // asks for the same key twice.
+    // A fresh Response per call: a body can only be read once.
     mockEzfetch.mockImplementation(
       async () =>
         new Response(binary, { headers: { "content-type": "application/octet-stream" } }),
     );
 
-    const res = await get("/keys/apt/syncthing");
+    const res = await get("/keys/apt/hashicorp");
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toBe("application/pgp-keys");
     expect(new Uint8Array(await res.arrayBuffer())).toEqual(binary);
 
     // Metadata needs a parse; an unparseable key answers 502 rather than 500.
-    const info = await get("/keys/apt/syncthing/info");
+    const info = await get("/keys/apt/hashicorp/info");
     expect(info.status).toBe(502);
+  });
+
+  it("merges every certificate of a multi-source key into one keyring", async () => {
+    // Syncthing signs with two certificates and publishes only one of them; the
+    // mirror serves both so `sqv` (and therefore apt) accepts the index.
+    const first = new Uint8Array([0xc6, 0x00, 0x01]);
+    const second = new Uint8Array([0xc6, 0x00, 0x02]);
+    mockEzfetch
+      .mockImplementationOnce(async () => new Response(first))
+      .mockImplementationOnce(async () => new Response(second));
+
+    const res = await get("/keys/apt/syncthing");
+    expect(res.status).toBe(200);
+    expect(new Uint8Array(await res.arrayBuffer())).toEqual(
+      new Uint8Array([0xc6, 0x00, 0x01, 0xc6, 0x00, 0x02]),
+    );
+    expect(fetchedUrl(0)).toBe("https://syncthing.net/release-key.gpg");
+    expect(fetchedUrl(1)).toContain("keyserver.ubuntu.com/pks/lookup");
   });
 
   it("apt key route resolves via well-known table", async () => {
