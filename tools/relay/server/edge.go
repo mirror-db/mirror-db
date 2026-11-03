@@ -73,9 +73,14 @@ func newEdgeSelection() (*edgeSelection, http.RoundTripper) {
 // engineConfig maps relay configuration onto the engine's.
 func engineConfig() engine.Config {
 	cfg := engine.Config{
-		TopN:                  config.GetCfTopN(),
-		SeedCount:             config.GetCfSeedCount(),
-		SpeedSeedCount:        config.GetCfSpeedSeedCount(),
+		TopN:           config.GetCfTopN(),
+		SeedCount:      config.GetCfSeedCount(),
+		SpeedSeedCount: config.GetCfSpeedSeedCount(),
+		// Only the pool the traffic is actually routed through is worth
+		// measuring. A speed probe occupies the link for a whole window where a
+		// latency probe costs a round trip, so maintaining a pool nothing selects
+		// from is the largest line item in the probe budget.
+		DisableSpeedPool:      config.GetUpstreamTransport() != "speed",
 		Penalty:               config.GetCfPenalty(),
 		RecruitSamples:        config.GetCfRecruitSamples(),
 		ScanInterval:          config.GetCfScanInterval(),

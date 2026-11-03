@@ -159,6 +159,26 @@ candidates fail — which is exactly when looking longer pays off.
 A recruit waits for a patrol in progress — both are bulk measurements of the
 same links, and running them together makes both numbers wrong.
 
+### What probing costs
+
+A latency probe moves about **1.1 KB** (request line, response headers, a small
+body). A speed probe reads for `speed_probe_duration` (three seconds by default),
+so it moves whatever the link delivers in that time — hundreds of KB, measured as
+0-700 KB on a congested path. Three orders of magnitude more. Measured on a
+nominally 0.5 MB/s Cloudflare path:
+
+| job | cadence | probes/day | bytes/day |
+|---|---|---|---|
+| patrol latency | 5m × 8 members | ~2,300 | ~2.5 MB |
+| scan | 1h, stops when stocked | ~5,900 | ~6.5 MB |
+| recruit | 10m × 2 candidates | ~290 | ~0.3 MB |
+
+That is the whole bill with the speed pool disabled (the default, because
+`upstream.transport` defaults to `latency`). **Enabling it adds 300-500 MB a day**
+at the same cadence, against ~10 MB for everything else — which is why the engine
+only maintains the pool traffic is actually routed through
+([ADR-0012](../cft/docs/adr/0012-measure-only-the-pool-in-use.md)).
+
 Candidate addresses survive a restart: the top of both pools is written to
 `cf-candidates.csv` every hour and on shutdown, and a restart measures those
 instead of exploring the published ranges. With no snapshot, the engine resolves

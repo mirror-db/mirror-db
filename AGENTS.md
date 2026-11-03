@@ -514,6 +514,13 @@ A **recruit waits for a patrol in progress** — both are bulk measurements of t
 same links, and a speed probe saturates the link, so concurrent runs measure
 each other.
 
+Probing is not free, and the two probe kinds differ by ~1000x in bytes: a latency
+probe moves ~1.1 KB, a speed probe reads for a three-second window and moves
+hundreds of KB. So the engine only maintains the pool traffic is routed through —
+`upstream.transport: latency` (the default) disables the speed pool entirely,
+which is the difference between ~10 MB/day and ~350 MB/day at default cadences.
+See ADR-0012.
+
 Candidate addresses survive a restart: the top of both pools is written to
 `cf-candidates.csv` every hour and on shutdown, and a restart measures those
 instead of exploring the published ranges. Without a snapshot the engine resolves
