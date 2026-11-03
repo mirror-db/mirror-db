@@ -27,8 +27,8 @@ func TestConfigDirEnvIsSingleSourceOfTruth(t *testing.T) {
 	if got := ResolveConfig("secret.key"); got != filepath.Join(dir, "secret.key") {
 		t.Fatalf("ResolveConfig = %q", got)
 	}
-	if got := GetCfNodesFile(); got != filepath.Join(dir, "cf-nodes.csv") {
-		t.Fatalf("GetCfNodesFile = %q", got)
+	if got := ResolveConfig("certmagic"); got != filepath.Join(dir, "certmagic") {
+		t.Fatalf("ResolveConfig(certmagic) = %q", got)
 	}
 }
 

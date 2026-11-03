@@ -4,7 +4,7 @@ go 1.25.7
 
 require (
 	github.com/caddyserver/certmagic v0.25.3
-	github.com/geektr-cloud/go-cloudflare-fastest-transport v0.2.0
+	github.com/geektr-cloud/go-cloudflare-fastest-transport v0.3.0
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/gorilla/mux v1.8.1
 	github.com/joho/godotenv v1.5.1
@@ -43,3 +43,8 @@ require (
 	golang.org/x/text v0.36.0 // indirect
 	golang.org/x/tools v0.44.0 // indirect
 )
+
+// TEMPORARY: the transport module is mounted at ./cft while the new engine is
+// validated end to end. Delete this directive once v0.3.0 is published — the
+// import paths are already the published ones, so nothing else changes.
+replace github.com/geektr-cloud/go-cloudflare-fastest-transport => ./cft

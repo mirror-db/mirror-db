@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	_ "github.com/joho/godotenv/autoload"
 	"github.com/spf13/viper"
@@ -26,7 +27,7 @@ func init() {
 	viper.SetDefault("relay.config_dir", "/etc/mirror-relay")
 
 	viper.SetDefault("upstream.url", "https://mirs.uk")
-	viper.SetDefault("upstream.pool_size", 25)
+	viper.SetDefault("upstream.transport", "latency")
 
 	viper.SetDefault("acme.source", "acme")
 	viper.SetDefault("acme.email", "acme@mirs.uk")
@@ -75,8 +76,6 @@ func decodeBaseDomains(raw string) ([]BaseDomain, error) {
 // certmagic store. Every path in this package derives from it, so the config
 // file, the secret and the certificates can never diverge.
 func GetConfigDir() string         { return viper.GetString("relay.config_dir") }
-func GetPoolSize() int             { return viper.GetInt("upstream.pool_size") }
-func GetCfNodesFile() string       { return ResolveConfig("cf-nodes.csv") }
 func GetDisguisePort() int         { return viper.GetInt("relay.disguise_port") }
 func GetUpstreamURL() string       { return viper.GetString("upstream.url") }
 func GetUpstreamDisguisePort() int { return viper.GetInt("upstream.disguise_port") }
@@ -85,6 +84,60 @@ func GetAcmeSource() string        { return viper.GetString("acme.source") }
 func GetAcmeEmail() string         { return viper.GetString("acme.email") }
 func GetAcmeCA() string            { return viper.GetString("acme.ca") }
 func GetAcmeAgree() bool           { return viper.GetBool("acme.agree") }
+
+// --- Cloudflare edge selection ---
+
+// GetUpstreamTransport selects which pool the proxy draws from: "latency"
+// (default) or "speed".
+//
+// They rank differently on purpose: latency decides a manifest fetch, where a
+// few kilobytes round-trip time dominates, while speed decides a large layer
+// download. A mirror serving mostly blobs can prefer "speed"; the default suits
+// mixed traffic.
+func GetUpstreamTransport() string {
+	v := strings.ToLower(strings.TrimSpace(viper.GetString("upstream.transport")))
+	if v == "speed" {
+		return "speed"
+	}
+	return "latency"
+}
+
+// CFConfig values for the edge-selection engine. Zero means "use the engine's
+// default"; the engine owns the defaults so they stay in one place.
+func GetCfPoolCapacity() int        { return viper.GetInt("cf.latency_capacity") }
+func GetCfSpeedCapacity() int       { return viper.GetInt("cf.speed_capacity") }
+func GetCfTopN() int                { return viper.GetInt("cf.top_n") }
+func GetCfSeedCount() int           { return viper.GetInt("cf.seed_count") }
+func GetCfSpeedSeedCount() int      { return viper.GetInt("cf.speed_seed_count") }
+func GetCfLatencyURL() string       { return strings.TrimSpace(viper.GetString("cf.latency_url")) }
+func GetCfSpeedURL() string         { return strings.TrimSpace(viper.GetString("cf.speed_url")) }
+func GetCfLatencyMinScore() float64 { return viper.GetFloat64("cf.latency_min_score") }
+func GetCfSpeedMinScore() float64   { return viper.GetFloat64("cf.speed_min_score") }
+func GetCfPenalty() float64         { return viper.GetFloat64("cf.penalty") }
+func GetCfScanSamples() int         { return viper.GetInt("cf.scan_samples") }
+func GetCfRecruitSamples() int      { return viper.GetInt("cf.recruit_samples") }
+
+func GetCfScanInterval() time.Duration {
+	return viper.GetDuration("cf.scan_interval")
+}
+func GetCfPatrolLatencyInterval() time.Duration {
+	return viper.GetDuration("cf.patrol_latency_interval")
+}
+func GetCfPatrolSpeedInterval() time.Duration {
+	return viper.GetDuration("cf.patrol_speed_interval")
+}
+func GetCfRecruitInterval() time.Duration {
+	return viper.GetDuration("cf.recruit_interval")
+}
+
+// GetCfInitTimeout bounds how long startup waits for the edge pools to fill.
+// Exceeding it is not fatal: the relay falls back to unoptimised transport.
+func GetCfInitTimeout() time.Duration {
+	if d := viper.GetDuration("cf.init_timeout"); d > 0 {
+		return d
+	}
+	return 30 * time.Second
+}
 
 // IsAcmeUpstream returns true when acme.source is not "acme" (i.e. a URL or "upstream").
 func IsAcmeUpstream() bool {

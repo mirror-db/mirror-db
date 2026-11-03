@@ -7,6 +7,8 @@ package main
 
 import (
 	"log"
+	"os/signal"
+	"syscall"
 
 	"github.com/mirror-db/mirror-db/tools/relay/config"
 	"github.com/mirror-db/mirror-db/tools/relay/forward"
@@ -34,15 +36,31 @@ func serveCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "serve",
 		Short: "Start the relay server",
-		Run: func(cmd *cobra.Command, args []string) {
+		RunE: func(cmd *cobra.Command, args []string) error {
 			srv, err := server.NewServer()
 			if err != nil {
-				log.Fatalf("failed to create relay server: %v", err)
+				return err
 			}
 
+			// Stop the edge-selection engine on the way out; otherwise its
+			// probe goroutines keep running against a network the process is no
+			// longer serving.
+			defer srv.Close()
+
 			log.Printf("relay → %s", config.GetUpstreamURL())
-			if err := server.ListenAndServeHTTPS(srv); err != nil {
-				log.Fatal(err)
+
+			ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
+			defer stop()
+
+			served := make(chan error, 1)
+			go func() { served <- server.ListenAndServeHTTPS(srv) }()
+
+			select {
+			case err := <-served:
+				return err
+			case <-ctx.Done():
+				log.Println("shutting down")
+				return nil
 			}
 		},
 	}

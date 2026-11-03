@@ -15,7 +15,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	cft "github.com/geektr-cloud/go-cloudflare-fastest-transport"
 	"github.com/gorilla/mux"
 	"github.com/mirror-db/mirror-db/tools/relay/certsrv"
 	"github.com/mirror-db/mirror-db/tools/relay/config"
@@ -44,6 +43,8 @@ type Server struct {
 	Router     *mux.Router // HTTPS (all requests)
 	HTTPRouter *mux.Router // HTTP (keepHTTP + redirect)
 
+	edge *edgeSelection
+
 	mirrors      atomic.Pointer[[]Mirror]
 	allowedHosts atomic.Pointer[map[string]bool]
 	keepHTTP     atomic.Pointer[map[string]bool]
@@ -69,24 +70,28 @@ func NewServer() (*Server, error) {
 		return nil, fmt.Errorf("upstream url %q needs scheme and host", u.String())
 	}
 
-	// Upstream transport: proxy > disguise > CF fastest-node.
-	// When a proxy is configured, skip the CF node optimizer entirely.
-	var transport http.RoundTripper
-	if px := config.GetUpstreamProxy(); px != "" {
-		t, err := buildProxyTransport(px)
+	// Upstream transport: proxy > disguise > edge selection.
+	//
+	// The first two are explicit routing decisions and bypass edge selection
+	// entirely: when the operator says "go through this proxy" or "use this
+	// disguised port", picking a Cloudflare IP would override their intent.
+	var (
+		transport http.RoundTripper
+		edge      *edgeSelection
+	)
+	switch {
+	case config.GetUpstreamProxy() != "":
+		t, err := buildProxyTransport(config.GetUpstreamProxy())
 		if err != nil {
 			return nil, fmt.Errorf("proxy transport: %w", err)
 		}
 		transport = t
-		log.Printf("upstream via proxy %s", px)
-	} else if dp := config.GetUpstreamDisguisePort(); dp != 0 {
-		transport = buildDisguiseTransport(u.Hostname(), dp)
-	} else {
-		t, err := buildTransport(config.GetPoolSize())
-		if err != nil {
-			return nil, fmt.Errorf("cf transport: %w", err)
-		}
-		transport = t
+		log.Printf("upstream via proxy %s", config.GetUpstreamProxy())
+	case config.GetUpstreamDisguisePort() != 0:
+		transport = buildDisguiseTransport(u.Hostname(), config.GetUpstreamDisguisePort())
+		log.Printf("upstream via SSH disguise :%d", config.GetUpstreamDisguisePort())
+	default:
+		edge, transport = newEdgeSelection()
 	}
 
 	// No Client.Timeout: it caps the WHOLE request including body read, which
@@ -97,6 +102,7 @@ func NewServer() (*Server, error) {
 	s := &Server{
 		upstream:    u,
 		client:      httpClient,
+		edge:        edge,
 		resty:       resty.NewWithClient(httpClient).SetBaseURL(config.GetUpstreamURL()),
 		baseDomains: config.AllDomainNames(),
 	}
@@ -128,6 +134,7 @@ func (s *Server) buildRouters() {
 	g := &guard.Guard{SecretKey: config.GetSecretKey()}
 	relayRouter.Handle("/cert-pack", g.Wrap(certsrv.New(CertMagicStorage())))
 	relayRouter.Handle("/mirrors", g.Wrap(http.HandlerFunc(s.handleMirrors)))
+	relayRouter.Handle("/pool", g.Wrap(http.HandlerFunc(s.handlePool)))
 
 	// Speedtest endpoint
 	router.HandleFunc("/speedtest/{mb}", s.handleSpeedtest)
@@ -297,6 +304,30 @@ func (s *Server) Mirrors() ([]Mirror, error) {
 	return *p, nil
 }
 
+// handlePool reports what the edge-selection engine currently believes, so an
+// operator can answer "why is traffic going to that IP" without guessing.
+func (s *Server) handlePool(w http.ResponseWriter, r *http.Request) {
+	snap := s.edge.Snapshot()
+	if snap == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error": "edge selection is not running (configured proxy or disguise)",
+		})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(snap)
+}
+
+// Close stops background work. The edge engine owns goroutines that would
+// otherwise keep probing a network nobody is serving from.
+func (s *Server) Close() {
+	if s.edge != nil {
+		s.edge.Close()
+	}
+}
+
 func (s *Server) handleMirrors(w http.ResponseWriter, r *http.Request) {
 	m, err := s.Mirrors()
 	if err != nil {
@@ -363,19 +394,6 @@ func requestHost(r *http.Request) string {
 		host = strings.TrimSpace(h)
 	}
 	return strings.ToLower(strings.TrimSuffix(hostOnly(host), "."))
-}
-
-// buildTransport creates an http.RoundTripper using CF fastest-node discovery.
-func buildTransport(poolSize int) (http.RoundTripper, error) {
-	mgr := cft.NewPoolManagerWithFile(poolSize, config.GetCfNodesFile())
-	mgr.RefreshPool() // skips if pool already >61.8% full (i.e. file had enough nodes)
-
-	transport := mgr.Transport(cft.TransportOptions{
-		UpstreamCount:  3,
-		EliminateDelay: 5 * time.Second,
-	})
-
-	return transport, nil
 }
 
 // buildProxyTransport creates an http.RoundTripper that routes all upstream
