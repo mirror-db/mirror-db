@@ -147,7 +147,11 @@ at replenishment.
 
 The order at startup is deliberate: initialization only seeds a handful of
 addresses, so **one full scan runs immediately** and the periodic jobs start once
-it finishes. Deferring exploration by a whole interval would leave the relay on a
+it finishes. It logs what it did:
+
+```
+scan: 32/5956 candidates responded, 14 admitted in 49.6s (latency=14 speed=7)
+``` Deferring exploration by a whole interval would leave the relay on a
 bootstrap-sized pool for the hour it is most likely to be restarted — and a
 restart resets every timer, so a process that restarts more often than
 `scan_interval` never scans at all.

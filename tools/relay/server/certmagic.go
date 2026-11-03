@@ -277,11 +277,35 @@ var buildCertClient = sync.OnceValue(func() *certclient.CertClient {
 		SecretKey:   config.GetSecretKey(),
 		Transport:   certTransport(),
 	}
-	if err := c.Refresh(); err != nil {
+	if err := fetchPackWithRetry(c); err != nil {
 		log.Fatalf("failed to fetch cert-pack from upstream: %v", err)
 	}
 	return c
 })
+
+// fetchPackWithRetry retries the first pack fetch a few times.
+//
+// The process cannot listen without certificates, so a failure here is fatal —
+// but a first attempt can lose to a parent that is restarting at that exact
+// moment (a one-second overlap is enough: observed, connection refused), and
+// dying on that costs a systemd restart cycle for a problem that fixes itself in
+// seconds.
+func fetchPackWithRetry(c *certclient.CertClient) error {
+	const attempts = 3
+
+	var err error
+	for i := 0; i < attempts; i++ {
+		if i > 0 {
+			time.Sleep(time.Duration(i) * 2 * time.Second)
+			log.Printf("cert-pack: retrying (%d/%d)", i+1, attempts)
+		}
+		if err = c.Refresh(); err == nil {
+			return nil
+		}
+		log.Printf("cert-pack: fetch failed: %v", err)
+	}
+	return err
+}
 
 // certTransport follows the same upstream path rules as proxying, so a relay
 // that can only reach its parent through the SSH disguise can still sync certs.

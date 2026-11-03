@@ -46,6 +46,7 @@ type Server struct {
 	edge *edgeSelection
 
 	mirrors      atomic.Pointer[[]Mirror]
+	loaded       atomic.Bool // manifest has been fetched at least once
 	allowedHosts atomic.Pointer[map[string]bool]
 	keepHTTP     atomic.Pointer[map[string]bool]
 
@@ -291,6 +292,7 @@ func (s *Server) refreshMirrors() error {
 	s.keepHTTP.Store(&httpOK)
 	s.ready.Store(true)
 	log.Printf("loaded %d mirrors (%d hosts) from upstream", len(mirrors), len(hosts))
+	s.loaded.Store(true)
 	return nil
 }
 
@@ -340,8 +342,17 @@ func (s *Server) handleMirrors(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) watchMirrors(interval time.Duration) {
 	for {
+		// Until the manifest has loaded once, this relay has no routes at all:
+		// every request is a 502. Retry on a short timer rather than waiting a
+		// full interval, which is what turned one unlucky edge address at
+		// startup into ten minutes of downtime.
+		wait := interval
+		if !s.loaded.Load() {
+			wait = 15 * time.Second
+		}
+
 		// Jitter each cycle so a fleet of relays doesn't stampede the Worker.
-		next := interval + time.Duration(rand.Int64N(int64(interval/3))) - interval/6
+		next := wait + time.Duration(rand.Int64N(int64(wait/3))) - wait/6
 		time.Sleep(next)
 		if err := s.refreshMirrors(); err != nil {
 			log.Printf("mirror refresh failed: %v", err)

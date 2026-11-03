@@ -525,6 +525,12 @@ is anchored at `Start` — so a relay restarting more often than `scan_interval`
 would otherwise never scan at all (ADR-0014 in `cft/docs/adr/`). The scan logs one
 line when it finishes: `scan: N/M candidates responded, K admitted in Xs`.
 
+Two startup paths must tolerate a transient: the cert-pack fetch retries three
+times before giving up (a parent restarting at that exact second used to kill the
+consumer), and until `/api/mirrors` has loaded once the watcher retries every
+15 s instead of every 10 minutes (a relay with no manifest answers 502 to
+everything, so one unlucky edge address at startup was ten minutes of downtime).
+
 `cf.patrol_intensity` sets the scan's candidate budget, measured against what the
 pre-rewrite pool manager generated (one per `/24`, ≈6000), capped at 4. It is a
 ceiling, not a quota: the scan stops once the pool has taken as many admissible
