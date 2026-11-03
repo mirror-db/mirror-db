@@ -76,9 +76,22 @@ const aptConfigs: AptMirrorConfig[] = [
     suites: ["stable"],
   },
   {
+    // `apt.syncthing.dev` no longer resolves; the archive moved to `.net`. The
+    // suite is `syncthing` (with components stable / stable-v2 / candidate /
+    // nightly), and the host serves no directory listings, so the suite list is
+    // explicit — auto-discovery would find nothing.
     name: "syncthing-pkgs",
-    base: "https://apt.syncthing.dev/",
+    base: "https://apt.syncthing.net/",
     suites: ["syncthing"],
+  },
+  {
+    // A real APT repo (Artifactory, components main + test), not a file tree:
+    // it was a passthrough only because `dists/` has no listing. Suites are
+    // per-release codenames; a client on an un-listed codename still passes
+    // through unjudged.
+    name: "hashicorp",
+    base: "https://apt.releases.hashicorp.com/",
+    suites: ["trixie", "bookworm", "noble", "jammy", "focal"],
   },
   {
     name: "opentofu",

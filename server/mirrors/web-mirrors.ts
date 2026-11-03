@@ -61,10 +61,6 @@ const passthroughConfigs: WebMirrorConfig[] = [
     base: "https://go.dev/dl/",
   },
   {
-    name: "hashicorp",
-    base: "https://apt.releases.hashicorp.com/",
-  },
-  {
     name: "kube-releases",
     base: "https://dl.k8s.io/",
   },

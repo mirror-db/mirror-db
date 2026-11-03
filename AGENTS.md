@@ -362,12 +362,17 @@ reaching upstreams directly. Mounted in [server/index.ts](server/index.ts) via
   `gcr.io`, `eu.gcr.io`, `us.gcr.io`, `mirror.gcr.io` answer `401` + a valid
   token realm over a working path). Not an upstream shutdown — treat as a path
   problem when it shows up.
-- `apt.syncthing.dev` no longer resolves (NODATA/`NXDOMAIN` locally) but
-  `apt.syncthing.net` is up; the mirror config still points at `.dev`.
+- `apt.syncthing.net` serves a real archive (`dists/syncthing/…`) but no
+  directory listings — `/dists/` is `404` and a wrong component answers `403`.
+  The suite list is therefore explicit, and the mount's HTML/JSON listing is
+  `404` by design.
 - `packages.opentofu.org/opentofu/tofu/any/` is not an APT tree (packagecloud
   web UI; `dists/` is 404 at every path tried).
 - `packages.k8s.io` returns `403` for the `isv:/kubernetes:/` prefix without a
   token.
+- APT `pool/` files are proxied with `ezfetch` and **do not forward `Range`**:
+  a resuming client gets `200` from byte 0 and apt restarts the download. Not
+  fixed yet; `dists/` files and by-hash objects are unaffected.
 
 ## Commands
 

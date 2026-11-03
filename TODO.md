@@ -18,12 +18,13 @@ Open question: does `dcr/ghcr/k8s/...`-style proxying of `gcr.io` work from a
 real CN client, or only from the relay? Needs one test from a domestic host
 (`docker pull gcr.mirs.uk/...`).
 
-## 2. `apt.syncthing.dev` no longer resolves
+## 2. ~~`apt.syncthing.dev` no longer resolves~~ — resolved
 
-`getent hosts apt.syncthing.dev` → no answer; `https://apt.syncthing.net/` is up.
-The mirror config still points at `.dev`, so `mirs.uk/syncthing-pkgs/` cannot
-work. Either move the base to `.net` (and confirm the suite name `syncthing`
-under `dists/`) or drop the mirror.
+`apt.syncthing.dev` has no DNS record; the archive lives at
+`https://apt.syncthing.net/` with suite `syncthing` (components `stable`,
+`stable-v2`, `candidate`, `nightly`). The mirror now points there; `dists/` has
+no listing upstream, so the suite list stays explicit and directory browsing on
+this mount answers 404 by design.
 
 ## 3. `packages.opentofu.org` is not an APT tree
 
