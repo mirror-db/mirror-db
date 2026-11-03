@@ -161,7 +161,7 @@ restart resets every timer, so a process that restarts more often than
 
 `cf.patrol_intensity` sets the scan's candidate budget, measured against the
 volume the pre-rewrite pool manager generated — one candidate per `/24` over the
-ranges that actually answer, 4932 — so `1` scans that volume, `0.5` half of it,
+ranges that actually answer, 2334 — so `1` scans that volume, `0.5` half of it,
 and it is capped at 4.
 
 A scan **spends its whole budget**: a full pool still has a worst member, and only
@@ -183,7 +183,7 @@ nominally 0.5 MB/s Cloudflare path:
 
 | job | cadence | probes/day | bytes/day |
 |---|---|---|---|
-| scan | 1h × full budget | ~118,000 | ~130 MB |
+| scan | 1h × full budget | ~56,000 | ~62 MB |
 | patrol latency | 5m × 64 members | ~18,400 | ~20 MB |
 | recruit | 10m × 2 candidates | ~290 | ~0.3 MB |
 

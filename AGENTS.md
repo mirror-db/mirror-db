@@ -545,11 +545,12 @@ consumer), and until `/api/mirrors` has loaded once the watcher retries every
 everything, so one unlucky edge address at startup was ten minutes of downtime).
 
 `cf.patrol_intensity` sets the scan's candidate budget, measured against what the
-pre-rewrite pool manager generated — one per `/24` over the ranges that answer,
-4932 today — capped at 4. A scan **spends the whole budget**: a full pool still
-has a worst member worth replacing, and stopping at the fill level freezes the
-ranking at the first sweep's result (ADR-0015 supersedes ADR-0009's early stop).
-At intensity 1 that is ~4900 probes an hour — the knob to lower first on a
+pre-rewrite pool manager generated — one per `/24` over the measured usable
+ranges, 2334 today — capped at 4. A scan **spends the whole budget**: a full pool
+still has a worst member worth replacing, and stopping at the fill level freezes
+the ranking at the first sweep's result (ADR-0015 supersedes ADR-0009's early
+stop).
+At intensity 1 that is ~2300 probes an hour — the knob to lower first on a
 metered uplink.
 
 A **recruit waits for a patrol in progress** — both are bulk measurements of the
