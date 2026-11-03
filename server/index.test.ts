@@ -66,6 +66,15 @@ describe("front door — host routing", () => {
     }
   });
 
+  it("does not serve the site on a subdomain that is not a mirror", async () => {
+    const worker = await loadWorker();
+    const res = await worker.fetch(
+      new Request("https://nope.mirs.uk/", { headers: { host: "nope.mirs.uk" } }) as any,
+    );
+    expect(res.status).toBe(404);
+    expect(assets.fetch).not.toHaveBeenCalled();
+  });
+
   it("rejects a host outside BASE_DOMAIN", async () => {
     const worker = await loadWorker();
     const res = await worker.fetch(

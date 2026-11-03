@@ -36,26 +36,29 @@ export default {
 
     const url = new URL(request.url);
 
-    // Path-routed mirrors + API on the bare domain.
-    if (subdomain === "@") {
-      const [, firstSeg, ...rest] = url.pathname.split("/");
+    // A subdomain that is not a mirror is not this site either: the web UI and
+    // the path mounts live on the bare domain only. Serving the SPA shell here
+    // would answer `200 text/html` for a typo in a registry hostname.
+    if (subdomain !== "@") return notFound(request);
 
-      if (firstSeg === "speedtest") return handleSpeedtest(request, rest[0]);
+    // Path-routed mounts on the bare domain.
+    const [, firstSeg, ...rest] = url.pathname.split("/");
 
-      const pathMirror = firstSeg && mirrorsByPath.get(firstSeg);
-      if (pathMirror) return pathMirror.fetch(request);
+    if (firstSeg === "speedtest") return handleSpeedtest(request, rest[0]);
 
-      if (firstSeg === "") return serveStatic(request);
-      if (firstSeg === "keys") return keys.fetch(request);
-      if (firstSeg === "api") return api.fetch(request);
-      if (firstSeg === "scripts") return scripts.fetch(request);
-    }
+    const pathMirror = firstSeg && mirrorsByPath.get(firstSeg);
+    if (pathMirror) return pathMirror.fetch(request);
+
+    if (firstSeg === "") return serveStatic(request);
+    if (firstSeg === "keys") return keys.fetch(request);
+    if (firstSeg === "api") return api.fetch(request);
+    if (firstSeg === "scripts") return scripts.fetch(request);
 
     // Static assets (favicon, /weblist/, SPA chunks) and the SPA's own routes.
     // Anything else is a genuine miss: falling through to the SPA answered
     // `200 text/html` for a misspelled mount, which reads as success to every
     // script that checks the status code.
-    if (subdomain === "@" && SPA_ROUTES.has(url.pathname)) return serveStatic(request);
+    if (SPA_ROUTES.has(url.pathname)) return serveStatic(request);
     return serveStaticOr404(request, url.pathname);
   },
 } satisfies ExportedHandler<Env>;
