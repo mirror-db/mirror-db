@@ -145,6 +145,13 @@ explores the address pools for addresses nobody holds yet; it is the expensive
 one, on an hourly cadence. A **recruit** is a small scan on a short cadence, aimed
 at replenishment.
 
+The order at startup is deliberate: initialization only seeds a handful of
+addresses, so **one full scan runs immediately** and the periodic jobs start once
+it finishes. Deferring exploration by a whole interval would leave the relay on a
+bootstrap-sized pool for the hour it is most likely to be restarted — and a
+restart resets every timer, so a process that restarts more often than
+`scan_interval` never scans at all.
+
 `cf.patrol_intensity` sets the scan's candidate budget, measured against the
 volume the pre-rewrite pool manager generated — one candidate per `/24`, about
 6000 — so `1` allows the old intensity, `0.5` allows half, and it is capped at 4.

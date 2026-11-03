@@ -92,6 +92,28 @@ describe("keys app routing", () => {
     expect(fetchedUrl()).toBe("https://gitlab.com/someone.keys");
   });
 
+  it("serves a binary key instead of failing to parse it", async () => {
+    // syncthing.net publishes a binary key file. Parsing it used to throw
+    // (readKey was called with `armoredKey`), which surfaced as a 500 for a key
+    // apt clients need in order to trust the repository.
+    const binary = new Uint8Array([0xc6, 0x00, 0x00]); // not parseable on purpose
+    // A fresh Response per call: a body can only be read once, and this test
+    // asks for the same key twice.
+    mockEzfetch.mockImplementation(
+      async () =>
+        new Response(binary, { headers: { "content-type": "application/octet-stream" } }),
+    );
+
+    const res = await get("/keys/apt/syncthing");
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("application/pgp-keys");
+    expect(new Uint8Array(await res.arrayBuffer())).toEqual(binary);
+
+    // Metadata needs a parse; an unparseable key answers 502 rather than 500.
+    const info = await get("/keys/apt/syncthing/info");
+    expect(info.status).toBe(502);
+  });
+
   it("apt key route resolves via well-known table", async () => {
     // Minimal armored block; openpgp parse failure surfaces as a 500, but the
     // upstream URL resolution is what we assert here.

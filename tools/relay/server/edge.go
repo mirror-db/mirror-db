@@ -87,6 +87,8 @@ func engineConfig() engine.Config {
 		SnapshotPath:     config.GetCfCandidatesFile(),
 		SnapshotInterval: config.GetCfSnapshotInterval(),
 		BootstrapHost:    config.GetCfBootstrapHost(),
+
+		Logf: log.Printf,
 	}
 
 	// Set the fields individually: a pool is allowed to configure only its floor

@@ -509,6 +509,12 @@ A **patrol** re-measures every member (bounded by pool capacity, every 5m); a
 **scan** explores the address pools for new candidates (hourly, the expensive
 one); a **recruit** is a small scan on a short cadence.
 
+Startup order: `Start` runs **one full scan immediately**, then starts the
+periodic jobs. Initialization only seeds a handful of addresses, and every timer
+is anchored at `Start` — so a relay restarting more often than `scan_interval`
+would otherwise never scan at all (ADR-0014 in `cft/docs/adr/`). The scan logs one
+line when it finishes: `scan: N/M candidates responded, K admitted in Xs`.
+
 `cf.patrol_intensity` sets the scan's candidate budget, measured against what the
 pre-rewrite pool manager generated (one per `/24`, ≈6000), capped at 4. It is a
 ceiling, not a quota: the scan stops once the pool has taken as many admissible
