@@ -14,3 +14,9 @@ export const MdbCacheName = "upstream";
 
 // The default limit for concurrent requests to the upstream server
 export const MdbMaxConcurrentRequests = 64;
+
+// How often a cached entry past its `max-age` is re-checked against its source.
+// The check is a conditional HEAD (ETag / Last-Modified), so an unchanged object
+// costs one round-trip and no body. Refresh this with the file's own max-age:
+// the first check happens exactly one max-age after the store.
+export const MdbRevalidateIntervalMs = 10 * 60 * 1000; // 10 minutes

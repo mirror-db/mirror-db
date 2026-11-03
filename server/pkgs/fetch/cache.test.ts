@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { MdbCacheManager, cachedfetch, mdbCache } from "./cache";
+import { MdbCacheManager, cachedfetch, liftCacheControl, mdbCache } from "./cache";
 import { mdbfetch } from "./fetch";
 
 // `ResolveCache` does `instanceof Cache`; Node has no such global, so stub it
@@ -36,13 +36,16 @@ class FakeCache extends Cache {
 const state = vi.hoisted(() => ({
   cache: undefined as FakeCache | undefined,
   fetch: vi.fn(),
+  now: Date.now(),
 }));
 
 // `cachedfetch` writes through the module-level `mdbCache`; redirect it (and
-// the upstream fetch) into the per-test fakes.
+// the upstream fetch) into the per-test fakes. The clock is virtual so the
+// max-age → revalidate schedule can be exercised without waiting.
 vi.mock("./cache", async (importOriginal) => {
   const mod = await importOriginal<typeof import("./cache")>();
   Object.defineProperty(mod.mdbCache, "cache", { get: () => state.cache });
+  Object.defineProperty(mod.mdbCache, "now", { get: () => () => state.now });
   return mod;
 });
 
@@ -93,6 +96,7 @@ describe("cachedfetch", () => {
     cache = state.cache = new FakeCache();
     state.fetch.mockReset();
     state.fetch.mockImplementation(async () => okResponse());
+    state.now = Date.now();
   });
 
   it("caches 2xx GET responses", async () => {
@@ -138,6 +142,185 @@ describe("cachedfetch", () => {
   });
 });
 
-// Guard: the mocked module still exports the real primitives.
-expect(typeof mdbfetch).toBe("function");
-expect(mdbCache).toBeInstanceOf(MdbCacheManager);
+// ── Revalidation ────────────────────────────────────────────────────────────
+//
+// A stored entry is re-checked with a conditional HEAD at most once per
+// `MdbRevalidateIntervalMs` (10 min), counted from when it was stored — not
+// from its `max-age`. A 304 re-stamps the entry; a 200 means the object changed
+// and the new copy is stored.
+
+describe("cachedfetch — periodic revalidation", () => {
+  const url = "https://x.com/rev";
+  const STORED_AT = 1_000_000;
+  const INTERVAL = 10 * 60 * 1000;
+
+  const stored = (opts: { etag?: string; maxAge?: number; body?: string } = {}) => {
+    const headers: Record<string, string> = {
+      "content-length": String((opts.body ?? "v1").length),
+      "x-mdb-stored-at": String(STORED_AT),
+    };
+    if (opts.etag) headers.etag = opts.etag;
+    if (opts.maxAge !== undefined) headers["cache-control"] = `public, max-age=${opts.maxAge}`;
+    return new Response(opts.body ?? "v1", { headers });
+  };
+
+  let cache: FakeCache;
+
+  beforeEach(() => {
+    cache = new FakeCache();
+    state.cache = cache;
+    state.fetch.mockReset();
+    state.now = STORED_AT;
+  });
+
+  it("serves the stored copy between revalidation points, whatever max-age says", async () => {
+    // max-age is tiny, but the entry is only a minute old → no HEAD yet.
+    cache.entries.set(url, stored({ etag: '"a"', maxAge: 60 }));
+    state.now = STORED_AT + 60_000;
+    expect(await (await cachedfetch(url)).text()).toBe("v1");
+    expect(state.fetch).not.toHaveBeenCalled();
+  });
+
+  it("revalidates with a conditional HEAD once the interval has elapsed", async () => {
+    cache.entries.set(url, stored({ etag: '"a"', maxAge: 31_536_000 }));
+    state.now = STORED_AT + INTERVAL;
+    state.fetch.mockImplementation(async (req: Request) => {
+      expect(req.method).toBe("HEAD");
+      expect(req.headers.get("if-none-match")).toBe('"a"');
+      return new Response(null, { status: 304 });
+    });
+
+    expect(await (await cachedfetch(url)).text()).toBe("v1");
+    // Only the HEAD went out: the body was not refetched.
+    expect(state.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("re-stamps the entry after a 304, so the next check waits a full interval", async () => {
+    cache.entries.set(url, stored({ etag: '"a"' }));
+    state.now = STORED_AT + INTERVAL;
+    state.fetch.mockImplementation(async () => new Response(null, { status: 304 }));
+
+    await cachedfetch(url);
+    await vi.waitFor(() =>
+      expect(Number(cache.entries.get(url)?.headers.get("x-mdb-stored-at"))).toBe(
+        STORED_AT + INTERVAL,
+      ),
+    );
+
+    // One second later it is a plain hit — no second HEAD.
+    state.fetch.mockReset();
+    state.fetch.mockImplementation(async () => new Response(null, { status: 304 }));
+    state.now = STORED_AT + INTERVAL + 1_000;
+    expect(await (await cachedfetch(url)).text()).toBe("v1");
+    expect(state.fetch).not.toHaveBeenCalled();
+  });
+
+  it("re-fetches and stores the new body when the source changed", async () => {
+    cache.entries.set(url, stored({ etag: '"a"' }));
+    state.now = STORED_AT + INTERVAL;
+    state.fetch.mockImplementation(async (req: Request) =>
+      req.method === "HEAD"
+        ? new Response(null, { status: 200, headers: { etag: '"b"' } })
+        : stored({ etag: '"b"', body: "v2" }),
+    );
+
+    expect(await (await cachedfetch(url)).text()).toBe("v2");
+    await vi.waitFor(() =>
+      expect(cache.entries.get(url)?.headers.get("etag")).toBe('"b"'),
+    );
+  });
+
+  it("drops the entry when the source answers 404", async () => {
+    cache.entries.set(url, stored({ etag: '"a"' }));
+    state.now = STORED_AT + INTERVAL;
+    state.fetch.mockImplementation(async (req: Request) =>
+      req.method === "HEAD"
+        ? new Response(null, { status: 404 })
+        : new Response("gone", { status: 404 }),
+    );
+
+    expect((await cachedfetch(url)).status).toBe(404);
+    expect(cache.entries.has(url)).toBe(false);
+  });
+
+  it("keeps serving the stored copy when the source is unreachable", async () => {
+    cache.entries.set(url, stored({ etag: '"a"' }));
+    state.now = STORED_AT + INTERVAL;
+    state.fetch.mockImplementation(async () => {
+      throw new TypeError("network down");
+    });
+
+    expect(await (await cachedfetch(url)).text()).toBe("v1");
+  });
+
+  it("serves entries written outside the manager without revalidating", async () => {
+    cache.entries.set(url, new Response("legacy"));
+    state.now = STORED_AT + 365 * 24 * 3600 * 1000;
+    expect(await (await cachedfetch(url)).text()).toBe("legacy");
+    expect(state.fetch).not.toHaveBeenCalled();
+  });
+
+  it("does not leak the bookkeeping headers to the client", async () => {
+    cache.entries.set(url, stored({ etag: '"a"' }));
+    state.now = STORED_AT + 1_000;
+    const res = await cachedfetch(url);
+    expect(res.headers.get("x-mdb-stored-at")).toBeNull();
+    expect(res.headers.get("x-mdb-revalidate-after")).toBeNull();
+  });
+});
+
+describe("MdbCacheManager.revalidateInterval", () => {
+  const at = (now: number) => new MdbCacheManager(new FakeCache(), undefined, () => now);
+  const entry = () =>
+    new Response("x", { headers: { "x-mdb-stored-at": "400" } });
+
+  it("returns the remaining time inside an interval", () => {
+    // Stored at 400 ms, interval is 10 min → first check at 400 + 600 000.
+    expect(at(400).revalidateInterval(entry())).toBe(600_000);
+    expect(at(400 + 60_000).revalidateInterval(entry())).toBe(540_000);
+  });
+
+  it("returns 0 exactly on a boundary (check now)", () => {
+    expect(at(400 + 600_000).revalidateInterval(entry())).toBe(0);
+    expect(at(400 + 1_200_000).revalidateInterval(entry())).toBe(0);
+  });
+
+  it("honours a per-entry interval", () => {
+    const r = new Response("x", {
+      headers: { "x-mdb-stored-at": "400", "x-mdb-revalidate-after": "1000" },
+    });
+    expect(at(400).revalidateInterval(r)).toBe(1000);
+    expect(at(1400).revalidateInterval(r)).toBe(0);
+  });
+
+  it("returns undefined without a store stamp", () => {
+    expect(at(1).revalidateInterval(new Response("x"))).toBeUndefined();
+  });
+});
+
+describe("liftCacheControl", () => {
+  it("adds the floor when the source sends no lifetime", () => {
+    expect(liftCacheControl(null)).toBe("public, max-age=600");
+  });
+
+  it("raises a shorter max-age and keeps the other directives", () => {
+    expect(liftCacheControl("public, max-age=60")).toBe("public, max-age=600");
+    expect(liftCacheControl("public, s-maxage=60, max-age=5")).toBe(
+      "public, s-maxage=60, max-age=600",
+    );
+    expect(liftCacheControl("max-age=5")).toBe("max-age=600");
+  });
+
+  it("leaves a longer lifetime alone", () => {
+    expect(liftCacheControl("public, max-age=31536000, immutable")).toBe(
+      "public, max-age=31536000, immutable",
+    );
+  });
+
+  it("does not invent a lifetime for no-store / no-cache", () => {
+    // An upstream that forbids storage keeps forbidding it.
+    expect(liftCacheControl("no-store")).toBe("no-store");
+    expect(liftCacheControl("private, no-cache")).toBe("private, no-cache");
+    expect(liftCacheControl("no-store, max-age=0")).toBe("no-store, max-age=0");
+  });
+});
