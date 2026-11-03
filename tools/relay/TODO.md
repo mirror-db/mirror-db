@@ -1,12 +1,36 @@
-# Worker 侧待办（relay 审计发现，本轮未改动）
+# Relay 待办
+
+## P0 — 发布 cft 模块，解除构建阻塞
+
+`tools/relay/cft/` 是为了端到端验证而临时挂载的独立 module，未提交进本仓库
+（`.gitignore:57`）。relay 通过 `go.mod` 的 `replace` 引用它，因此：
+
+- **CI**：checkout 里没有 `cft/`，`.github/workflows/relay.yml` 的 build job
+  用「模块是否存在」判定并跳过 relay 构建（会打 warning）。
+- **Docker**：`docker` job 被 `&& false` 禁用；`Dockerfile` 已能在 `cft/` 存在时
+  正确构建（先 `COPY cft/` 再 `go mod download`）。
+
+发布并删除本地挂载后要做的三件事：
+
+1. 删除 `tools/relay/go.mod` 末尾的 `replace` 指令。
+2. 删除 `.github/workflows/relay.yml` 里的 `Check for local transport module`
+   步骤及其 `if:` 条件。
+3. 恢复 docker job 的条件（去掉 `&& false`）。
+
+---
+
+# Worker 侧（relay 审计发现）
 
 来源：`tools/relay/` 全面 review。前提：整个 mirror 项目开放，**除证书外一切资源不设防**。
 relay 利用 `X-MDB-Relay-Host` 把「用户实际访问的域名」传给 Worker，
 Worker 生成的 URL 必须指回该域名，否则用户会离开 relay 直连 Worker。
 
-## P0 — 绝对 URL 指向 Worker 而非 relay
+## 绝对 URL 指向 Worker 而非 relay
 
-### 1. `server/mirrors/npm/index.ts:25` — tarball URL 改写绕开 relay
+> **已完成**（commit `ef5c84f`）：npm 与 apt 均已改用 `relayInfo()`，apt 的目录
+> 重定向同时改成 308。以下两条保留作为成因记录。
+
+### 1. `server/mirrors/npm/index.ts:25` — tarball URL 改写绕开 relay（已修）
 
 ```ts
 const origin = new URL(req.url).origin;   // ← Worker 自己的域名
@@ -20,7 +44,7 @@ const origin = new URL(req.url).origin;   // ← Worker 自己的域名
 改用 `relayInfo(req).origin`。注意 `rewriteBody` 的 callback 拿到的是
 **原始 request**，`relayInfo` 正好接受 `Request`，可直接调用。
 
-### 2. `server/pkgs/apt/proxy.ts:82` — 目录补斜杠 301 跳回 Worker
+### 2. `server/pkgs/apt/proxy.ts:82` — 目录补斜杠 301 跳回 Worker（已修）
 
 ```ts
 const url = new URL(request.url);          // ← origin 是 Worker
@@ -45,9 +69,9 @@ APT 客户端访问 `/<repo>/dists` 被 301 到 `https://mirs.uk/...`，此后�
   复制全部头，当前正确 —— 后续任何人把 inner request 改成 `new Request(url, {...})`
   就会静默丢失 relay 信息，建议加注释固化。
 
-## P1 — relay 相关契约
+## relay 相关契约
 
-### 4. HTTP → HTTPS 重定向用 301，方法不保真
+### HTTP → HTTPS 重定向用 301，方法不保真
 
 relay 侧 `httpRedirectHandler` 已改为 **308**（本次改动）。Worker 若有同类
 重定向，应对齐 308；`301` 只保留给 `GET /`。
@@ -74,21 +98,21 @@ Worker 侧需要保证：**只在用户可见的响应里**消费 `x-mdb-relay-h
 - 校验为裸 host（不含 `/`、不含 `:`、匹配 `[a-z0-9.-]+`），不合法则回落 `BASE_DOMAIN`；
 - 输出前统一 `strings.TrimSuffix` 去尾部点。
 
-## P2 — 其他审计记录
+## 其他审计记录
 
-### 7. `sanitizeResponse` 剥 `www-authenticate` 之后，Worker 内的 OCI 路径已自洽，
+### `sanitizeResponse` 剥 `www-authenticate` 之后，Worker 内的 OCI 路径已自洽，
 但 relay 侧曾发现 `Set-Cookie` 会在 relay→客户端方向原样透传。开放项目下
 不可利用（Worker 不设 cookie），仅记录：**若将来 Worker 引入任何 cookie，
 必须同时改 relay 的 `copyHeaders`**，否则 `Domain=mirs.uk` 的 cookie 会种到
 relay 域名下。
 
-### 8. `/api/mirrors` 无缓存头
+### `/api/mirrors` 无缓存头
 
 relay 每 10 分钟拉一次这个接口（带 ±30s 抖动）。建议 Worker 侧加
 `Cache-Control: public, max-age=60`，让多级 relay 与 CF 边缘共享缓存，
 减少 Worker 请求数。
 
-### 9. `mirrors` 清单缺少 `keepHTTP` 之外的传输能力描述
+### `mirrors` 清单缺少 `keepHTTP` 之外的传输能力描述
 
 relay 需要知道某个镜像是否需要特殊处理（如只支持 HTTPS、或需要 range 透传）。
 当前只用 `keepHTTP`，够用。若未来新增能力位，relay 侧 `server.Mirror` 结构体

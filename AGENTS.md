@@ -434,9 +434,28 @@ relay:
 
 upstream:
   url: "https://mirs.uk"
-  # pool_size: 25            # CF edge node pool (default 25, active rotation 3)
+  transport: latency         # "latency" | "speed" — which edge pool to draw from
   # disguise_port: 344       # connect via SSH-disguised TLS
-  # proxy: ""                # http(s)/socks5 proxy; bypasses CF optimizer
+  # proxy: ""                # http(s)/socks5 proxy; bypasses edge selection
+
+cf:                          # edge selection; every key is optional
+  # latency_capacity: 32     # entries held in the latency pool
+  # speed_capacity: 8
+  # top_n: 3                 # transports select randomly within Top-N
+  # seed_count: 10           # latency results before Initialize returns
+  # speed_seed_count: 3      # bootstrap IPs speed-probed during Initialize
+  # latency_url: ""          # default: cloudflare.com/cdn-cgi/trace
+  # speed_url: ""            # default: speed.cloudflare.com/__down
+  # latency_min_score: 200   # = slower than 800ms is discarded
+  # speed_min_score: 65536   # = below 64KiB/s is discarded
+  # penalty: 0.5             # score multiplier for a failed request
+  # scan_interval: 1h        # scan address pools for new candidates
+  # patrol_latency_interval: 5m
+  # patrol_speed_interval: 30m
+  # recruit_interval: 10m    # small scan; keeps pools from draining
+  # recruit_samples: 2
+  # scan_samples: 8
+  # init_timeout: 30s        # startup wait; exceeding it is not fatal
 
 acme:
   source: acme               # "acme" | "upstream" | URL origin
@@ -449,23 +468,45 @@ acme:
 
 ### Upstream transport
 
-Selection priority: `proxy` > `disguise` > CF fastest-node.
+Selection priority: `proxy` > `disguise` > edge selection.
 
 - **Proxy** (`upstream.proxy`): when set, all upstream traffic routes through an
-  `http`/`https`/`socks5` proxy and the CF node optimizer is skipped entirely.
-  `buildProxyTransport` uses `http.Transport.Proxy` for http(s) and
-  `golang.org/x/net/proxy` for socks5(h).
-- **CF fastest-node** (default): `NewPoolManagerWithFile(poolSize, cf-nodes.csv)`,
-  `UpstreamCount: 3`. Pool auto-refreshes when depleted.
+  `http`/`https`/`socks5` proxy. `buildProxyTransport` uses `http.Transport.Proxy`
+  for http(s) and `golang.org/x/net/proxy` for socks5(h).
 - **SSH disguise** (`upstream.disguise_port`): `disguiseDialTLS` exchanges SSH
   banner then does TLS handshake. Bypasses HTTPS-targeted DPI throttling.
+- **Edge selection** (default): see below.
+
+The first two are explicit operator decisions and skip edge selection entirely —
+picking a Cloudflare IP would override their intent.
+
+### Edge selection — [tools/relay/server/edge.go](tools/relay/server/edge.go)
+
+Ranks Cloudflare anycast IPs from this host's vantage point and serves through
+the best ones. Two pools, because the winner differs by workload: **latency**
+(time to first byte; decides a manifest fetch) and **speed** (bytes/sec; decides
+a layer download). `upstream.transport` picks which one the proxy draws from.
+
+Startup calls `engine.Initialize` under `cf.init_timeout`. **Failure is logged,
+not fatal:** the engine keeps running, patrol and recruit fill the pools in the
+background, and requests fall back to unoptimised routing until they do. A
+measurement problem must not become an outage.
+
+`GET /.mirror-relay/pool` (JWT-guarded, like `/cert-pack` and `/mirrors`) reports
+both pools, the gate verdict and which pool is serving — the answer to "why is
+traffic going to that IP".
+
+The engine lives in `tools/relay/cft/`, a **separate module** mounted here for
+development and referenced by a `replace` in `go.mod`. It is not committed to
+this repository: CI skips the relay build while it is absent, and the Docker job
+is disabled. Publishing it is what unblocks both — see TODO.md.
 
 **No `http.Client.Timeout`.** It caps the *whole* request including body read,
 so any download longer than the timeout is cut mid-stream (e.g. a 755MB ISO at
 1MB/s dies at ~30s). Streaming proxies must bound only the setup phases:
 `TLSHandshakeTimeout` + `ResponseHeaderTimeout` (30s) on the proxy/disguise
-transports, dial timeout (`EliminateDelay`, 5s) on the CF transport. Once
-response headers arrive, transfer runs untimed.
+transports, `DialTimeout` (5s) inside the edge engine. Once response headers
+arrive, transfer runs untimed.
 
 ### Speedtest
 
@@ -476,8 +517,10 @@ with `passthrough - 1`; when 0 or absent, serves random bytes locally.
 
 - `tools/relay/server/server.go` — Server, routers, `httputil.ReverseProxy`
   rewrites, `X-MDB-Relay-Host` handling (`RelayHostHeader`), manifest watcher.
-  Internal endpoints: `/.mirror-relay/cert-pack` (JWT-guarded),
-  `/.mirror-relay/mirrors` (JWT-guarded, serves the cached manifest).
+  Internal endpoints: `/.mirror-relay/cert-pack`, `/.mirror-relay/mirrors`,
+  `/.mirror-relay/pool` (all JWT-guarded).
+- `tools/relay/server/edge.go` — edge-selection wiring: engine construction,
+  `cf.*` → `engine.Config` mapping, `/.mirror-relay/pool` snapshot, shutdown.
 - `tools/relay/server/certmagic.go` — `CertMagicStorage()` is a `sync.OnceValue`:
   file storage in ACME mode, the shared `certclient.CertClient` in cert-pack
   mode. ACME issuance is skipped entirely in cert-pack mode.

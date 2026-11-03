@@ -26,9 +26,26 @@ relay:
 
 upstream:
   url: "https://mirs.uk"     # upstream Worker or upper relay
-  # pool_size: 25             # CF edge node pool capacity (default 25)
+  transport: latency         # "latency" | "speed" — which edge pool to draw from
   # disguise_port: 344        # connect to upstream via SSH-disguised TLS
-  # proxy: ""                 # http(s)/socks5 proxy; bypasses the CF optimizer
+  # proxy: ""                 # http(s)/socks5 proxy; bypasses edge selection
+
+cf:                          # edge selection; every key is optional
+  # top_n: 3                 # transports select randomly within Top-N
+  # latency_capacity: 32
+  # speed_capacity: 8
+  # seed_count: 10           # latency results before Initialize returns
+  # speed_seed_count: 3      # bootstrap IPs speed-probed during Initialize
+  # latency_url: ""          # default: cloudflare.com/cdn-cgi/trace
+  # speed_url: ""            # default: speed.cloudflare.com/__down
+  # latency_min_score: 200   # = slower than 800ms is discarded
+  # speed_min_score: 65536   # = below 64KiB/s is discarded
+  # penalty: 0.5             # score multiplier for a failed request
+  # scan_interval: 1h
+  # patrol_latency_interval: 5m
+  # patrol_speed_interval: 30m
+  # recruit_interval: 10m
+  # init_timeout: 30s        # startup wait; exceeding it is not fatal
 
 acme:
   source: acme                # "acme" = DNS-01; "upstream" = sync from upstream.url; or a URL origin
@@ -77,7 +94,8 @@ sudo ./relay install
 
 ## How it works
 
-1. On startup, loads CF edge nodes from `cf-nodes.csv` in config dir (pool size default 25, active rotation 3 IPs)
+1. On startup, ranks Cloudflare edge IPs from this host (see [Edge selection](#edge-selection)).
+   Failing to do so is not fatal — the relay still serves, unoptimised.
 2. Fetches mirror manifest from `GET <upstream>/api/mirrors`. A failure is not
    fatal: the relay serves `502` until the first fetch succeeds, then refreshes
    every ~10 min (jittered) and keeps serving the last good manifest on errors.
@@ -100,6 +118,28 @@ The relay treats it as **client-supplied and trusted**: anyone may proxy
 authorization. It is forwarded untouched; the relay fills in its own base
 domain only when the header is absent. Relay-originated requests
 (`/api/mirrors`, `/speedtest?passthrough`, cert-pack sync) do not set it.
+
+### Edge selection
+
+Two pools, because the fastest IP differs by workload: **latency** (time to
+first byte — decides a manifest fetch) and **speed** (bytes/sec — decides a layer
+download). `upstream.transport` chooses which one the proxy draws from; latency
+is the default because it suits mixed traffic.
+
+Each pool keeps the best N scored IPs, and a transport picks randomly among the
+top few. A failed request multiplies that IP's score, so a bad edge drifts out of
+selection on its own rather than being banned — and comes back when it measures
+well again.
+
+Measurements are gated: while this host cannot reach the canary
+(`223.5.5.5:443`), nothing is probed and in-flight results are discarded. A local
+outage must not look like "every Cloudflare IP got worse".
+
+`GET /.mirror-relay/pool` (JWT-guarded) reports both pools and the gate verdict.
+
+Set `cf.latency_url` / `cf.speed_url` to your own endpoints when proxying a
+specific zone: edge routing differs per zone, so ranking on `cloudflare.com`
+while serving `mirs.uk` optimises the wrong path.
 
 ### Proxy semantics
 
