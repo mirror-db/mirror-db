@@ -220,11 +220,12 @@ describe("createAptProxy — directory listing", () => {
       ready: true,
       paths: ["dists/trixie/InRelease"],
     });
-    // "dists" has children in knownPaths → fetchHook returns 301 redirect
     const res = await proxy.fetch(get("dists"));
 
-    expect(res.status).toBe(301);
-    expect(res.headers.get("location")).toContain("dists/");
+    // 308 keeps the method and body; the Location stays relative so the client
+    // does not get pinned to the Worker's own origin (bypassing the relay).
+    expect(res.status).toBe(308);
+    expect(res.headers.get("location")).toBe("/dists/");
   });
 });
 

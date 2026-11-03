@@ -10,8 +10,8 @@ import { cachedfetch } from "@server/pkgs/fetch";
 
 const mockCachedfetch = cachedfetch as ReturnType<typeof vi.fn>;
 
-function makeRequest(path: string): Request {
-  return new Request(`https://mirs.uk${path}`);
+function makeRequest(path: string, headers?: Record<string, string>): Request {
+  return new Request(`https://mirs.uk${path}`, { headers });
 }
 
 /** Extract the URL string from the first argument of a cachedfetch call. */
@@ -30,6 +30,31 @@ describe("npm mirror", () => {
   it("has correct name and path", () => {
     expect(npm.name).toBe("npm");
     expect(npm.path).toBe("npm");
+  });
+
+  it("rewrites tarball URLs to the relay host when the request came through one", async () => {
+    // `request.url` is always the Worker origin. Rewriting to it would send the
+    // tarball download straight past the relay, which is the whole problem the
+    // relay exists to solve.
+    const meta = JSON.stringify({
+      name: "lodash",
+      versions: {
+        "4.17.21": {
+          dist: { tarball: "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz" },
+        },
+      },
+    });
+    mockCachedfetch.mockResolvedValue(
+      new Response(meta, { headers: { "content-type": "application/json" } }),
+    );
+
+    const res = await npm.fetch(
+      makeRequest("/npm/lodash", { "x-mdb-relay-host": "relay.example.com" }),
+    );
+    const body = (await res.json()) as any;
+    expect(body.versions["4.17.21"].dist.tarball).toBe(
+      "https://relay.example.com/npm/lodash/-/lodash-4.17.21.tgz",
+    );
   });
 
   it("rewrites tarball URLs in JSON metadata", async () => {

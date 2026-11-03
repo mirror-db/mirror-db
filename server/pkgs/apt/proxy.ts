@@ -75,11 +75,17 @@ async function aptFetchHook(
       // through unjudged so a curated suite list never blocks reachable suites.
       if (!repo.knownPaths.has(rel)) {
         // A directory addressed without a trailing slash → redirect so the
-        // proxy serves it as a proper directory listing.
+        // proxy serves it as a proper directory listing. The `Location` stays
+        // *relative*: an absolute URL built from `request.url` would point at
+        // the Worker's origin and take the client off the relay permanently.
+        // `308` keeps the method and body (APT only GETs here, but a permanent
+        // `301` would also be cached by clients forever, outliving a relay
+        // move).
         if (hasChildren(repo, `${rel}/`)) {
-          const url = new URL(request.url);
-          url.pathname += "/";
-          return Response.redirect(url.toString(), 301);
+          return new Response(null, {
+            status: 308,
+            headers: { location: `${new URL(request.url).pathname}/` },
+          });
         }
         return notFound();
       }
