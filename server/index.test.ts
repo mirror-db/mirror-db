@@ -44,6 +44,38 @@ beforeEach(() => {
   });
 });
 
+describe("front door — host routing", () => {
+  it("routes a subdomain mirror even when the host carries a port", async () => {
+    const worker = await loadWorker();
+    // Upstream is stubbed: this test is about routing, not about Docker Hub.
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockImplementation(async () => new Response("{}", { status: 200 }));
+    try {
+      // A relay or a dev server on a non-default port must not lose the mirror.
+      const res = await worker.fetch(
+        new Request("http://dcr.mirs.uk:8788/v2/", {
+          headers: { host: "dcr.mirs.uk:8788" },
+        }) as any,
+      );
+      const body = await res.text();
+      expect(body).not.toContain("is not a mirror on this service");
+      expect(fetchSpy).toHaveBeenCalled();
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+
+  it("rejects a host outside BASE_DOMAIN", async () => {
+    const worker = await loadWorker();
+    const res = await worker.fetch(
+      new Request("http://evil.example/v2/", { headers: { host: "evil.example" } }) as any,
+    );
+    expect(res.status).toBe(404);
+    expect(await res.text()).toContain("is not a mirror on this service");
+  });
+});
+
 describe("front door — unknown paths", () => {
   it("answers a plain-text 404 for an unknown mount (non-browser)", async () => {
     const worker = await loadWorker();

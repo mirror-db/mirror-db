@@ -18,11 +18,17 @@ const MOUNTS = mirrors
 
 export default {
   async fetch(request) {
-    // get subdomain from host header
-    const host = request.headers.get("host") || new URL(request.url).host;
+    // Route on the host, without any port: a relay or a local dev server on a
+    // non-default port still has to resolve to the same mirror.
+    const rawHost = request.headers.get("host") || new URL(request.url).host;
+    const host = rawHost.replace(/:\d+$/, "").replace(/\.$/, "").toLowerCase();
     if (!host) return notFound(request);
-    if (!host.endsWith(env.BASE_DOMAIN)) return notFound(request);
-    const subdomain = host.slice(0, -(env.BASE_DOMAIN.length + 1)) || "@";
+    if (host !== env.BASE_DOMAIN && !host.endsWith(`.${env.BASE_DOMAIN}`)) {
+      return notFound(request);
+    }
+    const subdomain = host === env.BASE_DOMAIN
+      ? "@"
+      : host.slice(0, -(env.BASE_DOMAIN.length + 1));
 
     // Subdomain-routed mirrors (OCI registries) win first.
     const mirror = mirrorsBySubdomain.get(subdomain);
