@@ -9,6 +9,12 @@
   "main": "server/index.ts",
   "assets": {
     "binding": "ASSETS",
+    // Serve every request through the Worker first. Without this the asset
+    // layer answers `/` (and `/favicon.ico`, …) *before* the Worker runs, so
+    // `nope.mirs.uk/` returned the SPA shell with `200` on any hostname and a
+    // typo in a registry hostname looked like success. The Worker decides what
+    // a host means; assets are then fetched through `env.ASSETS`.
+    "run_worker_first": true,
     "directory": "./dist"
   },
   "routes": [
