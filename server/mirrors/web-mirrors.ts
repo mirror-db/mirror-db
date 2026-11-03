@@ -38,7 +38,9 @@ const webListConfigs: WebMirrorConfig[] = [
   },
   {
     name: "microsoft",
-    base: "https://packages.microsoft.com/",
+    // The listing root is `repos/`: the site root also holds config/, keys/
+    // and yumrepos/, which are chrome around the repositories themselves.
+    base: "https://packages.microsoft.com/repos/",
   },
 ];
 
