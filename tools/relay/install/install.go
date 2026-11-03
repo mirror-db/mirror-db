@@ -54,13 +54,32 @@ RestartSec=10
 StandardOutput=journal
 StandardError=journal
 
-# Allow binding to privileged ports (80/443)
+# Allow binding to privileged ports (80/443). The bounding set is narrowed to
+# exactly this capability so nothing else survives exec.
 AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
 # Security
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RemoveIPC=true
+PrivateDevices=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 ReadWritePaths=%s %s
 
 [Install]
@@ -219,11 +238,17 @@ func createDirs() {
 		path string
 		perm os.FileMode
 	}{
-		{configDir, 0755},
-		{cacheDir, 0755},
+		// 0750: holds secret.key and (in ACME mode) private keys — not listable
+		// by other users on the box.
+		{configDir, 0750},
+		{cacheDir, 0750},
 	} {
 		if err := os.MkdirAll(dir.path, dir.perm); err != nil {
 			log.Fatalf("failed to create %s: %v", dir.path, err)
+		}
+		// MkdirAll leaves an existing dir's mode alone; enforce ours.
+		if err := os.Chmod(dir.path, dir.perm); err != nil {
+			log.Printf("chmod %s: %v", dir.path, err)
 		}
 	}
 	// Ensure ownership
@@ -237,7 +262,9 @@ func createConfig() {
 		return
 	}
 
-	if err := os.WriteFile(configFile, []byte(defaultConfig), 0644); err != nil {
+	// 0640: group-readable for the service, not world-readable (the file holds
+	// cf_api_token values).
+	if err := os.WriteFile(configFile, []byte(defaultConfig), 0640); err != nil {
 		log.Fatalf("failed to write config: %v", err)
 	}
 	fmt.Printf("Created config: %s\n", configFile)
