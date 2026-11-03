@@ -17,8 +17,8 @@ import (
 
 // BaseDomain represents one domain the relay serves, with its own CF API token for DNS-01.
 type BaseDomain struct {
-	Domain     string `mapstructure:"domain"`
-	CFAPIToken string `mapstructure:"cf_api_token"`
+	Domain     string `mapstructure:"domain" json:"domain"`
+	CFAPIToken string `mapstructure:"cf_api_token" json:"cf_api_token"`
 }
 
 func init() {
@@ -33,30 +33,47 @@ func init() {
 	viper.SetDefault("acme.ca", "production")
 	viper.SetDefault("acme.agree", true)
 
+	// Env override (highest priority).
+	viper.AutomaticEnv()
+	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+
+	// Explicit bindings for the two keys whose env var names are not the plain
+	// upper-cased form. Without these, RELAY_CONFIG_DIR would be visible only to
+	// the one caller that reads os.Getenv directly while every other path went
+	// through viper — config read from one dir, key + certs written to another.
+	mustBind("relay.config_dir", "RELAY_CONFIG_DIR")
+	mustBind("relay.base_domains", "RELAY_BASE_DOMAINS")
+
 	// Config file
 	viper.SetConfigName("config")
 	viper.SetConfigType("yaml")
-	viper.AddConfigPath(getConfigDir())
-	viper.AddConfigPath(".")
+	viper.AddConfigPath(GetConfigDir())
 
 	if err := viper.ReadInConfig(); err != nil {
 		log.Println("no config file found, using defaults + env")
 	}
-
-	// Env override (highest priority)
-	viper.AutomaticEnv()
-	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 }
 
-func getConfigDir() string {
-	if dir := os.Getenv("RELAY_CONFIG_DIR"); dir != "" {
-		return dir
+func mustBind(key, envVar string) {
+	if err := viper.BindEnv(key, envVar); err != nil {
+		log.Fatalf("failed to bind %s to %s: %v", key, envVar, err)
 	}
-	return "/etc/mirror-relay"
+}
+
+// decodeBaseDomains parses the JSON array form used by RELAY_BASE_DOMAINS.
+func decodeBaseDomains(raw string) ([]BaseDomain, error) {
+	var domains []BaseDomain
+	if err := json.Unmarshal([]byte(raw), &domains); err != nil {
+		return nil, err
+	}
+	return domains, nil
 }
 
 // --- Accessors ---
 
+// GetConfigDir returns the directory holding config.yaml, secret.key and the
+// certmagic store. Every path in this package derives from it, so the config
+// file, the secret and the certificates can never diverge.
 func GetConfigDir() string         { return viper.GetString("relay.config_dir") }
 func GetPoolSize() int             { return viper.GetInt("upstream.pool_size") }
 func GetCfNodesFile() string       { return ResolveConfig("cf-nodes.csv") }
@@ -91,10 +108,10 @@ func CertPackURL() string {
 //
 //	RELAY_BASE_DOMAINS='[{"domain":"x.com","cf_api_token":"tok"}]'
 var GetBaseDomains = sync.OnceValue(func() []BaseDomain {
-	// Try env var as JSON first (highest priority)
-	if raw := os.Getenv("RELAY_BASE_DOMAINS"); raw != "" {
-		var domains []BaseDomain
-		if err := json.Unmarshal([]byte(raw), &domains); err != nil {
+	// Env var holds JSON; viper cannot decode it into []BaseDomain on its own.
+	if raw := strings.TrimSpace(os.Getenv("RELAY_BASE_DOMAINS")); raw != "" {
+		domains, err := decodeBaseDomains(raw)
+		if err != nil {
 			log.Fatalf("failed to parse RELAY_BASE_DOMAINS env (expect JSON array): %v", err)
 		}
 		return domains
@@ -139,11 +156,13 @@ func ensureSecretKeyFile() []byte {
 
 	_, err := os.Stat(file)
 	if errors.Is(err, os.ErrNotExist) {
-		if err := os.MkdirAll(GetConfigDir(), 0755); err != nil {
+		// 0750: the service user can read it; nobody else can list the dir.
+		if err := os.MkdirAll(GetConfigDir(), 0750); err != nil {
 			log.Fatalf("failed to create config dir: %v", err)
 		}
 		key := rand.Text()
-		if err := os.WriteFile(file, []byte(key), 0600); err != nil {
+		// 0640: readable by the service group, not world-readable.
+		if err := os.WriteFile(file, []byte(key), 0640); err != nil {
 			log.Fatalf("failed to write secret key: %v", err)
 		}
 	}
