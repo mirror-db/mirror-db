@@ -40,13 +40,12 @@ cf:                          # edge selection; every key is optional
   # latency_min_score: 250   # reciprocal score; 250 ≈ "answers within 4s"
   # speed_min_score: 65536   # = below 64KiB/s is discarded
   # penalty: 0.5             # score multiplier for a failed request
-  # scan_interval: 1h        # discover new candidates (expensive)
-  # patrol_latency_interval: 5m    # re-measure members (cheap)
+  # intensity: 0.13          # sweep patience: 0.13 × block count probes
+  #                          # without an improvement ends the opening sweep
+  # interval: 10s            # steady state: one probe, then rest
+  # patrol_latency_interval: 5m    # re-measure members (preempts everything)
   # patrol_speed_interval: 30m
-  # recruit_interval: 10m
   # init_timeout: 30s        # startup wait; exceeding it is not fatal
-  # patrol_intensity: 1      # scan budget ceiling vs the pre-rewrite Refresh
-  #                          # (≈6k candidates); 0.5 = half, capped at 4
   # candidates_file: ""      # default: <config dir>/cf-candidates.csv
   # snapshot_interval: 1h    # also written on shutdown
   # bootstrap_host: ""       # default: hostname of upstream.url
@@ -150,28 +149,19 @@ addresses, so **one full scan runs immediately** and the periodic jobs start onc
 it finishes. It logs what it did:
 
 ```
-scan: 245 probed, 32 responded, 18 admitted in 48.8s (latency=16 speed=7)
+sweep: 412 probed, 64 admitted, stopped after 303 without improvement in 1m12s (latency=64 speed=8)
 ```
 
-`probed` sits far below the budget because a scan stops once the pool is
-stocked; the budget is a ceiling, not a quota. Deferring exploration by a whole interval would leave the relay on a
-bootstrap-sized pool for the hour it is most likely to be restarted — and a
-restart resets every timer, so a process that restarts more often than
-`scan_interval` never scans at all.
+The sweep ends when the pool stops improving, not when it is full and not when a
+budget runs out: `cf.intensity` (default `0.13`) is how many consecutive probes
+without an improvement to tolerate, as a fraction of the block list — ~303
+against 2334 blocks.
 
-`cf.patrol_intensity` sets the scan's candidate budget, measured against the
-volume the pre-rewrite pool manager generated — one candidate per `/24` over the
-ranges that actually answer, 2334 — so `1` scans that volume, `0.5` half of it,
-and it is capped at 4.
+After that the steady state probes **one address per `cf.interval`** (default
+10 s), which walks the whole address space in about 68 days. That is the long
+tail, not the main path to a good pool: patrols keep the members honest.
 
-A scan **spends its whole budget**: a full pool still has a worst member, and only
-a fresh measurement can replace it. Stopping at the fill level freezes the
-ranking at whatever the first sweep found. This is the knob to lower first when
-the uplink is metered — at intensity 1 a scan is ~6000 probes, roughly six
-minutes an hour on a bad path.
-
-A recruit waits for a patrol in progress — both are bulk measurements of the
-same links, and running them together makes both numbers wrong.
+A patrol takes the whole gate, so no probe — sweep or steady — runs during one.
 
 ### What probing costs
 
@@ -183,9 +173,9 @@ nominally 0.5 MB/s Cloudflare path:
 
 | job | cadence | probes/day | bytes/day |
 |---|---|---|---|
-| scan | 1h × full budget | ~56,000 | ~62 MB |
+| opening sweep | once | ~300-900 | ~1 MB |
+| steady state | 1 probe / 10s | ~8,600 | ~9 MB |
 | patrol latency | 5m × 64 members | ~18,400 | ~20 MB |
-| recruit | 10m × 2 candidates | ~290 | ~0.3 MB |
 
 Both pools are maintained regardless of which one is selected, because routing is
 per-request: a cold high-speed pool cannot be switched to on the first request

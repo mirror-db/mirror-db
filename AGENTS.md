@@ -476,14 +476,11 @@ cf:                          # edge selection; every key is optional
   # latency_min_score: 250   # reciprocal score; 250 ≈ "answers within 4s"
   # speed_min_score: 65536   # = below 64KiB/s is discarded
   # penalty: 0.5             # score multiplier for a failed request
-  # scan_interval: 1h        # scan address pools for new candidates
+  # intensity: 0.13          # sweep patience as a fraction of the block list
+  # interval: 10s            # steady state: one probe, then rest
   # patrol_latency_interval: 5m
   # patrol_speed_interval: 30m
-  # recruit_interval: 10m    # small scan; keeps pools from draining
-  # recruit_samples: 2
   # init_timeout: 30s        # startup wait; exceeding it is not fatal
-  # patrol_intensity: 1      # scan budget ceiling vs the pre-rewrite Refresh
-  #                          # (≈6k candidates); 0.5 = half, capped at 4
   # candidates_file: ""      # default: <config dir>/cf-candidates.csv
   # snapshot_interval: 1h    # also written on shutdown
   # bootstrap_host: ""       # default: hostname of upstream.url
@@ -528,15 +525,15 @@ measurement problem must not become an outage.
 both pools, the gate verdict and which pool is serving — the answer to "why is
 traffic going to that IP".
 
-A **patrol** re-measures every member (bounded by pool capacity, every 5m); a
-**scan** explores the address pools for new candidates (hourly, the expensive
-one); a **recruit** is a small scan on a short cadence.
+One **sweep** at startup, then one probe per interval. A **patrol** re-measures
+every member on its own timers and preempts both (reader/writer gate: probes
+share, a patrol takes the whole thing).
 
-Startup order: `Start` runs **one full scan immediately**, then starts the
-periodic jobs. Initialization only seeds a handful of addresses, and every timer
-is anchored at `Start` — so a relay restarting more often than `scan_interval`
-would otherwise never scan at all (ADR-0014 in `cft/docs/adr/`). The scan logs one
-line when it finishes: `scan: P probed, N responded, K admitted in Xs`.
+Startup order: `Start` runs **one sweep immediately**, then drops into one probe
+per interval. Initialization only seeds a handful of addresses, so waiting a
+schedule would leave the relay on that seed pool — which is why the sweep is
+first, not scheduled (ADR-0018). The sweep logs one line when it finishes:
+`sweep: P probed, K admitted, stopped after N without improvement in Xs`.
 
 Two startup paths must tolerate a transient: the cert-pack fetch retries three
 times before giving up (a parent restarting at that exact second used to kill the
@@ -544,18 +541,16 @@ consumer), and until `/api/mirrors` has loaded once the watcher retries every
 15 s instead of every 10 minutes (a relay with no manifest answers 502 to
 everything, so one unlucky edge address at startup was ten minutes of downtime).
 
-`cf.patrol_intensity` sets the scan's candidate budget, measured against what the
-pre-rewrite pool manager generated — one per `/24` over the measured usable
-ranges, 2334 today — capped at 4. A scan **spends the whole budget**: a full pool
-still has a worst member worth replacing, and stopping at the fill level freezes
-the ranking at the first sweep's result (ADR-0015 supersedes ADR-0009's early
-stop).
-At intensity 1 that is ~2300 probes an hour — the knob to lower first on a
-metered uplink.
+`cf.intensity` (default `0.13`) is the sweep's patience: it stops after that
+fraction of the block list in consecutive probes without an improvement — ~303
+against 2334 blocks. A fraction rather than a count because the component is
+reusable: the same value means "a large slice of the space" for Cloudflare and "a
+few addresses" for a three-subnet list. ADR-0018 supersedes the budget model of
+ADR-0009/0015.
 
-A **recruit waits for a patrol in progress** — both are bulk measurements of the
-same links, and a speed probe saturates the link, so concurrent runs measure
-each other.
+A **patrol blocks every probe, including the steady state's** — it takes the
+whole gate. A speed probe saturates the link, so a patrol and a probe running
+together would measure each other.
 
 Probing is not free, and the two probe kinds differ by ~1000x in bytes: a latency
 probe moves ~1.1 KB, a speed probe reads for a three-second window and moves

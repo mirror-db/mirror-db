@@ -89,7 +89,7 @@ func GetAcmeAgree() bool           { return viper.GetBool("acme.agree") }
 
 // CFConfig values for the edge-selection engine. Zero means "use the engine's
 // default"; the engine owns the defaults so they stay in one place.
-func GetCfPoolCapacity() int        { return viper.GetInt("cf.latency_capacity") }
+func GetCfLatencyCapacity() int     { return viper.GetInt("cf.latency_capacity") }
 func GetCfSpeedCapacity() int       { return viper.GetInt("cf.speed_capacity") }
 func GetCfTopN() int                { return viper.GetInt("cf.top_n") }
 func GetCfSeedCount() int           { return viper.GetInt("cf.seed_count") }
@@ -99,30 +99,21 @@ func GetCfSpeedURL() string         { return strings.TrimSpace(viper.GetString("
 func GetCfLatencyMinScore() float64 { return viper.GetFloat64("cf.latency_min_score") }
 func GetCfSpeedMinScore() float64   { return viper.GetFloat64("cf.speed_min_score") }
 func GetCfPenalty() float64         { return viper.GetFloat64("cf.penalty") }
-func GetCfRecruitSamples() int      { return viper.GetInt("cf.recruit_samples") }
 
-func GetCfScanInterval() time.Duration {
-	return viper.GetDuration("cf.scan_interval")
-}
 func GetCfPatrolLatencyInterval() time.Duration {
 	return viper.GetDuration("cf.patrol_latency_interval")
 }
 func GetCfPatrolSpeedInterval() time.Duration {
 	return viper.GetDuration("cf.patrol_speed_interval")
 }
-func GetCfRecruitInterval() time.Duration {
-	return viper.GetDuration("cf.recruit_interval")
-}
 
-// GetCfPatrolIntensity scales how much a patrol explores, relative to the
-// candidate volume of the pool manager this replaced (one IP per /24, ~6k). 1 is
-// that volume; the engine clamps the value to MaxPatrolIntensity.
-func GetCfPatrolIntensity() float64 {
-	if v := viper.GetFloat64("cf.patrol_intensity"); v > 0 {
-		return v
-	}
-	return 1
-}
+// GetCfIntensity is the opening sweep's patience, as a fraction of one full
+// cycle over the block list: the sweep stops after this many consecutive probes
+// that did not improve the pool. 0.13 is ~303 probes against 2334 /24s.
+func GetCfIntensity() float64 { return viper.GetFloat64("cf.intensity") }
+
+// GetCfInterval is how long the steady state rests between single probes.
+func GetCfInterval() time.Duration { return viper.GetDuration("cf.interval") }
 
 // GetCfCandidatesFile is where the candidate snapshot lives. It lets a restart
 // skip exploring every published range, and it is the successor to the old

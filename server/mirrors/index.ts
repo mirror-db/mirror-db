@@ -6,6 +6,7 @@ import { npm } from "./npm";
 import { pypi } from "./pypi";
 import { charts } from "./charts";
 import { aptMirrors } from "./apt-mirrors";
+import { debianSnapshot } from "./debian-snapshot";
 import { webMirrors } from "./web-mirrors";
 
 // Simple anonymous-passthrough OCI registries — the proxy follows each
@@ -24,7 +25,16 @@ const simpleRegistries: Mirror[] = [
 ];
 
 /** Every mirror, regardless of how it is routed (subdomain or path prefix). */
-export const mirrors: Mirror[] = [docker, ...simpleRegistries, ...aptMirrors, ...webMirrors, pypi, npm, charts];
+export const mirrors: Mirror[] = [
+  docker,
+  ...simpleRegistries,
+  ...aptMirrors,
+  ...webMirrors,
+  pypi,
+  npm,
+  charts,
+  debianSnapshot,
+];
 
 /** Subdomain-routed mirrors, keyed by subdomain (e.g. `"dcr"`). */
 export const mirrorsBySubdomain: Map<string, Mirror> = new Map(
