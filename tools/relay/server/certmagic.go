@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/caddyserver/certmagic"
@@ -97,15 +98,31 @@ func buildCertMagicConfig() (*certmagic.Config, *certmagic.Cache) {
 
 	// GetConfigForCert is called per-certificate for renewal.
 	// Select the correct CF API token based on which domain the cert covers.
+	// The config returned here must be built with certmagic.New so it carries a
+	// pointer back to this cache. A hand-built &certmagic.Config{} has a nil
+	// cache, and certmagic's maintenance loop rejects it:
+	//
+	//   error maintenance unable to get configuration to manage certificate;
+	//   unable to renew: config returned for certificate [x] has nil cache
+	//
+	// which means renewals never run — the certificates simply expire. The cache
+	// pointer is stored after construction because NewCache needs the closure
+	// first; certmagic only calls it from the maintenance goroutine.
+	var cachePtr atomic.Pointer[certmagic.Cache]
+
 	cacheOpts := certmagic.CacheOptions{
 		GetConfigForCert: func(cert certmagic.Certificate) (*certmagic.Config, error) {
+			c := cachePtr.Load()
+			if c == nil {
+				return nil, fmt.Errorf("certmagic cache not initialised yet")
+			}
 			tok := tokenForCertName(cert.Names[0], tokens)
-			cfg := &certmagic.Config{
+			cfg := certmagic.New(c, certmagic.Config{
 				RenewalWindowRatio: certmagic.Default.RenewalWindowRatio,
 				KeySource:          certmagic.Default.KeySource,
 				Logger:             certmagic.Default.Logger,
 				Storage:            storage,
-			}
+			})
 			cfg.Issuers = []certmagic.Issuer{makeIssuer(cfg, tok)}
 			return cfg, nil
 		},
@@ -113,6 +130,7 @@ func buildCertMagicConfig() (*certmagic.Config, *certmagic.Cache) {
 	}
 
 	cache := certmagic.NewCache(cacheOpts)
+	cachePtr.Store(cache)
 
 	// Default config — issuer placeholder; actual issuance done via manageDomainsPerToken.
 	cmCfg := certmagic.Config{
