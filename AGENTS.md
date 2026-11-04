@@ -280,6 +280,50 @@ the APT mirror but reusable for any directory-listing upstream.
 - **`webdav.ts`** — hand-crafted RFC 4918 class 1 responses (no XML library
   needed). `propfindResponse`, `optionsResponse`, `methodNotAllowed`.
 
+## Snapshot mirror — [server/mirrors/debian-snapshot/](server/mirrors/debian-snapshot/)
+
+Read-through access to `snapshot.debian.org` at `/debian-snapshot/`. The upstream
+is the Debian archive's time machine and is **PB-scale**, so this is a cache, not
+a mirror: nothing is pre-fetched, and only what a client asks for is stored.
+
+Upstream shape, and what the mirror does with it:
+
+- `/archive/<archive>/<YYYYMMDDTHHMMSSZ>/…` is one pinned tree. Eight archives
+  exist (`debian`, `debian-security`, `debian-ports`, `debian-backports`,
+  `debian-debug`, `debian-security-debug`, `debian-volatile`, `debian-archive`).
+- Every file answers `302 → /file/<sha1>/<name>`, which is immutable. Redirects
+  are followed **inside** the Worker, so clients never see an upstream origin.
+- A timestamp between two snapshots resolves to the nearest **earlier** one, and
+  one in the **future** resolves to the newest snapshot. The first is stable
+  forever; the second keeps moving, so a future timestamp is never stored.
+- `/mr/…` is the upstream's JSON API. Served, never stored.
+
+Policy:
+
+| path | cached | advertised |
+|------|--------|------------|
+| `archive/<known>/<timestamp ≤ now>/…` (GET, no Range) | yes, keyed by the request URL | `immutable, max-age=31536000` |
+| the same with a future timestamp | no | `max-age=600` |
+| `mr/…` | no | `max-age=600` |
+| `Range` requests | no (206 would poison the key) | upstream |
+
+Everything else — the calendar, `/package/`, `/binary/` — is **404**: those are
+browsing UI for the upstream site, and proxying them would turn this into a
+crawler of a donation-funded service. Object size is capped by `CFCacheLimit`
+(512 MB); a larger `.deb` streams through uncached.
+
+Client prerequisites, which the mirror cannot fix:
+
+- snapshots carry a long-expired `Valid-Until`, so apt needs
+  `check-valid-until=no`;
+- old snapshots are signed by archive keys of their era — install
+  `debian-archive-keyring` (our `/keys/debian/<version>` covers 8 and later).
+
+```bash
+deb [signed-by=… check-valid-until=no] \
+  https://mirs.uk/debian-snapshot/archive/debian/20240101T000000Z/ bookworm main
+```
+
 ## Helm chart mirror — [server/mirrors/charts/](server/mirrors/charts/)
 
 Single path-routed mirror (`/charts/`) hosting many Helm repos, one per entry in
