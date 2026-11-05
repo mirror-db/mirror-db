@@ -610,10 +610,10 @@ instead of exploring the published ranges. Without a snapshot the engine resolve
 because a score describes a moment. This replaces `cf-nodes.csv`, which nothing
 reads any more.
 
-The engine lives in `tools/relay/cft/`, a **separate module** mounted here for
-development and referenced by a `replace` in `go.mod`. It is not committed to
-this repository: CI skips the relay build while it is absent, and the Docker job
-is disabled. Publishing it is what unblocks both — see TODO.md.
+The engine is `github.com/geektr-cloud/go-cloudflare-fastest-transport` (**v0.3.0**),
+a separate published module. It used to be mounted at `tools/relay/cft/` and
+referenced by a `replace` while it was validated end to end; the mount is gone,
+CI builds the relay normally, and the image no longer copies a local module.
 
 **No `http.Client.Timeout`.** It caps the *whole* request including body read,
 so any download longer than the timeout is cut mid-stream (e.g. a 755MB ISO at

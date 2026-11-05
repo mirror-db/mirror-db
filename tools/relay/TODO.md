@@ -1,21 +1,18 @@
 # Relay 待办
 
-## P0 — 发布 cft 模块，解除构建阻塞
+## P0 — 发布 cft 模块 ✅
 
-`tools/relay/cft/` 是为了端到端验证而临时挂载的独立 module，未提交进本仓库
-（`.gitignore:57`）。relay 通过 `go.mod` 的 `replace` 引用它，因此：
+`tools/relay/cft/` 曾是临时挂载的独立 module（未提交，`.gitignore` 里）。它已于
+2026-11-05 作为 **v0.3.0** 发布到
+`github.com/geektr-cloud/go-cloudflare-fastest-transport`，本地挂载已删除：
 
-- **CI**：checkout 里没有 `cft/`，`.github/workflows/relay.yml` 的 build job
-  用「模块是否存在」判定并跳过 relay 构建（会打 warning）。
-- **Docker**：`docker` job 被 `&& false` 禁用；`Dockerfile` 已能在 `cft/` 存在时
-  正确构建（先 `COPY cft/` 再 `go mod download`）。
+1. `tools/relay/go.mod` 的 `replace` 已删除，`go.sum` 从 proxy 拉取 v0.3.0。
+2. `.github/workflows/relay.yml` 的 `Check for local transport module` 步骤及
+   所有 `if:` 条件已删除。
+3. `docker` job 的条件已恢复（去掉 `&& false`），`Dockerfile` 不再 `COPY cft/`。
 
-发布并删除本地挂载后要做的三件事：
-
-1. 删除 `tools/relay/go.mod` 末尾的 `replace` 指令。
-2. 删除 `.github/workflows/relay.yml` 里的 `Check for local transport module`
-   步骤及其 `if:` 条件。
-3. 恢复 docker job 的条件（去掉 `&& false`）。
+验证方式：把 `tools/relay/cft` 移走后 `go build ./...` / `go test ./...` 全部通过
+—— 依赖来自模块代理，不是本地目录。
 
 ## 升级注意：`cf-nodes.csv` 已废弃
 

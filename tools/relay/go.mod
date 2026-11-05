@@ -43,8 +43,3 @@ require (
 	golang.org/x/text v0.36.0 // indirect
 	golang.org/x/tools v0.44.0 // indirect
 )
-
-// TEMPORARY: the transport module is mounted at ./cft while the new engine is
-// validated end to end. Delete this directive once v0.3.0 is published — the
-// import paths are already the published ones, so nothing else changes.
-replace github.com/geektr-cloud/go-cloudflare-fastest-transport => ./cft

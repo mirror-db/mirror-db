@@ -29,38 +29,20 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # The edge-selection module is mounted at tools/relay/cft while it is
-      # validated, and is not committed. Until it is published the relay cannot
-      # resolve it, so say so loudly instead of failing on a confusing import
-      # error. Remove this step together with the replace directive in go.mod.
-      - name: Check for local transport module
-        id: cft
-        run: |
-          if [ -f tools/relay/cft/go.mod ]; then
-            echo "ok=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "ok=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::tools/relay/cft is absent (not published yet); skipping relay build"
-          fi
-
       - uses: actions/setup-go@v6
-        if: steps.cft.outputs.ok == 'true'
         with:
           go-version: ${{ env.GO_VERSION }}
           cache-dependency-path: tools/relay/go.sum
 
       - name: Vet
-        if: steps.cft.outputs.ok == 'true'
         working-directory: tools/relay
         run: go vet ./...
 
       - name: Test
-        if: steps.cft.outputs.ok == 'true'
         working-directory: tools/relay
         run: go test -race ./...
 
       - name: Build
-        if: steps.cft.outputs.ok == 'true'
         working-directory: tools/relay
         env:
           CGO_ENABLED: "0"
@@ -69,7 +51,6 @@ jobs:
         run: go build -trimpath -ldflags="-s -w" -o relay-${{ matrix.goos }}-${{ matrix.goarch }} .
 
       - uses: actions/upload-artifact@v7
-        if: steps.cft.outputs.ok == 'true'
         with:
           name: relay-${{ matrix.goos }}-${{ matrix.goarch }}
           path: tools/relay/relay-${{ matrix.goos }}-${{ matrix.goarch }}
@@ -98,9 +79,7 @@ jobs:
             artifacts/checksums.txt
 
   docker:
-    # Blocked while the transport module is unpublished: the image build needs
-    # tools/relay/cft, which is not in the repository.
-    if: startsWith(github.ref, 'refs/tags/relay/v') && false
+    if: startsWith(github.ref, 'refs/tags/relay/v')
     needs: build
     runs-on: ubuntu-latest
     steps:
