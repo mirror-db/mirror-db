@@ -49,6 +49,10 @@ const WellKnownAptKeyUrl: Record<string, string | string[]> = {
   opentofu: "https://get.opentofu.org/opentofu.gpg",
   "opentofu-repo": "https://packages.opentofu.org/opentofu/tofu/gpgkey",
   "github-cli": "https://cli.github.com/packages/githubcli-archive-keyring.gpg",
+  // Flat repository (no `dists/`): the index lives next to the packages at
+  // `/stable/deb/<arch>/InRelease`, which the same key signs.
+  "libnvidia-container": "https://nvidia.github.io/libnvidia-container/gpgkey",
+  nvidia: "https://nvidia.github.io/libnvidia-container/gpgkey",
   "gitlab-runner": GitLabKeys,
   "gitlab-runner-deb": GitLabKeys,
   gitlab: GitLabKeys,

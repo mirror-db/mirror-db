@@ -118,6 +118,12 @@ describe("well-known APT keys cover the APT mirrors", () => {
     expect(() => repo2KeyUrl("debian-ports")).toThrow(UnknownKeyError);
   });
 
+  it("maps the NVIDIA container repo to its signing key", () => {
+    expect(repo2KeyUrl("libnvidia-container")).toBe(
+      "https://nvidia.github.io/libnvidia-container/gpgkey",
+    );
+  });
+
   it("merges Debian's release keys, because the index is signed by all of them", () => {
     const urls = repo2KeyUrl("debian");
     expect(Array.isArray(urls)).toBe(true);
