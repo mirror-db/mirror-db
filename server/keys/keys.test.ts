@@ -6,7 +6,7 @@ import { keys } from "./index";
 import { debianKeyName2Url } from "./pgp/debian";
 import { repo2KeyUrl } from "./pgp/well-known-apt";
 import { ParseSSHKey } from "./utils/ssh-key";
-import { toSourcesFormat } from "./utils/pgp-key";
+import { armorBinary, toSourcesFormat } from "./utils/pgp-key";
 import { UnknownKeyError } from "./utils/errors";
 import { cachedfetch } from "@server/pkgs/fetch";
 
@@ -68,6 +68,31 @@ describe("ParseSSHKey", () => {
 
   it("throws on invalid base64 body", async () => {
     await expect(ParseSSHKey("ssh-rsa !!!notb64 c")).rejects.toThrow();
+  });
+});
+
+describe("armorBinary", () => {
+  const dearmor = (armored: string): Uint8Array => {
+    const lines = armored.trimEnd().split("\n");
+    const body = lines.slice(2, -2).join(""); // drop BEGIN, blank, …, CRC, END
+    const binary = atob(body);
+    const out = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
+    return out;
+  };
+
+  it("round-trips packets, wrapped at 64 columns with a CRC line", () => {
+    const packets = new Uint8Array(200).map((_, i) => (i * 7) % 256);
+    const armored = armorBinary(packets);
+    const lines = armored.trimEnd().split("\n");
+
+    expect(lines[0]).toBe("-----BEGIN PGP PUBLIC KEY BLOCK-----");
+    expect(lines[1]).toBe("");
+    expect(lines.at(-2)?.startsWith("=")).toBe(true);
+    expect(lines.at(-1)).toBe("-----END PGP PUBLIC KEY BLOCK-----");
+    expect(lines.slice(2, -2).every((l) => l.length <= 64)).toBe(true);
+
+    expect(dearmor(armored)).toEqual(packets);
   });
 });
 

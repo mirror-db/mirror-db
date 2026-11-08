@@ -382,6 +382,24 @@ reaching upstreams directly. Mounted in [server/index.ts](server/index.ts) via
   bytes served for `/` and `/pgp` are the published file, normalised to binary
   when it parses. An unknown name is a **404** (`UnknownKeyError`), any other
   failure a 502.
+
+  `/in-sources` is designed for the **inline** form — first line unindented, all
+  others indented by one space, blank lines as `.`, exactly one trailing newline:
+
+  ```bash
+  install -m 0644 /dev/stdin /etc/apt/sources.list.d/<repo>.sources <<EOF
+  Types: deb
+  URIs: https://mirs.uk/<repo>/
+  Suites: <suite>
+  Components: <component>
+  Signed-By: $(curl -fsSL https://mirs.uk/keys/apt/<repo>/in-sources)
+  EOF
+  ```
+
+  A keyring with several certificates is emitted as **one** armored block
+  (`armorBinary`, CRC-24 included) so the field stays a single BEGIN/END pair; a
+  single armored source is passed through untouched, which keeps the bytes
+  identical to the `curl … | sed` pipeline.
 - **`SrvSSHKeyList(urlProvider)`** ([utils/ssh-key.ts](server/keys/utils/ssh-key.ts))
   — sub-app serving a user's SSH `authorized_keys` list. `GET /:keyname` returns
   raw text; `/:keyname/info` returns parsed keys with md5 (via `spark-md5`) +

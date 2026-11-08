@@ -97,11 +97,18 @@ export class PGPPubKeyHandler {
       ? concat(keys.map((k) => k.write()))
       : concat(fetched);
 
-    const armoredText = fetched.every(isArmored)
-      ? fetched.map((b) => new TextDecoder().decode(b).trimEnd()).join("\n")
-      : keys.length
-        ? keys.map((k) => k.armor().trimEnd()).join("\n")
-        : undefined;
+    // One armored block for the whole keyring. A value embedded in a deb822
+    // `Signed-By:` field reads as a single PEM-ish block, so several
+    // certificates are re-armored together instead of being emitted as
+    // back-to-back blocks with blank lines between them. A single armored
+    // source is passed through untouched (that keeps the output byte-identical
+    // to `curl … | sed`, which is what people diff against).
+    const armoredText =
+      fetched.length === 1 && isArmored(fetched[0])
+        ? new TextDecoder().decode(fetched[0]).trimEnd()
+        : keys.length
+          ? armorBinary(concat(keys.map((k) => k.write())))
+          : undefined;
 
     return new PGPPubKeyHandler(raw, keys, armoredText);
   }
@@ -245,6 +252,48 @@ function armored(h: PGPPubKeyHandler): string | undefined {
 
 /** 502 with a reason, for routes that need a parsed key. */
 const unparsable = (c: any) => c.json({ error: "key could not be parsed" }, 502);
+
+/**
+ * Wrap OpenPGP packets in an ASCII-armored block (RFC 4880 §6.2), including the
+ * CRC-24 checksum line that clients expect.
+ */
+export function armorBinary(packets: Uint8Array): string {
+  const body = base64(packets);
+  const lines: string[] = [];
+  for (let i = 0; i < body.length; i += 64) lines.push(body.slice(i, i + 64));
+  const crc = base64(crc24(packets));
+  return [
+    "-----BEGIN PGP PUBLIC KEY BLOCK-----",
+    "",
+    ...lines,
+    `=${crc}`,
+    "-----END PGP PUBLIC KEY BLOCK-----",
+    "",
+  ].join("\n");
+}
+
+/** RFC 4880 CRC-24. */
+function crc24(data: Uint8Array): Uint8Array {
+  let crc = 0xb704ce;
+  for (const byte of data) {
+    crc ^= byte << 16;
+    for (let i = 0; i < 8; i++) {
+      crc <<= 1;
+      if (crc & 0x1000000) crc ^= 0x1864cfb;
+    }
+  }
+  crc &= 0xffffff;
+  return new Uint8Array([(crc >> 16) & 0xff, (crc >> 8) & 0xff, crc & 0xff]);
+}
+
+/** Base64 encode; handles the whole buffer without blowing the argument limit. */
+function base64(data: Uint8Array): string {
+  let binary = "";
+  for (let i = 0; i < data.length; i += 0x8000) {
+    binary += String.fromCharCode(...data.subarray(i, i + 0x8000));
+  }
+  return btoa(binary);
+}
 
 /** Concatenate byte arrays. */
 function concat(chunks: Uint8Array[]): Uint8Array {
