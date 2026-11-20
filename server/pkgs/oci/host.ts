@@ -38,5 +38,10 @@ export function createRegistryHost(opts: OciHostOptions): Mirror {
   // blob request with a *relative* redirect to an on-host download path like
   // `/artifacts-downloads/...`, which the client resolves against this mirror.
   // Those follow-up requests still need upstream auth, so they must be proxied.
-  return { name: opts.host, host: opts.host, fetch: proxy };
+  return {
+    name: opts.host,
+    host: opts.host,
+    policyTags: ["oci"],
+    fetch: proxy,
+  };
 }

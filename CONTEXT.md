@@ -75,6 +75,26 @@ The value of `X-MDB-Relay-Host` — the outermost relay's base domain as seen by
 the end user. Untrusted input: anyone can set it, so it may only shape URLs
 returned to the client, never grant access.
 
+### Policy tag
+
+An opaque label attached to a mirror in its manifest. Tags select relay policies;
+they do not classify the mirror's kind, grant a capability, or change how the
+mirror serves content.
+
+### Relay policy
+
+A named, ordered rule distributed with the mirror manifest. Its matchers select
+requests by tag, mirror name, or mount-relative path; all present matchers must
+agree. The first matching policy supplies the request's traffic policy. A request
+that matches none uses `latency`.
+
+### Traffic policy
+
+A relay's transport preference for one request: `latency` favours prompt response
+headers, while `speed` favours sustained transfer throughput. It never changes
+the requested content. If the preferred transport is unavailable, the relay
+falls back rather than failing the request.
+
 ### Absolute reference
 
 Any URL a mirror writes into its own response body or `Location` header (npm

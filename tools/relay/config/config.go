@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/url"
 	"os"
@@ -28,6 +29,10 @@ func init() {
 	viper.SetDefault("relay.config_dir", "/etc/mirror-relay")
 
 	viper.SetDefault("upstream.url", "https://mirs.uk")
+
+	// Manifest refresh cadence. Zero is not a valid value: refusing to poll
+	// would silently stop policy distribution.
+	viper.SetDefault("relay.manifest_sync_interval", "10m")
 
 	viper.SetDefault("acme.source", "acme")
 	viper.SetDefault("acme.email", "acme@mirs.uk")
@@ -84,6 +89,28 @@ func GetAcmeSource() string        { return viper.GetString("acme.source") }
 func GetAcmeEmail() string         { return viper.GetString("acme.email") }
 func GetAcmeCA() string            { return viper.GetString("acme.ca") }
 func GetAcmeAgree() bool           { return viper.GetBool("acme.agree") }
+
+// DefaultManifestSyncInterval is the manifest refresh cadence when unset.
+const DefaultManifestSyncInterval = 10 * time.Minute
+
+// GetManifestSyncInterval is how often the mirror manifest is revalidated. It
+// must be a positive duration: a non-positive or unparsable value is an error
+// rather than a silent default, so policy distribution cannot be disabled by
+// accident.
+func GetManifestSyncInterval() (time.Duration, error) {
+	raw := strings.TrimSpace(viper.GetString("relay.manifest_sync_interval"))
+	if raw == "" {
+		return DefaultManifestSyncInterval, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("relay.manifest_sync_interval %q is not a duration: %w", raw, err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("relay.manifest_sync_interval %q must be positive", raw)
+	}
+	return d, nil
+}
 
 // --- Cloudflare edge selection ---
 

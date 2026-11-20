@@ -6,5 +6,6 @@ import { handle } from "./docker";
 export default {
   name: "dcr",
   host: "dcr",
+  policyTags: ["oci"],
   fetch: handle,
 } satisfies Mirror;

@@ -77,8 +77,8 @@ func TestRequestHost(t *testing.T) {
 
 func TestShouldKeepHTTP(t *testing.T) {
 	s := &Server{baseDomains: []string{"relay.example.com"}}
-	httpOK := map[string]bool{"apt": true, "dcr": true}
-	s.keepHTTP.Store(&httpOK)
+	st := &manifestState{keepHTTP: map[string]bool{"apt": true, "dcr": true}}
+	s.manifest.Store(st)
 
 	cases := []struct {
 		target string

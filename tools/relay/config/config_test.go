@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/spf13/viper"
 )
@@ -82,6 +83,29 @@ func TestAcmeSource(t *testing.T) {
 		}
 	}
 	viper.Set("acme.source", "acme")
+}
+
+func TestManifestSyncInterval(t *testing.T) {
+	const key = "relay.manifest_sync_interval"
+	t.Cleanup(func() { viper.Set(key, "10m") })
+
+	// Unset/empty falls back to the documented default.
+	viper.Set(key, "")
+	if got, err := GetManifestSyncInterval(); err != nil || got != DefaultManifestSyncInterval {
+		t.Fatalf("default: got (%v,%v), want (%v,nil)", got, err, DefaultManifestSyncInterval)
+	}
+
+	viper.Set(key, "5m")
+	if got, err := GetManifestSyncInterval(); err != nil || got != 5*time.Minute {
+		t.Fatalf("override: got (%v,%v), want (5m,nil)", got, err)
+	}
+
+	for _, raw := range []string{"0", "-1m", "10", "not-a-duration"} {
+		viper.Set(key, raw)
+		if got, err := GetManifestSyncInterval(); err == nil {
+			t.Errorf("%q: got (%v,nil), want an error", raw, got)
+		}
+	}
 }
 
 func TestSecretKeyFilePermissions(t *testing.T) {

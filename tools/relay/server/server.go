@@ -20,22 +20,21 @@ import (
 	"github.com/mirror-db/mirror-db/tools/relay/config"
 	"github.com/mirror-db/mirror-db/tools/relay/guard"
 	"golang.org/x/net/proxy"
-	"resty.dev/v3"
 )
 
 // Mirror matches the JSON shape from GET /api/mirrors.
 type Mirror struct {
-	Name     string `json:"name"`
-	Host     string `json:"host,omitempty"`
-	Path     string `json:"path,omitempty"`
-	KeepHTTP bool   `json:"keepHTTP,omitempty"`
+	Name       string   `json:"name"`
+	Host       string   `json:"host,omitempty"`
+	Path       string   `json:"path,omitempty"`
+	KeepHTTP   bool     `json:"keepHTTP,omitempty"`
+	PolicyTags []string `json:"policy_tags,omitempty"`
 }
 
 // Server holds state and exposes the HTTPS router + HTTP router.
 type Server struct {
 	upstream    *url.URL
 	client      *http.Client
-	resty       *resty.Client
 	baseDomains []string
 	proxy       *httputil.ReverseProxy
 
@@ -45,10 +44,11 @@ type Server struct {
 
 	edge *edgeSelection
 
-	mirrors      atomic.Pointer[[]Mirror]
-	loaded       atomic.Bool // manifest has been fetched at least once
-	allowedHosts atomic.Pointer[map[string]bool]
-	keepHTTP     atomic.Pointer[map[string]bool]
+	// manifest is the single snapshot a request reads: mirrors, compiled
+	// policies, keepHTTP and the ETag they were loaded with. One pointer keeps
+	// them consistent; separate atomics could tear across a refresh.
+	manifest atomic.Pointer[manifestState]
+	loaded   atomic.Bool // manifest has been fetched at least once
 
 	// ready is closed after the first successful manifest fetch. Until then the
 	// proxy answers 502 instead of an empty allow-list.
@@ -57,7 +57,8 @@ type Server struct {
 
 // mirrorsResponse matches the JSON shape from GET /api/mirrors.
 type mirrorsResponse struct {
-	Mirrors []Mirror `json:"mirrors"`
+	Mirrors  []Mirror `json:"mirrors"`
+	Policies []Policy `json:"policies,omitempty"`
 }
 
 // NewServer creates a relay server. Discovers CF edge nodes, fetches mirror
@@ -69,6 +70,13 @@ func NewServer() (*Server, error) {
 	}
 	if u.Scheme == "" || u.Host == "" {
 		return nil, fmt.Errorf("upstream url %q needs scheme and host", u.String())
+	}
+
+	// Validate before the edge engine probes the network: a bad interval is a
+	// startup error, not something to discover ten minutes later.
+	syncInterval, err := config.GetManifestSyncInterval()
+	if err != nil {
+		return nil, err
 	}
 
 	// Upstream transport: proxy > disguise > edge selection.
@@ -104,7 +112,6 @@ func NewServer() (*Server, error) {
 		upstream:    u,
 		client:      httpClient,
 		edge:        edge,
-		resty:       resty.NewWithClient(httpClient).SetBaseURL(config.GetUpstreamURL()),
 		baseDomains: config.AllDomainNames(),
 	}
 	if len(s.baseDomains) == 0 {
@@ -117,11 +124,11 @@ func NewServer() (*Server, error) {
 
 	// A transient upstream failure must not turn into a systemd restart loop:
 	// log it, serve 502 until the watcher succeeds.
-	if err := s.refreshMirrors(); err != nil {
+	if err := s.syncManifest(); err != nil {
 		log.Printf("initial mirror fetch failed (serve 502 until it succeeds): %v", err)
 	}
 
-	go s.watchMirrors(10 * time.Minute)
+	go s.watchMirrors(syncInterval)
 	return s, nil
 }
 
@@ -164,6 +171,13 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "relay has no upstream manifest yet", http.StatusBadGateway)
 		return
 	}
+
+	// The policy is carried on the request context so the per-request
+	// RoundTripper can pick a pool without rewriting the reverse proxy.
+	c := r.Context()
+	if p := s.matchTrafficPolicy(r); p != trafficLatency {
+		r = r.WithContext(withTrafficPolicy(c, p))
+	}
 	s.proxy.ServeHTTP(w, r)
 }
 
@@ -173,7 +187,7 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 func (s *Server) newReverseProxy() *httputil.ReverseProxy {
 	return &httputil.ReverseProxy{
 		Rewrite:       s.rewriteUpstream,
-		Transport:     s.client.Transport,
+		Transport:     s.upstreamTransport(),
 		FlushInterval: 100 * time.Millisecond,
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			// Client cancellations are normal; don't spam the log.
@@ -184,6 +198,18 @@ func (s *Server) newReverseProxy() *httputil.ReverseProxy {
 			http.Error(w, "upstream error", http.StatusBadGateway)
 		},
 	}
+}
+
+// upstreamTransport returns the RoundTripper the reverse proxy uses.
+//
+// Without edge selection (explicit proxy or SSH disguise) there is exactly one
+// route, so the policy list is irrelevant. With edge selection every request
+// picks its pool from the matched policy.
+func (s *Server) upstreamTransport() http.RoundTripper {
+	if s.edge == nil {
+		return s.client.Transport
+	}
+	return &policyTransport{edge: s.edge}
 }
 
 // rewriteUpstream maps a client request onto the upstream origin, preserving
@@ -257,53 +283,14 @@ func (s *Server) matchBaseDomain(host string) (sub string, base string) {
 	return "", ""
 }
 
-// refreshMirrors fetches /api/mirrors from upstream.
-func (s *Server) refreshMirrors() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	var result mirrorsResponse
-	resp, err := s.resty.R().SetContext(ctx).SetResult(&result).Get("/api/mirrors")
-	if err != nil {
-		return err
-	}
-	if resp.IsStatusFailure() {
-		return fmt.Errorf("upstream returned %s", resp.Status())
-	}
-
-	mirrors := result.Mirrors
-
-	hosts := make(map[string]bool, len(mirrors))
-	httpOK := make(map[string]bool)
-	for _, m := range mirrors {
-		if m.Host != "" {
-			hosts[m.Host] = true
-			if m.KeepHTTP {
-				httpOK[m.Host] = true
-			}
-		}
-		if m.Path != "" && m.KeepHTTP {
-			httpOK[m.Path] = true
-		}
-	}
-
-	s.mirrors.Store(&mirrors)
-	s.allowedHosts.Store(&hosts)
-	s.keepHTTP.Store(&httpOK)
-	s.ready.Store(true)
-	log.Printf("loaded %d mirrors (%d hosts) from upstream", len(mirrors), len(hosts))
-	s.loaded.Store(true)
-	return nil
-}
-
-// Mirrors returns the current manifest as JSON, for operators debugging
-// upstream discovery. Served at /.mirror-relay/mirrors.
+// Mirrors returns the current manifest, for operators debugging upstream
+// discovery. Served at /.mirror-relay/mirrors.
 func (s *Server) Mirrors() ([]Mirror, error) {
-	p := s.mirrors.Load()
-	if p == nil {
+	st := s.manifest.Load()
+	if st == nil {
 		return nil, nil
 	}
-	return *p, nil
+	return st.mirrors, nil
 }
 
 // handlePool reports what the edge-selection engine currently believes, so an
@@ -331,13 +318,13 @@ func (s *Server) Close() {
 }
 
 func (s *Server) handleMirrors(w http.ResponseWriter, r *http.Request) {
-	m, err := s.Mirrors()
-	if err != nil {
+	st := s.manifest.Load()
+	if st == nil {
 		http.Error(w, "no manifest", http.StatusServiceUnavailable)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(mirrorsResponse{Mirrors: m})
+	_ = json.NewEncoder(w).Encode(mirrorsResponse{Mirrors: st.mirrors, Policies: st.policyList()})
 }
 
 func (s *Server) watchMirrors(interval time.Duration) {
@@ -352,28 +339,39 @@ func (s *Server) watchMirrors(interval time.Duration) {
 		}
 
 		// Jitter each cycle so a fleet of relays doesn't stampede the Worker.
-		next := wait + time.Duration(rand.Int64N(int64(wait/3))) - wait/6
-		time.Sleep(next)
-		if err := s.refreshMirrors(); err != nil {
+		time.Sleep(jitteredWait(wait))
+		if err := s.syncManifest(); err != nil {
 			log.Printf("mirror refresh failed: %v", err)
 		}
 	}
 }
 
+// jitteredWait spreads a refresh interval by ±1/6 so a fleet of relays does not
+// stampede the Worker. Tiny intervals are returned unchanged: rand.Int64N(0)
+// panics, and a sub-nanosecond jitter is meaningless anyway.
+func jitteredWait(wait time.Duration) time.Duration {
+	span := wait / 3
+	if span <= 0 {
+		return wait
+	}
+	return wait + time.Duration(rand.Int64N(int64(span))) - wait/6
+}
+
 // ShouldKeepHTTP returns true if the request targets a mirror that allows plain HTTP.
 func (s *Server) ShouldKeepHTTP(r *http.Request) bool {
-	httpOK := s.keepHTTP.Load()
-	if httpOK == nil {
+	st := s.manifest.Load()
+	if st == nil {
 		return false
 	}
+	httpOK := st.keepHTTP
 
 	host := requestHost(r)
 	if sub, _ := s.matchBaseDomain(host); sub != "" {
-		return (*httpOK)[sub]
+		return httpOK[sub]
 	}
 	path := strings.TrimPrefix(r.URL.Path, "/")
 	if seg, _, _ := strings.Cut(path, "/"); seg != "" {
-		return (*httpOK)[seg]
+		return httpOK[seg]
 	}
 	return false
 }

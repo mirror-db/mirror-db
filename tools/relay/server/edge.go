@@ -21,6 +21,13 @@ type edgeSelection struct {
 	cancel context.CancelFunc
 	gate   *netgate.Gate
 
+	// One transport per pool, built once: the engine's transports are stateless
+	// apart from their engine pointer, and keeping them stable makes the
+	// per-request choice observable (and testable) by identity.
+	latency http.RoundTripper
+	speed   http.RoundTripper
+	plain   http.RoundTripper // used when no engine is available
+
 	closeOnce sync.Once
 }
 
@@ -31,13 +38,15 @@ type edgeSelection struct {
 // reach its upstream slowly is still a working mirror, and refusing to start
 // would turn a measurement problem into an outage.
 func newEdgeSelection() (*edgeSelection, http.RoundTripper) {
+	e := &edgeSelection{plain: plainTransport()}
+
 	pr, err := probe.New(probe.Config{
 		LatencyURL: config.GetCfLatencyURL(),
 		SpeedURL:   config.GetCfSpeedURL(),
 	})
 	if err != nil {
 		log.Printf("edge selection disabled: %v", err)
-		return &edgeSelection{}, plainTransport()
+		return e, e.plain
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -48,7 +57,7 @@ func newEdgeSelection() (*edgeSelection, http.RoundTripper) {
 	if err != nil {
 		cancel()
 		log.Printf("edge selection disabled: %v", err)
-		return &edgeSelection{}, plainTransport()
+		return e, e.plain
 	}
 
 	initCtx, initCancel := context.WithTimeout(ctx, config.GetCfInitTimeout())
@@ -66,7 +75,11 @@ func newEdgeSelection() (*edgeSelection, http.RoundTripper) {
 
 	go eng.Start(ctx)
 
-	e := &edgeSelection{engine: eng, cancel: cancel, gate: gate}
+	e.engine = eng
+	e.cancel = cancel
+	e.gate = gate
+	e.latency = eng.LatencyTransport()
+	e.speed = eng.SpeedTransport()
 	return e, e.transport()
 }
 
@@ -100,17 +113,31 @@ func engineConfig() engine.Config {
 	return cfg
 }
 
-// transport returns the RoundTripper the proxy currently sends traffic through.
-//
-// Both pools are maintained regardless: routing is per-request (manifests and
-// metadata through the low-latency pool, large downloads through the high-speed
-// one), so a pool that is not the default still has to be warm when a request
-// asks for it.
+// transport returns the RoundTripper a latency request uses, for callers that
+// need "the default" without a request in hand.
 func (e *edgeSelection) transport() http.RoundTripper {
-	if e.engine == nil {
+	return e.transportFor(trafficLatency)
+}
+
+// transportFor picks the edge pool for one request.
+//
+// Traffic policy is a preference, not an availability requirement: an empty
+// speed pool falls back to latency rather than to an unoptimised route, and a
+// missing engine (disabled or failed to start) falls back to plain DNS.
+func (e *edgeSelection) transportFor(p trafficPolicy) http.RoundTripper {
+	if e == nil {
 		return plainTransport()
 	}
-	return e.engine.LatencyTransport()
+	if e.engine == nil || e.latency == nil {
+		if e.plain != nil {
+			return e.plain
+		}
+		return plainTransport()
+	}
+	if p == trafficSpeed && e.engine.SpeedPool().Len() > 0 {
+		return e.speed
+	}
+	return e.latency
 }
 
 // Close stops the maintenance loops and releases pooled connections.
@@ -133,9 +160,9 @@ func (e *edgeSelection) Snapshot() *edgeSnapshot {
 	}
 
 	snap := &edgeSnapshot{
-		// Literal: there is no configured single pool any more. When per-request
-		// routing lands this becomes a per-route answer.
-		Pool:     "latency",
+		// There is no single serving pool: the distributed policy list chooses
+		// per request, and an unavailable speed pool falls back to latency.
+		Pool:     "per-request",
 		TopN:     e.engine.Config().TopN,
 		Latency:  describePool(e.engine.LatencyPool()),
 		Speed:    describePool(e.engine.SpeedPool()),

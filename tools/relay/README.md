@@ -20,6 +20,7 @@ always resolve to the same directory.
 relay:
   # disguise_port: 344        # SSH-disguised TLS listener (bypasses HTTPS DPI)
   # secret_key: ""            # shared secret; auto-generated if omitted
+  # manifest_sync_interval: 10m  # positive; conditional HEAD with jitter
   base_domains:
     - domain: relay.example.com
       cf_api_token: ""        # CF API token for DNS-01
@@ -99,16 +100,19 @@ sudo ./relay install
 
 1. On startup, ranks Cloudflare edge IPs from this host (see [Edge selection](#edge-selection)).
    Failing to do so is not fatal — the relay still serves, unoptimised.
-2. Fetches mirror manifest from `GET <upstream>/api/mirrors`. A failure is not
-   fatal: the relay serves `502` until the first fetch succeeds, then refreshes
-   every ~10 min (jittered) and keeps serving the last good manifest on errors.
-3. Listens on :443 (HTTPS) + :80 (HTTP redirect/keepHTTP)
-4. Routes by Host header, replacing relay domain with upstream domain:
+2. Fetches mirror manifest and traffic policies from `GET <upstream>/api/mirrors`.
+   A failure is not fatal: the relay serves `502` until the first fetch succeeds.
+3. Rechecks every `relay.manifest_sync_interval` (default 10m, jittered) with a
+   conditional HEAD. Only a changed or missing ETag causes a GET; errors and
+   invalid updates keep the last good snapshot.
+4. Listens on :443 (HTTPS) + :80 (HTTP redirect/keepHTTP)
+5. Routes by Host header, replacing relay domain with upstream domain:
    - `<sub>.<relay-domain>` → proxies to `<sub>.<upstream-domain>` with same path
    - `<relay-domain>` → proxies to `<upstream-domain>` with same path
-5. Sets `X-MDB-Relay-Host` **only when the client did not already send one**, so
+6. Applies the first matching policy to the mirror-relative request path and
+   selects its latency or speed transport. Unmatched requests use latency.
+7. Sets `X-MDB-Relay-Host` **only when the client did not already send one**, so
    a multi-tier chain keeps the origin closest to the user.
-6. Refreshes mirror list every 10 minutes
 
 ### `X-MDB-Relay-Host`
 
@@ -126,8 +130,11 @@ domain only when the header is absent. Relay-originated requests
 
 Two pools, because the fastest IP differs by workload: **latency** (time to
 first byte — decides a manifest fetch) and **speed** (bytes/sec — decides a layer
-download). Both are maintained; requests currently go through the latency pool,
-and per-request routing (manifests versus downloads) is the next step.
+download). Both are maintained, and the distributed policy list selects one per
+request. OCI blobs, APT packages, and common archive/image/installer suffixes
+prefer speed; metadata and unmatched requests prefer latency. If speed is not
+available the request falls back to latency. Explicit `upstream.proxy` and SSH
+disguise configuration bypass edge selection and therefore ignore this preference.
 
 Each pool keeps the best N scored IPs, and a transport picks randomly among the
 top few. A failed request multiplies that IP's score, so a bad edge drifts out of

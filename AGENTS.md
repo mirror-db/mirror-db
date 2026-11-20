@@ -28,8 +28,11 @@ without redirect), `fetch(request)`, optional `status()`.
   `createRegistryHost`; mirrors needing logic (login, path rewrite, an index)
   live in their own subdir under `mirrors/`.
 - [server/api/index.ts](server/api/index.ts) — Hono app at `/api/`. Endpoints:
-  - `GET /api/mirrors` — JSON manifest of all mirrors (for relay discovery).
-    Includes `keepHTTP` flag for mirrors that allow plain HTTP.
+  - `GET|HEAD /api/mirrors` — JSON manifest of all mirrors plus ordered relay
+    policies. Mirrors include `keepHTTP` and opaque `policy_tags`; policies select
+    `latency` or `speed` transport by tag, mirror, or mount-relative path. Both
+    methods emit the same deterministic ETag and honour `If-None-Match`. See
+    [ADR 0009](docs/adr/0009-policy-driven-relay-transport.md).
   - `GET /api/status/:name` — per-mirror status snapshot.
 - [server/keys/index.ts](server/keys/index.ts) — Hono app at `/keys/` on the
   bare domain. Proxies common signing keys (PGP + SSH) so domestic clients fetch
@@ -518,6 +521,7 @@ YAML (`/etc/mirror-relay/config.yaml`) + env override (dots → underscores).
 ```yaml
 relay:
   # disguise_port: 344      # SSH-disguised TLS listener
+  # manifest_sync_interval: 10m  # conditional HEAD; positive, jittered
   base_domains:
     - domain: relay.example.com
       cf_api_token: ""
@@ -570,13 +574,35 @@ Selection priority: `proxy` > `disguise` > edge selection.
 The first two are explicit operator decisions and skip edge selection entirely —
 picking a Cloudflare IP would override their intent.
 
+### Policy sync and matching
+
+The initial manifest load is a GET. Later checks send HEAD with the saved strong
+ETag every `relay.manifest_sync_interval` (default 10m, jittered); only a changed
+or missing ETag causes another GET. Mirrors, compiled policies, routing maps and
+ETag are one atomic snapshot. Network errors, invalid JSON, duplicate policy
+names, invalid RE2 expressions and unknown traffic policies preserve the last
+known good snapshot.
+
+The first policy whose tag, exact mirror name and mount-relative path conditions
+all match wins; an empty match catches everything and an unmatched request is
+`latency`. Paths exclude the query and keep their case and escaping. For a path
+mount, `/debian/pool/x.deb` is matched as `/pool/x.deb`; for a subdomain mount,
+the path is unchanged. Generic artifact suffixes only apply after mirror
+resolution, never to API, keys, scripts, speedtest or relay control endpoints.
+
+Initial rules send OCI `blobs/`, APT `pool/`, and common archive, disk-image,
+installer and package suffixes to `speed`, followed by an explicit latency
+default. Bare `.gz` is deliberately absent so `Packages.gz` stays on latency.
+See [ADR 0009](docs/adr/0009-policy-driven-relay-transport.md).
+
 ### Edge selection — [tools/relay/server/edge.go](tools/relay/server/edge.go)
 
 Ranks Cloudflare anycast IPs from this host's vantage point and serves through
 the best ones. Two pools, because the winner differs by workload: **latency**
 (time to first byte; decides a manifest fetch) and **speed** (bytes/sec; decides
-a layer download). Both are maintained; requests currently go through the
-latency pool, and per-request routing is the next step.
+a layer download). The distributed policy list chooses a pool per request; an
+unavailable speed pool falls back to latency, while explicit proxy/disguise
+configuration bypasses both.
 
 Startup calls `engine.Initialize` under `cf.init_timeout`. **Failure is logged,
 not fatal:** the engine keeps running, patrol and recruit fill the pools in the
