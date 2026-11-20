@@ -47,6 +47,19 @@ describe("mirror manifest — policy tags", () => {
     }
   });
 
+  it("advertises Pigsty as a plain-HTTP path mount", () => {
+    const mirrored = buildMirrorManifest().mirrors.find(
+      (m) => m.name === "pigsty",
+    );
+
+    expect(mirrored).toEqual({
+      name: "pigsty",
+      path: "pigsty",
+      keepHTTP: true,
+      policy_tags: ["apt"],
+    });
+  });
+
   it("emits `policy_tags` as an array for every mirror", () => {
     const manifest = buildMirrorManifest();
     for (const mirror of manifest.mirrors) {

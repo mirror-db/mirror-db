@@ -1,4 +1,7 @@
+import type { Mirror } from "@server/types";
+
 import { createAptMirror, type AptMirrorConfig } from "./apt-mirror";
+import { pigsty } from "./pigsty";
 
 /**
  * All APT mirror definitions sourced from mirror-db.net/api/endpoints?tag=apt.
@@ -111,4 +114,10 @@ const aptConfigs: AptMirrorConfig[] = [
 ];
 
 /** All APT mirrors, instantiated from the config table above. */
-export const aptMirrors = aptConfigs.map(createAptMirror);
+export const aptMirrors: Mirror[] = [
+  ...aptConfigs.map(createAptMirror),
+  // Pigsty is not an `AptRepo`: one mount carries two independent repository
+  // roots (`infra/` and `pgsql/<codename>/`), so it is a path-preserving
+  // passthrough. See ./pigsty.
+  pigsty,
+];

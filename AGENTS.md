@@ -283,6 +283,33 @@ the APT mirror but reusable for any directory-listing upstream.
 - **`webdav.ts`** — hand-crafted RFC 4918 class 1 responses (no XML library
   needed). `propfindResponse`, `optionsResponse`, `methodNotAllowed`.
 
+## Pigsty APT mirror — [server/mirrors/pigsty/](server/mirrors/pigsty/)
+
+`/pigsty/` passes through `https://repo.pigsty.io/apt/`. The `.io` origin is on
+Cloudflare and answers quickly from global PoPs; `.cc` is optimised for mainland
+clients but slow outside China, which does not help a Worker fetching from a CF
+edge. Both serve the same bytes.
+
+The upstream has two repository layouts below one tree:
+
+- `infra/dists/generic` + `infra/pool/main` — suite `generic`;
+- `pgsql/<codename>/dists/<codename>` + `pgsql/<codename>/pool/main` — each
+  codename is its own repository root.
+
+That second layout does not fit `AptRepo`'s single `base/dists/<suite>` model, so
+this is an `upstreamProxy` passthrough rather than `createAptMirror`. It still
+carries the `apt` policy tag and `keepHTTP`, and Range passes through. Upstream
+has no directory listings or by-hash indexes and advertises `Cache-Control:
+no-store` on every object, so the read-through cache deliberately stores nothing.
+
+`/keys/apt/pigsty` serves `https://repo.pigsty.io/key` (fingerprint
+`9592A7BC7A682E7333376E09E7935D8DB9BD8B20`), which signs both layouts.
+
+```bash
+deb [signed-by=/etc/apt/keyrings/pigsty.gpg] https://mirs.uk/pigsty/infra generic main
+deb [signed-by=/etc/apt/keyrings/pigsty.gpg] https://mirs.uk/pigsty/pgsql/bookworm bookworm main
+```
+
 ## Snapshot mirror — [server/mirrors/debian-snapshot/](server/mirrors/debian-snapshot/)
 
 Read-through access to `snapshot.debian.org` at `/debian-snapshot/`. The upstream

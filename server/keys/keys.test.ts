@@ -48,6 +48,10 @@ describe("repo2KeyUrl", () => {
     expect(repo2KeyUrl("hashicorp")).toBe("https://apt.releases.hashicorp.com/gpg");
   });
 
+  it("serves the Pigsty key, which signs both its repo layouts", () => {
+    expect(repo2KeyUrl("pigsty")).toBe("https://repo.pigsty.io/key");
+  });
+
   it("throws on unknown repo", () => {
     expect(() => repo2KeyUrl("does-not-exist")).toThrow();
   });

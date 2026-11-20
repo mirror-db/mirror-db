@@ -57,6 +57,9 @@ const WellKnownAptKeyUrl: Record<string, string | string[]> = {
   "gitlab-runner-deb": GitLabKeys,
   gitlab: GitLabKeys,
   hashicorp: "https://apt.releases.hashicorp.com/gpg",
+  // One certificate signs both the `infra` repo and every `pgsql/<codename>`
+  // repo, so the same key serves either `Signed-By:`.
+  pigsty: "https://repo.pigsty.io/key",
 
   // Keys for repositories this project does not mirror (kept for callers that
   // already rely on them).
