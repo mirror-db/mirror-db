@@ -1,7 +1,6 @@
 import type { Mirror } from "@server/types";
 
 import { createAptMirror, type AptMirrorConfig } from "./apt-mirror";
-import { pigsty } from "./pigsty";
 
 /**
  * All APT mirror definitions sourced from mirror-db.net/api/endpoints?tag=apt.
@@ -19,6 +18,9 @@ const aptConfigs: AptMirrorConfig[] = [
       "testing",
       "unstable",
       "sid",
+      "forky",
+      // `forky` is the current testing release: it has no `-updates` or
+      // `-backports` suite while it is still testing.
       "trixie",
       "trixie-updates",
       "trixie-backports",
@@ -35,12 +37,20 @@ const aptConfigs: AptMirrorConfig[] = [
   {
     name: "debian-security",
     base: "https://security.debian.org/debian-security/",
-    suites: ["trixie-security", "bookworm-security"],
+    suites: ["forky-security", "trixie-security", "bookworm-security"],
   },
   {
     name: "ubuntu",
     base: "http://archive.ubuntu.com/ubuntu/",
     suites: [
+      "stonking",
+      "stonking-updates",
+      "stonking-backports",
+      "stonking-security",
+      "resolute",
+      "resolute-updates",
+      "resolute-backports",
+      "resolute-security",
       "plucky",
       "plucky-updates",
       "plucky-backports",
@@ -59,6 +69,14 @@ const aptConfigs: AptMirrorConfig[] = [
     name: "ubuntu-ports",
     base: "http://ports.ubuntu.com/ubuntu-ports/",
     suites: [
+      "stonking",
+      "stonking-updates",
+      "stonking-backports",
+      "stonking-security",
+      "resolute",
+      "resolute-updates",
+      "resolute-backports",
+      "resolute-security",
       "plucky",
       "plucky-updates",
       "plucky-backports",
@@ -94,7 +112,7 @@ const aptConfigs: AptMirrorConfig[] = [
     // through unjudged.
     name: "hashicorp",
     base: "https://apt.releases.hashicorp.com/",
-    suites: ["trixie", "bookworm", "noble", "jammy", "focal"],
+    suites: ["trixie", "bookworm", "noble", "jammy", "focal", "resolute"],
   },
   {
     name: "opentofu",
@@ -109,15 +127,9 @@ const aptConfigs: AptMirrorConfig[] = [
   {
     name: "gitlab-runner-deb",
     base: "https://packages.gitlab.com/runner/gitlab-runner/debian/",
-    suites: ["bookworm", "trixie"],
+    suites: ["bookworm", "trixie", "forky"],
   },
 ];
 
 /** All APT mirrors, instantiated from the config table above. */
-export const aptMirrors: Mirror[] = [
-  ...aptConfigs.map(createAptMirror),
-  // Pigsty is not an `AptRepo`: one mount carries two independent repository
-  // roots (`infra/` and `pgsql/<codename>/`), so it is a path-preserving
-  // passthrough. See ./pigsty.
-  pigsty,
-];
+export const aptMirrors: Mirror[] = aptConfigs.map(createAptMirror);

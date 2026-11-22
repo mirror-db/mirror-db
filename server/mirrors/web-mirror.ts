@@ -23,6 +23,14 @@ export interface WebMirrorConfig {
    * `(path) => factories[]` for per-path selection. Omit to use all known parsers.
    */
   parsers?: WebListParserFactory[] | ((path: string) => WebListParserFactory[]);
+  /** Allow plain HTTP without redirecting to HTTPS (e.g. an APT tree). */
+  keepHTTP?: boolean;
+  /**
+   * Opaque tags selecting relay policies. Not a mirror-kind taxonomy — they
+   * only group mirrors for transport selection, so a file tree that serves an
+   * APT repository carries `apt` like `createAptMirror` would.
+   */
+  policyTags?: string[];
 }
 
 /**
@@ -42,6 +50,8 @@ export function createWebListMirror(config: WebMirrorConfig): Mirror {
   return {
     name: config.name,
     path: config.name,
+    ...(config.keepHTTP && { keepHTTP: true }),
+    ...(config.policyTags && { policyTags: config.policyTags }),
     fetch(request) {
       const url = new URL(request.url);
       const rel = url.pathname.slice(prefix.length);
@@ -62,6 +72,8 @@ export function createPassthroughMirror(config: WebMirrorConfig): Mirror {
   return {
     name: config.name,
     path: config.name,
+    ...(config.keepHTTP && { keepHTTP: true }),
+    ...(config.policyTags && { policyTags: config.policyTags }),
     fetch: (request) => proxy.apply(request),
   };
 }
