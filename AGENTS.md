@@ -588,6 +588,17 @@ cf:                          # edge selection; every key is optional
   # snapshot_interval: 1h    # also written on shutdown
   # bootstrap_host: ""       # default: hostname of upstream.url
 
+cache:                       # content store; disabled while dir is empty
+  # dir: /var/cache/mirror-relay  # CACHE_DIR; enables the store, holds .tmp + index
+  # capacity: 128GiB       # CACHE_CAPACITY; space the store may use, required
+  # max_size: 12GiB        # CACHE_MAX_SIZE; LRU budget + per-body cap,
+  #                        # default 10% of capacity
+  # s3:                    # optional shared RustFS bucket; bodies leave local disk
+  #   bucket: mirror-cache       # S3_BUCKET
+  #   endpoint: https://rustfs.internal:9000  # S3_ENDPOINT (required with bucket)
+  #   prefix: relay              # S3_PREFIX
+  #   region: us-east-1          # S3_REGION
+
 acme:
   source: acme               # "acme" | "upstream" | URL origin
 ```
@@ -596,6 +607,10 @@ acme:
 - `acme` — DNS-01 via Let's Encrypt (needs `cf_api_token` per domain).
 - `upstream` — sync cert-pack from `upstream.url`.
 - URL (e.g. `https://upper.example.com`) — sync cert-pack from that origin.
+
+Cache keys have their own env names, unlike the dotted-key default:
+`CACHE_DIR`, `CACHE_CAPACITY`, `CACHE_MAX_SIZE`, `S3_BUCKET`, `S3_ENDPOINT`,
+`S3_PREFIX`, `S3_REGION`.
 
 ### Upstream transport
 
@@ -708,6 +723,77 @@ arrive, transfer runs untimed.
 `GET /speedtest/{mb}?passthrough=n` — when `passthrough > 0`, proxies to upstream
 with `passthrough - 1`; when 0 or absent, serves random bytes locally.
 
+### Hash content store — [tools/relay/hashstore/](tools/relay/hashstore/)
+
+`CACHE_DIR` is both the on/off switch and the local working directory: `.tmp/`
+for bodies still being written, `.index.db` (bbolt) for sizes, SHA-1 aliases and
+LRU order, and — without S3 — `data/<ab>/<cd>/<sha256>` for the bodies
+themselves. There is no separate TMP_DIR.
+
+- One body is stored once under its real SHA-256 and read through either digest;
+  SHA-1 is an unweighted alias in the same index record.
+- `CACHE_MAX_SIZE` is the LRU budget and the largest single body: a strict byte
+  LRU over logical body bytes (`google/go-lru`, runtime-pressure eviction
+  disabled by a constant-zero pressure func). `CACHE_CAPACITY` is the space the
+  store may use and is required when the store is enabled; the budget defaults to
+  10% of it, and a body above the budget is skipped without evicting anything.
+- `S3_BUCKET` moves bodies to RustFS (AWS SDK for Go v2, path-style, checksums
+  only when required); the local disk then keeps only `.tmp` and `.index.db`.
+  The bucket holds `blobs/sha256/<ab>/<cd>/<sha256>` plus two tiny pointer
+  objects (`aliases/sha1/<ab>/<cd>/<sha1>` → SHA-256,
+  `aliases/sha256/<ab>/<cd>/<sha256>` → SHA-1) so any relay can resolve either
+  address. Every object is sharded by its first two and next two hex chars, the
+  same as the local layout. Pointers never count toward capacity.
+- Shared storage is opportunistic: each instance keeps its own LRU and may delete
+  any object, so losing that race is a MISS (`ErrNotFound`). Only a definite
+  absence maps to a MISS — S3 `NoSuchKey`/`NotFound` and local `ENOENT`; a
+  permission, timeout or I/O error is preserved, keeps the index entry, and
+  surfaces as 502. Objects another instance wrote are adopted into the local index
+  after a successful read. The bucket is never LISTed; each index entry is verified
+  on read (local: open, S3: the GET/HEAD itself).
+- Local startup reconciles in the background: an index entry without a file is
+  dropped, a file without an index entry is removed. A failed eviction delete is
+  written to the index as pending and retried by the same pass.
+- Public read-only endpoints, registered only when the store is enabled and
+  independent of the manifest snapshot: `GET|HEAD /hash-content/sha1/<40 hex>`
+  and `GET|HEAD /hash-content/sha256/<64 hex>`. Bad address → 400, absent → 404,
+  storage error → 502, other methods → 405. Bodies stream, so a body may be
+  evicted mid-transfer.
+- `relay prune` is the offline cleanup (see below), not part of serving. M1 stops
+  at storage and reads: the reverse-proxy MISS write path, prefetch, telemetry and
+  policy are later milestones. `CACHE_DIR` must be writable by the service user;
+  the unit's `ReadWritePaths` covers `/var/cache/mirror-relay`, so a custom
+  directory needs a unit change.
+
+### `relay prune` — [tools/relay/prune.go](tools/relay/prune.go)
+
+Offline command: it loads only the `CACHE_*`/`S3_*` configuration, opens
+`CACHE_DIR` with `hashstore.OpenOffline` (no startup reconcile, so the scan sees
+the raw state) and runs `Store.Prune`. No server, edge engine, certificates or
+manifest watcher is built. The bbolt lock refuses a second instance on the same
+directory while the relay runs. A disabled cache (empty `CACHE_DIR`) is a clear
+non-zero error.
+
+`Store.Prune` completes queued (`pending`) deletes, then repairs the index for
+**every** backend: each body record is checked with `backend.stat` (local `stat`,
+S3 HEAD) and dropped — LRU, object record and its alias — only on a definite
+absence (`stale`); a transient or permission error keeps the row and counts as
+`failed` (fail-closed, never fail open). Dangling alias rows whose primary record
+is missing are then removed in one bbolt transaction (also `stale`). Only after
+that does it list the backend and delete every body and digest pointer the index
+does not contain, so pointers of an already-vanished body go in the same pass.
+Shared storage is paged with `ListObjectsV2` under the configured prefix — the
+**only** listing in the store; normal reads and the startup reconcile still never
+list. Unknown keys and other prefixes are counted as `skipped`/never touched. It
+never adopts objects, recomputes digests or reads body contents. Failures are
+counted, the pass keeps going, and the command exits non-zero with
+`scanned/kept/deleted/pending/stale/skipped/failed` printed to stdout.
+
+**Destructive by design on a shared bucket:** objects written by other relays,
+including online ones, are deleted if this index lacks them. Only run it on a
+bucket no peer depends on, or when dropping everyone's cache is intended. The
+content is still fetchable upstream.
+
 ### Key files
 
 - `tools/relay/server/server.go` — Server, routers, `httputil.ReverseProxy`
@@ -728,6 +814,14 @@ with `passthrough - 1`; when 0 or absent, serves random bytes locally.
 - `tools/relay/server/disguise.go` — SSH banner exchange
   (`ClientBannerExchange` is exported for `forward`).
 - `tools/relay/server/speedtest.go` — `/speedtest/{mb}` handler with passthrough.
+- `tools/relay/server/hashcontent.go` — `/hash-content/{sha1|sha256}/<hex>`
+  read-only handler (400/404/405 matrix), registered before the proxy catch-all.
+- `tools/relay/prune.go` — `relay prune` cobra command: offline cache cleanup,
+  prints counts to stdout, non-zero on any failure.
+- `tools/relay/hashstore/` — content store: `store.go` (Put/Get/Stat/Delete,
+  capacity + LRU + reconcile), `index.go` (bbolt: sizes, aliases, LRU order,
+  pending deletes), `backend.go` (local bodies), `s3.go` (RustFS bodies +
+  digest pointers).
 - `tools/relay/certclient/` — read-only `certmagic.Storage` that snapshots the
   parent's cert-pack hourly. Mutations return `ErrReadOnly`.
 - `tools/relay/certsrv/` — streams the cert-pack tar; skips lock files.
@@ -751,10 +845,16 @@ usual hardening (`ProtectHome`, `ProtectKernelTunables`, `RestrictNamespaces`,
 `go test -race ./...` in `tools/relay` — covers proxy rewrites (raw path,
 hop-by-hop/`Connection` tokens, `X-MDB-Relay-Host` passthrough, upgrade,
 base path), host matching, `keepHTTP`, cert-name→token mapping, cert-pack
-tar streaming/untar, guard accept/reject matrix, config precedence, and the
-`forward` half-close regression. CI runs vet + test before building.
+tar streaming/untar, guard accept/reject matrix, config precedence, the
+`forward` half-close regression, and the hash store (dual digests, strict LRU,
+oversized bodies, restart/alias recovery, local reconcile, shared S3 via a fake
+object store, pending-delete retry, `/hash-content` 400/404/405 routing, sharded
+bucket keys, and offline prune (paged LIST, only-unindexed deletion, foreign key
+and other-prefix safety, failure counting). CI runs vet + test before building.
 
 ### Build
+
+Go 1.26+ (`google/go-lru` requires it).
 
 ```bash
 cd tools/relay && go build -o relay

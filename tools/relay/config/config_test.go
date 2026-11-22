@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -129,5 +130,155 @@ func TestSecretKeyFilePermissions(t *testing.T) {
 	// Second call reads the same file rather than regenerating.
 	if string(ensureSecretKeyFile()) != string(key) {
 		t.Fatal("secret key is not stable across calls")
+	}
+}
+
+// freshCacheViper mirrors the global viper's cache bindings without mutating it,
+// so these tests can set keys and env vars without leaking into each other.
+func freshCacheViper() *viper.Viper {
+	v := viper.New()
+	bindHashStoreEnv(v)
+	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+	v.AutomaticEnv()
+	return v
+}
+
+func TestHashStoreConfigDisabledWithoutCacheDir(t *testing.T) {
+	v := freshCacheViper()
+	v.Set("cache.dir", "")
+	cfg, err := hashStoreConfigFrom(v)
+	if err != nil || cfg != nil {
+		t.Fatalf("got (%v,%v), want nil config and no error", cfg, err)
+	}
+}
+
+func TestHashStoreConfigRequiresCapacity(t *testing.T) {
+	v := freshCacheViper()
+	v.Set("cache.dir", t.TempDir())
+	if _, err := hashStoreConfigFrom(v); err == nil {
+		t.Fatal("CACHE_DIR without CACHE_CAPACITY must fail")
+	}
+}
+
+func TestHashStoreConfigDefaultMaxSizeIsTenPercent(t *testing.T) {
+	v := freshCacheViper()
+	v.Set("cache.dir", t.TempDir())
+	v.Set("cache.capacity", "1GiB")
+
+	cfg, err := hashStoreConfigFrom(v)
+	if err != nil {
+		t.Fatalf("config: %v", err)
+	}
+	if cfg.Capacity != 1<<30 {
+		t.Errorf("capacity = %d, want %d", cfg.Capacity, 1<<30)
+	}
+	if want := int64(1<<30) / 10; cfg.MaxSize != want {
+		t.Errorf("max size = %d, want 10%% of capacity (%d)", cfg.MaxSize, want)
+	}
+}
+
+func TestHashStoreConfigSizeValidation(t *testing.T) {
+	cases := []struct {
+		name     string
+		capacity string
+		maxSize  string
+		wantErr  bool
+	}{
+		{"explicit max size below capacity", "128GiB", "64MiB", false},
+		{"max size equals capacity", "1MiB", "1MiB", false},
+		{"invalid capacity unit", "12XB", "", true},
+		{"zero capacity", "0", "", true},
+		{"negative capacity", "-1GiB", "", true},
+		{"max size above capacity", "1MiB", "2MiB", true},
+		{"invalid max size", "1MiB", "lots", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			v := freshCacheViper()
+			v.Set("cache.dir", t.TempDir())
+			v.Set("cache.capacity", tc.capacity)
+			if tc.maxSize != "" {
+				v.Set("cache.max_size", tc.maxSize)
+			}
+			_, err := hashStoreConfigFrom(v)
+			if tc.wantErr && err == nil {
+				t.Fatal("expected an error")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+// The S3_* env names are the contract; CACHE_* comes from the dotted-key mapping.
+func TestHashStoreConfigS3EnvAndDefaults(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CACHE_DIR", dir)
+	t.Setenv("CACHE_CAPACITY", "128GiB")
+	t.Setenv("S3_BUCKET", "env-bucket")
+	t.Setenv("S3_ENDPOINT", "https://rustfs.example:9000/")
+	t.Setenv("S3_PREFIX", "/mirror/")
+	t.Setenv("S3_REGION", "")
+
+	cfg, err := hashStoreConfigFrom(freshCacheViper())
+	if err != nil {
+		t.Fatalf("config: %v", err)
+	}
+	if cfg.Dir != dir {
+		t.Errorf("dir = %q, want %q", cfg.Dir, dir)
+	}
+	if cfg.S3 == nil {
+		t.Fatal("S3 section not built")
+	}
+	if cfg.S3.Bucket != "env-bucket" {
+		t.Errorf("bucket = %q", cfg.S3.Bucket)
+	}
+	if cfg.S3.Endpoint != "https://rustfs.example:9000" {
+		t.Errorf("endpoint = %q", cfg.S3.Endpoint)
+	}
+	if cfg.S3.Prefix != "mirror" {
+		t.Errorf("prefix = %q", cfg.S3.Prefix)
+	}
+	if cfg.S3.Region != "us-east-1" {
+		t.Errorf("region = %q, want the us-east-1 default", cfg.S3.Region)
+	}
+}
+
+func TestHashStoreConfigS3NeedsEndpoint(t *testing.T) {
+	v := freshCacheViper()
+	v.Set("cache.dir", t.TempDir())
+	v.Set("cache.capacity", "1GiB")
+	v.Set("cache.s3.bucket", "bucket")
+	v.Set("cache.s3.endpoint", "")
+	if _, err := hashStoreConfigFrom(v); err == nil {
+		t.Fatal("S3 bucket without an endpoint must fail")
+	}
+}
+
+// The S3 prefix is cleaned once, at startup, so writes (path.Join) and prune's
+// ListObjectsV2 prefix always refer to the same place.
+func TestHashStoreConfigS3PrefixIsCleaned(t *testing.T) {
+	v := freshCacheViper()
+	v.Set("cache.dir", t.TempDir())
+	v.Set("cache.capacity", "1GiB")
+	v.Set("cache.s3.bucket", "bucket")
+	v.Set("cache.s3.endpoint", "https://rustfs:9000")
+
+	for raw, want := range map[string]string{
+		"/relay//x/": "relay/x",
+		"relay/":     "relay",
+		"a/../b":     "b",
+		"/":          "",
+		"":           "",
+	} {
+		v.Set("cache.s3.prefix", raw)
+		cfg, err := hashStoreConfigFrom(v)
+		if err != nil {
+			t.Fatalf("prefix %q: %v", raw, err)
+		}
+		if cfg.S3.Prefix != want {
+			t.Errorf("prefix %q -> %q, want %q", raw, cfg.S3.Prefix, want)
+		}
 	}
 }

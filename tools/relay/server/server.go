@@ -19,6 +19,7 @@ import (
 	"github.com/mirror-db/mirror-db/tools/relay/certsrv"
 	"github.com/mirror-db/mirror-db/tools/relay/config"
 	"github.com/mirror-db/mirror-db/tools/relay/guard"
+	"github.com/mirror-db/mirror-db/tools/relay/hashstore"
 	"golang.org/x/net/proxy"
 )
 
@@ -43,6 +44,10 @@ type Server struct {
 	HTTPRouter *mux.Router // HTTP (keepHTTP + redirect)
 
 	edge *edgeSelection
+
+	// hashStore is nil when CACHE_DIR is unset: the public hash-content routes
+	// are then not registered at all.
+	hashStore *hashstore.Store
 
 	// manifest is the single snapshot a request reads: mirrors, compiled
 	// policies, keepHTTP and the ETag they were loaded with. One pointer keeps
@@ -118,6 +123,25 @@ func NewServer() (*Server, error) {
 		return nil, fmt.Errorf("no relay.base_domains configured")
 	}
 
+	// A configured CACHE_DIR opens the content store before the routers are
+	// built, so /hash-content is registered from the first request and a bad
+	// capacity/S3 setting is a startup error.
+	if cacheCfg, err := config.GetHashStoreConfig(); err != nil {
+		return nil, err
+	} else if cacheCfg != nil {
+		store, err := hashstore.Open(*cacheCfg)
+		if err != nil {
+			return nil, fmt.Errorf("hash content store: %w", err)
+		}
+		s.hashStore = store
+		kind := "local"
+		if cacheCfg.S3 != nil {
+			kind = "s3"
+		}
+		log.Printf("hash content store: dir=%s backend=%s capacity=%d max_size=%d",
+			cacheCfg.Dir, kind, cacheCfg.Capacity, cacheCfg.MaxSize)
+	}
+
 	s.proxy = s.newReverseProxy()
 
 	s.buildRouters()
@@ -146,6 +170,14 @@ func (s *Server) buildRouters() {
 
 	// Speedtest endpoint
 	router.HandleFunc("/speedtest/{mb}", s.handleSpeedtest)
+
+	// Public, read-only content addresses. Registered before the catch-all so a
+	// hit never reaches the upstream, and independent of the manifest: cached
+	// content is addressable even while every proxy route answers 502.
+	if s.hashStore != nil {
+		router.HandleFunc(strings.TrimSuffix(hashContentPrefix, "/"), s.handleHashContent)
+		router.PathPrefix(hashContentPrefix).HandlerFunc(s.handleHashContent)
+	}
 
 	// All other requests → proxy
 	router.PathPrefix("/").HandlerFunc(s.handleRequest)
@@ -314,6 +346,11 @@ func (s *Server) handlePool(w http.ResponseWriter, r *http.Request) {
 func (s *Server) Close() {
 	if s.edge != nil {
 		s.edge.Close()
+	}
+	if s.hashStore != nil {
+		if err := s.hashStore.Close(); err != nil {
+			log.Printf("hash content store close: %v", err)
+		}
 	}
 }
 

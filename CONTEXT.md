@@ -115,6 +115,13 @@ tarball URLs, Helm index chart URLs, APT directory redirects, install-script
 endpoints). Every absolute reference must be built from the relay host, or the
 client leaves the relay on the next request.
 
+### Hash object
+
+An immutable body addressed by its real SHA-1 and SHA-256 digests. Both digests
+identify the same stored body, which exists once and is not scoped to a mirror.
+A relay may lose or evict the object at any time; callers treat that as a cache
+miss, never as proof that the upstream content disappeared.
+
 ### Cache key
 
 What a stored upstream response is filed under. Two kinds:

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	_ "github.com/joho/godotenv/autoload"
+	"github.com/mirror-db/mirror-db/tools/relay/hashstore"
 	"github.com/spf13/viper"
 )
 
@@ -49,6 +50,8 @@ func init() {
 	// through viper — config read from one dir, key + certs written to another.
 	mustBind("relay.config_dir", "RELAY_CONFIG_DIR")
 	mustBind("relay.base_domains", "RELAY_BASE_DOMAINS")
+
+	bindHashStoreEnv(viper.GetViper())
 
 	// Config file
 	viper.SetConfigName("config")
@@ -89,6 +92,81 @@ func GetAcmeSource() string        { return viper.GetString("acme.source") }
 func GetAcmeEmail() string         { return viper.GetString("acme.email") }
 func GetAcmeCA() string            { return viper.GetString("acme.ca") }
 func GetAcmeAgree() bool           { return viper.GetBool("acme.agree") }
+
+// --- Hash content store ---
+
+// bindHashStoreEnv maps the cache keys onto the env names operators and the
+// RustFS/AWS documentation already use. CACHE_DIR, CACHE_CAPACITY and
+// CACHE_MAX_SIZE need no explicit binding: dots → underscores already match.
+// S3_BUCKET is not CACHE_S3_BUCKET, so those four are bound by name.
+func bindHashStoreEnv(v *viper.Viper) {
+	for key, env := range map[string]string{
+		"cache.s3.bucket":   "S3_BUCKET",
+		"cache.s3.endpoint": "S3_ENDPOINT",
+		"cache.s3.prefix":   "S3_PREFIX",
+		"cache.s3.region":   "S3_REGION",
+	} {
+		if err := v.BindEnv(key, env); err != nil {
+			log.Fatalf("failed to bind %s to %s: %v", key, env, err)
+		}
+	}
+	v.SetDefault("cache.s3.region", "us-east-1")
+}
+
+// GetHashStoreConfig builds the content-store configuration and validates it, so
+// a bad capacity or S3 endpoint fails at startup rather than at the first MISS.
+// A nil result means the store is disabled: CACHE_DIR is the on/off switch.
+func GetHashStoreConfig() (*hashstore.Config, error) {
+	return hashStoreConfigFrom(viper.GetViper())
+}
+
+func hashStoreConfigFrom(v *viper.Viper) (*hashstore.Config, error) {
+	dir := strings.TrimSpace(v.GetString("cache.dir"))
+	if dir == "" {
+		return nil, nil
+	}
+
+	capacityRaw := strings.TrimSpace(v.GetString("cache.capacity"))
+	if capacityRaw == "" {
+		return nil, errors.New("CACHE_CAPACITY is required when CACHE_DIR is set")
+	}
+	capacity, err := hashstore.ParseByteSize(capacityRaw)
+	if err != nil {
+		return nil, fmt.Errorf("CACHE_CAPACITY %q: %w", capacityRaw, err)
+	}
+
+	cfg := &hashstore.Config{Dir: dir, Capacity: capacity}
+	if maxRaw := strings.TrimSpace(v.GetString("cache.max_size")); maxRaw != "" {
+		maxSize, err := hashstore.ParseByteSize(maxRaw)
+		if err != nil {
+			return nil, fmt.Errorf("CACHE_MAX_SIZE %q: %w", maxRaw, err)
+		}
+		if maxSize > capacity {
+			return nil, fmt.Errorf("CACHE_MAX_SIZE %q exceeds CACHE_CAPACITY %q", maxRaw, capacityRaw)
+		}
+		cfg.MaxSize = maxSize
+	}
+
+	bucket := strings.TrimSpace(v.GetString("cache.s3.bucket"))
+	if bucket != "" {
+		endpoint := strings.TrimRight(strings.TrimSpace(v.GetString("cache.s3.endpoint")), "/")
+		if endpoint == "" {
+			return nil, errors.New("S3_ENDPOINT is required when S3_BUCKET is set")
+		}
+		cfg.S3 = &hashstore.S3Config{
+			Bucket:   bucket,
+			Endpoint: endpoint,
+			Prefix:   strings.TrimSpace(v.GetString("cache.s3.prefix")),
+			Region:   strings.TrimSpace(v.GetString("cache.s3.region")),
+		}
+	}
+
+	// Fill CACHE_MAX_SIZE's default (10% of capacity) and validate the rest.
+	if err := cfg.Normalize(); err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
 
 // DefaultManifestSyncInterval is the manifest refresh cadence when unset.
 const DefaultManifestSyncInterval = 10 * time.Minute

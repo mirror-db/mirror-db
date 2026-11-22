@@ -6,6 +6,8 @@ Uses Cloudflare fastest-node discovery to optimize edge routing.
 
 ## Build
 
+Go 1.26 or newer (the content store uses `google/go-lru`, which requires it).
+
 ```bash
 go build -o relay
 ```
@@ -51,6 +53,17 @@ cf:                          # edge selection; every key is optional
   # snapshot_interval: 1h    # also written on shutdown
   # bootstrap_host: ""       # default: hostname of upstream.url
 
+cache:                       # content store; disabled while dir is empty
+  # dir: /var/cache/mirror-relay  # CACHE_DIR; enables the store + local work dir
+  # capacity: 128GiB       # CACHE_CAPACITY; space the store may use, required
+  # max_size: 12GiB        # CACHE_MAX_SIZE; LRU budget + per-body cap,
+  #                        # default 10% of capacity
+  # s3:                    # optional shared RustFS bucket; bodies live there
+  #   bucket: mirror-cache       # S3_BUCKET
+  #   endpoint: https://rustfs.internal:9000  # S3_ENDPOINT (required with bucket)
+  #   prefix: relay              # S3_PREFIX
+  #   region: us-east-1          # S3_REGION
+
 acme:
   source: acme                # "acme" = DNS-01; "upstream" = sync from upstream.url; or a URL origin
   email: acme@mirror-db.net
@@ -60,11 +73,13 @@ acme:
 
 All keys can be overridden via env: `RELAY_POOL_SIZE=30`, `UPSTREAM_URL=...`,
 `UPSTREAM_DISGUISE_PORT=344`, etc. (dots → underscores, uppercased).
-Two have explicit names:
+Some have explicit names:
 
 - `RELAY_CONFIG_DIR` — config/key/cert directory (see above).
 - `RELAY_BASE_DOMAINS` — JSON array, replaces the yaml list entirely:
   `RELAY_BASE_DOMAINS='[{"domain":"r.example.com","cf_api_token":"tok"}]'`
+- `CACHE_DIR`, `CACHE_CAPACITY`, `CACHE_MAX_SIZE`, `S3_BUCKET`, `S3_ENDPOINT`,
+  `S3_PREFIX`, `S3_REGION` — content store (see [Hash content store](#hash-content-store)).
 
 ### `acme.source`
 
@@ -256,6 +271,126 @@ DPI sees SSH → no throttle. Enable with:
 
 `GET /speedtest/<mb>` returns `<mb>` megabytes of random data (max 1024 MB).
 Use for bandwidth testing through the relay.
+
+## Hash content store
+
+An optional, content-addressed body store. `CACHE_DIR` is the switch: empty
+(default) means no store and no `/hash-content` route; set it and the relay
+starts caching bodies and publishing their digests.
+
+Config (env names in parentheses):
+
+| key | meaning |
+|---|---|
+| `cache.dir` (`CACHE_DIR`) | local working directory; enables the store |
+| `cache.capacity` (`CACHE_CAPACITY`) | disk space the store may use, e.g. `128GiB`; required |
+| `cache.max_size` (`CACHE_MAX_SIZE`) | LRU budget, and the largest body kept; default 10% of capacity |
+| `cache.s3.bucket` (`S3_BUCKET`) | use a shared RustFS bucket instead of local bodies |
+| `cache.s3.endpoint` (`S3_ENDPOINT`) | RustFS endpoint; required with a bucket |
+| `cache.s3.prefix` (`S3_PREFIX`) | key prefix inside the bucket |
+| `cache.s3.region` (`S3_REGION`) | default `us-east-1` |
+
+Byte sizes accept binary units (`256MiB`, `128GiB`, plain bytes). Credentials
+come from the standard AWS environment variables / SDK credential chain; nothing
+else is configured here.
+
+Layout:
+
+- `<CACHE_DIR>/.tmp/` — bodies being written. Always local.
+- `<CACHE_DIR>/.index.db` — bbolt index: sizes, SHA-1 aliases, LRU order and any
+  delete still waiting to be retried. Always local.
+- `<CACHE_DIR>/data/<ab>/<cd>/<sha256>` — bodies, when no bucket is configured.
+- In the bucket: `blobs/sha256/<ab>/<cd>/<sha256>`, plus two tiny pointer objects
+  `aliases/sha1/<ab>/<cd>/<sha1>` and `aliases/sha256/<ab>/<cd>/<sha256>` so a
+  peer relay can resolve either digest. Every object is sharded by the first two
+  hex chars and the next two, exactly like the local layout. Pointers are not
+  counted against capacity.
+
+Behaviour:
+
+- A body is stored once, keyed by its real SHA-256, and is readable through
+  either digest. SHA-1 is an alias, not a second copy.
+- `cache.max_size` is both the total cache budget (strict byte LRU over logical
+  body bytes) and the largest single body. It defaults to 10% of the available
+  capacity; a larger body is skipped and never evicts anything.
+- A shared bucket is opportunistic reuse only: every relay keeps its own LRU and
+  may delete any object, so a body another relay already dropped is a cache MISS
+  (fall back upstream), not an error. A transient or permission error (denied,
+  timeout) is not a MISS and leaves the index entry alone. Objects written by
+  another relay are adopted into this relay's index after a successful read.
+- On startup a local store reconciles in the background: index entries whose
+  file vanished are dropped, files without an index entry are removed. A delete
+  that fails is queued in the index and retried.
+- The store is enabled for reads only in this milestone: the proxy does not
+  write into it yet (later milestone).
+
+### `/hash-content/<algo>/<digest>`
+
+Every relay serves the cached bodies publicly, read-only:
+
+```bash
+curl -O https://relay.example.com/hash-content/sha256/<64 hex>
+curl -I https://relay.example.com/hash-content/sha1/<40 hex>
+```
+
+`GET` and `HEAD` only. A malformed algorithm or hex length is `400`, an absent
+body is `404`, a storage error that is not a definite absence is `502`, and any
+other method is `405`. Responses stream, so a body may be evicted by another
+relay while it is being transferred. The route is registered before the proxy
+catch-all and does not depend on the upstream manifest.
+
+### Write permissions
+
+`relay install` creates `/var/cache/mirror-relay` and lists it in
+`ReadWritePaths=`. Point `CACHE_DIR` at that path, or add your own directory to
+the unit's `ReadWritePaths=` and give the service user ownership — otherwise
+`ProtectSystem=strict` makes it read-only and the relay fails to start.
+
+## `relay prune` — offline cache cleanup
+
+Deletes every cached object this relay's index does not know about:
+
+```bash
+sudo systemctl stop mirror-relay
+sudo -u mirror-relay env CACHE_DIR=/var/cache/mirror-relay CACHE_CAPACITY=128GiB \
+  /usr/local/bin/relay prune
+```
+
+It is an **offline** command: it opens the same `CACHE_DIR` (the bbolt lock
+refuses a second instance while the relay is running) and builds no server, edge
+selection, certificates or manifest watcher. Stop the relay first.
+
+> **WARNING — with `S3_BUCKET` configured this deletes from the SHARED cache.**
+> Every object this relay does not index is removed, including objects written by
+> other relays and by relays that are online right now. Only run it against a
+> bucket no other relay depends on, or when you deliberately want to drop
+> everyone's cache. Deleted content is fetched upstream again; the upstream data
+> is unaffected.
+
+What it does:
+
+- completes deletes that earlier evictions queued but could not finish;
+- drops this instance's index rows whose body is gone (local: a file stat; S3:
+  one HEAD per indexed body) and drops alias rows whose primary record is
+  missing. This is a *fail-closed* cleanup: a permission, timeout or I/O error
+  keeps the index row and fails the run, so a broken bucket cannot silently
+  empty the index;
+- then lists the configured bucket prefix (local: the data directory) and
+  deletes bodies and pointer objects that are not in the index. The index
+  cleanup runs first, so a body another relay removed also loses its pointers
+  in the same pass — no second run needed. Keys outside the prefix, and
+  unrecognised keys under it, are never deleted.
+
+Normal reads and the startup reconcile never list a shared bucket; this command
+is the only listing path. `stale` counts index rows removed (missing bodies plus
+dangling aliases). It prints the counts and exits non-zero if anything could not
+be checked, listed or deleted, after finishing the rest:
+
+```
+$ relay prune
+prune: scanned=1204 kept=980 deleted=224 pending=0 stale=1 skipped=2 failed=0
+```
+
 
 ## systemd
 

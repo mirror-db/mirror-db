@@ -26,6 +26,7 @@ func main() {
 	root.AddCommand(serveCmd())
 	root.AddCommand(install.Cmd())
 	root.AddCommand(forward.Cmd())
+	root.AddCommand(pruneCmd())
 
 	if err := root.Execute(); err != nil {
 		log.Fatal(err)
