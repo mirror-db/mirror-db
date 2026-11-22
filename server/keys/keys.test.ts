@@ -1,12 +1,17 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 
-vi.mock("@server/pkgs/fetch", () => ({ cachedfetch: vi.fn() }));
+vi.mock("@server/pkgs/fetch", async (importOriginal) => ({
+  // Keep the real helpers: the mirror graph below imports them (limits, cache
+  // names, `sanitizeResponse`). Only the outbound fetch is stubbed.
+  ...(await importOriginal<typeof import("@server/pkgs/fetch")>()),
+  cachedfetch: vi.fn(),
+}));
 
 import { keys } from "./index";
 import { debianKeyName2Url } from "./pgp/debian";
 import { repo2KeyUrl } from "./pgp/well-known-apt";
 import { ParseSSHKey } from "./utils/ssh-key";
-import { armorBinary, toSourcesFormat } from "./utils/pgp-key";
+import { armorBinary, PGPPubKeyHandler, toSourcesFormat } from "./utils/pgp-key";
 import { UnknownKeyError } from "./utils/errors";
 import { cachedfetch } from "@server/pkgs/fetch";
 
@@ -53,7 +58,7 @@ describe("repo2KeyUrl", () => {
   });
 
   it("throws on unknown repo", () => {
-    expect(() => repo2KeyUrl("does-not-exist")).toThrow();
+    expect(() => repo2KeyUrl("does-not-exist")).toThrow(UnknownKeyError);
   });
 });
 
@@ -132,19 +137,79 @@ describe("toSourcesFormat", () => {
 describe("well-known APT keys cover the APT mirrors", () => {
   // Every APT mount should be resolvable from `/keys/apt/<name>`, so a client
   // can write one sources file per repo without consulting a table.
-  const noKey = new Set(["debian-ports"]);
-
   it("resolves a key for every apt mirror", async () => {
     const { aptMirrors } = await import("@server/mirrors/apt-mirrors");
     for (const mirror of aptMirrors) {
-      if (noKey.has(mirror.name)) continue;
       expect(() => repo2KeyUrl(mirror.name), mirror.name).not.toThrow();
     }
   });
 
-  it("documents the exception", () => {
-    // debian-ports publishes its archive key only inside a .deb keyring package.
-    expect(() => repo2KeyUrl("debian-ports")).toThrow(UnknownKeyError);
+  it("resolves a key for every mount tagged `apt`, not only `aptMirrors`", async () => {
+    // File trees that serve an APT repository (`/cuda/`, `/docker-ce/`, …) are
+    // web mirrors, so they never appear in `aptMirrors` — but a generated
+    // sources file inlines their key too.
+    const { mirrors } = await import("@server/mirrors");
+    const aptMounts = mirrors.filter((m) => m.policyTags?.includes("apt"));
+
+    expect(aptMounts.length).toBeGreaterThan(0);
+    for (const mirror of aptMounts) {
+      expect(() => repo2KeyUrl(mirror.name), mirror.name).not.toThrow();
+    }
+  });
+
+  it("serves Debian Ports' yearly archive keys", () => {
+    // The key is published as a plain file; it used to be reachable only inside
+    // debian-ports-archive-keyring_*.deb. Both years are served because the
+    // transition keeps one suite signed by the previous key.
+    const urls = repo2KeyUrl("debian-ports");
+    expect(urls).toEqual([
+      "https://www.ports.debian.org/archive_2026.key",
+      "https://www.ports.debian.org/archive_2027.key",
+    ]);
+  });
+
+  it("merges OpenTofu's provider and repository keys", () => {
+    expect(repo2KeyUrl("opentofu")).toEqual([
+      "https://get.opentofu.org/opentofu.gpg",
+      "https://packages.opentofu.org/opentofu/tofu/gpgkey",
+    ]);
+    // The historical alias keeps resolving to the repository key alone.
+    expect(repo2KeyUrl("opentofu-repo")).toBe(
+      "https://packages.opentofu.org/opentofu/tofu/gpgkey",
+    );
+  });
+
+  it("merges every certificate CUDA's served trees are signed with", () => {
+    // One certificate per (distro, architecture) tree: a partial keyring makes
+    // apt report `Missing key` for the trees that were left out.
+    const base = "https://developer.download.nvidia.com/compute/cuda/repos/";
+    expect(repo2KeyUrl("cuda")).toEqual([
+      `${base}debian12/x86_64/3bf863cc.pub`,
+      `${base}debian13/x86_64/8793F200.pub`,
+      `${base}ubuntu2604/x86_64/60DF8A40.pub`,
+    ]);
+  });
+
+  it("serves Microsoft's rolling certificate alongside the legacy one", () => {
+    expect(repo2KeyUrl("microsoft")).toEqual([
+      "https://packages.microsoft.com/keys/microsoft-rolling.asc",
+      "https://packages.microsoft.com/keys/microsoft.asc",
+    ]);
+  });
+
+  it("serves the versioned Kubernetes key for the suite it mirrors", () => {
+    expect(repo2KeyUrl("kubernetes")).toBe(
+      "https://pkgs.k8s.io/core:/stable:/v1.37/deb/Release.key",
+    );
+  });
+
+  it("keeps the Docker aliases on the Debian signing key", () => {
+    const debian = "https://download.docker.com/linux/debian/gpg";
+    expect(repo2KeyUrl("docker-ce")).toBe(debian);
+    expect(repo2KeyUrl("docker")).toBe(debian);
+    expect(repo2KeyUrl("docker-ubuntu")).toBe(
+      "https://download.docker.com/linux/ubuntu/gpg",
+    );
   });
 
   it("maps the NVIDIA container repo to its signing key", () => {
@@ -243,5 +308,35 @@ describe("keys app routing", () => {
     mockEzfetch.mockResolvedValue(new Response("not-a-real-key"));
     await get("/keys/debian/bookworm").catch(() => {});
     expect(fetchedUrl()).toBe("https://ftp-master.debian.org/keys/archive-key-12.asc");
+  });
+
+  it("serves /in-sources from the handler's own accessor", async () => {
+    // Consumers that embed the block inline (`/conf/apt/…`) call
+    // `PGPPubKeyHandler.inSources()` instead of going through HTTP; the route
+    // must stay byte-identical to `inSources() + "\n"`.
+    const armored = [
+      "-----BEGIN PGP PUBLIC KEY BLOCK-----",
+      "",
+      "mQINBF5dI2sBEACy",
+      "=abcd",
+      "-----END PGP PUBLIC KEY BLOCK-----",
+      "",
+    ].join("\n");
+    // A fresh Response per call: a body can only be read once, and both the
+    // direct accessor and the route fetch the key.
+    mockEzfetch.mockImplementation(async () => new Response(armored));
+
+    const h = await PGPPubKeyHandler.fromUrls(["https://example.com/key.asc"]);
+    expect(h.inSources()).toBe(toSourcesFormat(armored));
+
+    const res = await get("/keys/apt/hashicorp/in-sources");
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe(`${h.inSources()}\n`);
+  });
+
+  it("reports an unparseable key through the accessor as undefined", async () => {
+    mockEzfetch.mockResolvedValue(new Response("not-a-real-key"));
+    const h = await PGPPubKeyHandler.fromUrls(["https://example.com/key.asc"]);
+    expect(h.inSources()).toBeUndefined();
   });
 });

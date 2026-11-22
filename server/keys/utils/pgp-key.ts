@@ -119,6 +119,18 @@ export class PGPPubKeyHandler {
     // Verification succeeds if **any** provided certificate signed the message.
     return openpgp.verify({ message, verificationKeys: this.keys });
   }
+
+  /**
+   * The key as a deb822 `Signed-By:` value, for callers that embed it inline
+   * (this is exactly what `toSourcesFormat` produces from the armored key).
+   * Undefined when no certificate could be armored.
+   *
+   * `GET /in-sources` serves this plus one trailing newline, so a caller that
+   * wants byte-identical output appends `"\n"` itself.
+   */
+  inSources(): string | undefined {
+    return this.armored ? toSourcesFormat(`${this.armored}\n`) : undefined;
+  }
 }
 
 /**
@@ -187,11 +199,11 @@ export function SrvPGPKey(
 
   route.get("/:keyname/in-sources", async (c) => {
     const h = await _handler(param(c));
-    const asc = armored(h);
-    if (!asc) return unparsable(c);
+    const sources = h.inSources();
+    if (!sources) return unparsable(c);
     // Trailing newline: matches `sed`'s output, so a redirect to a file or a
     // `$(...)` substitution behaves exactly like the documented pipeline.
-    return c.text(`${toSourcesFormat(asc)}\n`, 200, {
+    return c.text(`${sources}\n`, 200, {
       "content-type": "text/plain; charset=utf-8",
     });
   });
