@@ -130,6 +130,20 @@ describe("front door — unknown paths", () => {
     expect(res.headers.get("content-type")).toContain("image/x-icon");
   });
 
+  it("routes /conf/ to the configuration app, not the SPA", async () => {
+    const worker = await loadWorker();
+    const res = await worker.fetch(req("/conf/apt/debian-12.sources"));
+    expect(assets.fetch).not.toHaveBeenCalled();
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("text/plain; charset=utf-8");
+    expect(await res.text()).toContain("URIs: https://mirs.uk/debian/");
+
+    // A typo below /conf/ is still a real 404, never the SPA shell.
+    const miss = await worker.fetch(req("/conf/aptx"));
+    expect(miss.status).toBe(404);
+    expect(assets.fetch).not.toHaveBeenCalled();
+  });
+
   it("does not let the SPA swallow a known-but-missing mirror path", async () => {
     const worker = await loadWorker();
     // `debian` is a mount, so the request must reach the mirror, never ASSETS.

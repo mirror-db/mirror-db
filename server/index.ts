@@ -2,6 +2,7 @@ import { env } from "cloudflare:workers";
 
 import { mirrorsBySubdomain, mirrorsByPath, mirrors } from "./mirrors";
 import { api } from "./api";
+import { conf } from "./conf";
 import { keys } from "./keys";
 import { scripts } from "./scripts";
 import { handleSpeedtest } from "./speedtest";
@@ -53,6 +54,7 @@ export default {
     if (firstSeg === "keys") return keys.fetch(request);
     if (firstSeg === "api") return api.fetch(request);
     if (firstSeg === "scripts") return scripts.fetch(request);
+    if (firstSeg === "conf") return conf.fetch(request);
 
     // Static assets (favicon, /weblist/, SPA chunks) and the SPA's own routes.
     // Anything else is a genuine miss: falling through to the SPA answered
