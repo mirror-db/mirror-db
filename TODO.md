@@ -32,31 +32,23 @@ The archive is dual-signed but only one certificate is published. Our key mirror
 serves both, so the mount works; the underlying upstream inconsistency is
 theirs. Recheck when they drop the 2014 signature (then the extra fetch can go).
 
-## 2c. `debian-ports` has no key endpoint
+## 2c. ~~`debian-ports` has no key endpoint~~ — resolved
 
-`/keys/apt/debian-ports` is a 404 by design: `ftp.ports.debian.org` publishes no
-key file (only `README`, `dists/`, `doc/`, `indices/`, `pool-*`), and the
-keyserver copy of `5FFACC4B…` has no self-signature, so apt rejects it
-(`ERRSIG`). The key lives inside `debian-ports-archive-keyring_*.deb`. Options if
-this becomes important: extract the keyring at build time and ship it as a static
-asset, or accept the package install.
+`https://www.ports.debian.org/` publishes the yearly keys directly. The key
+mirror merges `archive_2026.key` and `archive_2027.key`; add the next yearly key
+before the older certificate expires.
 
-## 3. `packages.opentofu.org` is not an APT tree
+## 3. ~~`packages.opentofu.org` is not an APT tree~~ — resolved
 
-`https://packages.opentofu.org/opentofu/tofu/any/` is a packagecloud HTML UI;
-`dists/` is `404` at every layout tried (`any/`, `any/any/`, `any/apt/`,
-`any/deb/`). The documented source line is
-`deb https://packages.opentofu.org/opentofu/tofu/` — i.e. `dists/` sits at the
-repo root, but that returns `404` too. The installer script
-`/install/repositories/opentofu/tofu/script.deb.sh` is the authority; read it and
-derive the real layout, or drop the mirror.
+The APT root is `https://packages.opentofu.org/opentofu/tofu/any/` with suite
+`any` and component `main`. Its index is signed by the packagecloud repository
+key, not just the provider key, so the key mirror now merges both.
 
-## 4. `packages.k8s.io` prefix returns 403
+## 4. ~~`packages.k8s.io` prefix returns 403~~ — resolved
 
-`https://prod-cdn.packages.k8s.io/repositories/isv:/kubernetes:/…` answers `403`
-without a token, so the `/kubernetes/` passthrough mirror only works for the
-paths whose tokens clients send. Confirm which paths actually work; if none, drop
-it (`/kube-releases/` on `dl.k8s.io` already covers the release binaries).
+Only the bare repository prefix answers 403. Concrete
+`core:/stable:/v<minor>/deb/` trees anonymously serve InRelease, Packages,
+Release.key and packages. The configuration presets use those stable trees.
 
 ## 5. `/pypi/simple/` transfers 48 MB on a miss
 

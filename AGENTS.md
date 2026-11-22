@@ -16,7 +16,7 @@ without redirect), `fetch(request)`, optional `status()`.
 - [server/index.ts](server/index.ts) — entry. Parses subdomain from host header.
   Subdomain mirror wins; on bare `@` splits pathname, looks up first segment in
   `mirrorsByPath`, then the mount switches: `/speedtest/`, `/keys/`, `/api/`,
-  `/scripts/`. Everything else is a static asset or a **real 404** — the SPA
+  `/scripts/`, `/conf/`. Everything else is a static asset or a **real 404** — the SPA
   shell is only served for `/` and `/about` (the routes `src/router/` owns).
   An unknown first segment must never fall through to the SPA: a 404 page
   ([server/not-found.ts](server/not-found.ts)) answers in two flavours —
@@ -34,6 +34,17 @@ without redirect), `fetch(request)`, optional `status()`.
     methods emit the same deterministic ETag and honour `If-None-Match`. See
     [ADR 0009](docs/adr/0009-policy-driven-relay-transport.md).
   - `GET /api/status/:name` — per-mirror status snapshot.
+- [server/conf/apt/](server/conf/apt/) — deb822 source presets at
+  `/conf/apt/<name>.sources`. Each preset returns `Stanza[]`; explicit metadata,
+  not directory-name inference, handles multi-root, flat and architecture-mapped
+  repositories. Query aliases override suites/components/architectures;
+  `protocol` / `proto=http|https` selects every URI's scheme (default HTTPS).
+  Versioned Debian presets include a fixed security stanza whose suite is not
+  changed by a main-source `suites` override. Debian and Ubuntu use their installed
+  archive keyrings; other presets inline the same armored block as
+  `/keys/apt/<name>/in-sources`. All URIs use `relayInfo().origin`.
+  `/conf/apt/` lists registered paths as JSON, or a linked `<pre>` list for browser
+  user agents. See [ADR 0010](docs/adr/0010-explicit-apt-source-presets.md).
 - [server/keys/index.ts](server/keys/index.ts) — Hono app at `/keys/` on the
   bare domain. Proxies common signing keys (PGP + SSH) so domestic clients fetch
   them through the mirror. See [Key proxy](#key-proxy--serverkeys) below.
@@ -283,12 +294,12 @@ the APT mirror but reusable for any directory-listing upstream.
 - **`webdav.ts`** — hand-crafted RFC 4918 class 1 responses (no XML library
   needed). `propfindResponse`, `optionsResponse`, `methodNotAllowed`.
 
-## Pigsty APT mirror — [server/mirrors/pigsty/](server/mirrors/pigsty/)
+## Pigsty APT mirror — [server/mirrors/web-mirrors.ts](server/mirrors/web-mirrors.ts)
 
-`/pigsty/` passes through `https://repo.pigsty.io/apt/`. The `.io` origin is on
-Cloudflare and answers quickly from global PoPs; `.cc` is optimised for mainland
-clients but slow outside China, which does not help a Worker fetching from a CF
-edge. Both serve the same bytes.
+`/pigsty/` is a `passthroughConfigs` entry for `https://repo.pigsty.io/apt/`.
+The `.io` origin is on Cloudflare and answers quickly from global PoPs; `.cc` is
+optimised for mainland clients but slow outside China, which does not help a
+Worker fetching from a CF edge. Both serve the same bytes.
 
 The upstream has two repository layouts below one tree:
 
@@ -437,10 +448,10 @@ reaching upstreams directly. Mounted in [server/index.ts](server/index.ts) via
 - Key providers under [pgp/](server/keys/pgp/): `debianKeyName2Url` maps a
   codename/version (`bookworm`, `13`, `-security`, `-release`) to a
   `ftp-master.debian.org` archive key; `repo2KeyUrl` is a static table keyed by
-  **APT mount name**, so `/keys/apt/<mirror>` resolves for every mirror. The
-  only exception is `debian-ports`: its archive key ships only inside
-  `debian-ports-archive-keyring_*.deb`, and the keyserver copy has no
-  self-signature (apt answers `ERRSIG`), so it answers 404 on purpose.
+  **APT mount name** plus documented aliases. Multi-URL entries merge current
+  signers: Debian Ports uses the published yearly keys (add the new year before
+  the old one expires), OpenTofu needs both its provider and repository keys, and
+  Microsoft needs its rolling and legacy certificates.
 - Routes mounted: `/debian/:codename`, `/apt/:repo`, `/keybase/:user`,
   `/gh|github/:user`, `/gitlab/:user`.
 - Upstream fetch goes through `ezfetch` (no read-through cache yet — these keys
@@ -474,10 +485,9 @@ reaching upstreams directly. Mounted in [server/index.ts](server/index.ts) via
   directory listings — `/dists/` is `404` and a wrong component answers `403`.
   The suite list is therefore explicit, and the mount's HTML/JSON listing is
   `404` by design.
-- `packages.opentofu.org/opentofu/tofu/any/` is not an APT tree (packagecloud
-  web UI; `dists/` is 404 at every path tried).
-- `packages.k8s.io` returns `403` for the `isv:/kubernetes:/` prefix without a
-  token.
+- The bare Kubernetes repository prefix returns `403`, but concrete
+  `core:/stable:/v<minor>/deb/` trees are anonymous and work. Its signing key URL
+  is versioned; the key table follows the latest stable minor.
 - Syncthing signs `dists/syncthing` with **two** certificates: the current one
   (`FBA2E162…`) that `syncthing.net/release-key.gpg` ships, and the 2014 key
   (`37C84554…`) it no longer publishes. A client with only the published key

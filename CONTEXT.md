@@ -34,7 +34,20 @@ What a mirror is a view *of*, which decides how a request is served:
 
 The URL location a mirror occupies. The **mount name** is the mirror's name.
 A path suffix may not reuse another switch's name (`keys`, `api`, `scripts`,
-`speedtest`).
+`speedtest`, `conf`).
+
+### Source configuration
+
+A deb822 description of an APT source, identifying its repository URI, suites,
+components, optional architectures, and signing key. It is a client
+configuration, not a mirror: several configurations may select different
+repository roots below one mirror.
+
+### Source preset
+
+A named source-configuration default. A preset may have shortcuts for a
+distribution release or repository layout. Shortcuts only supply defaults;
+explicit client selections may override them.
 
 ### Mount switch
 
