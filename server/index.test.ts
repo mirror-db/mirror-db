@@ -144,6 +144,16 @@ describe("front door — unknown paths", () => {
     expect(assets.fetch).not.toHaveBeenCalled();
   });
 
+  it("routes /relaytest/ to the deterministic test upstream, not the SPA", async () => {
+    const worker = await loadWorker();
+    const res = await worker.fetch(req("/relaytest/fresh"));
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get("etag")).toBe('"fresh-v1"');
+    expect(await res.text()).toBe("relaytest: fresh v1\n");
+    expect(assets.fetch).not.toHaveBeenCalled();
+  });
+
   it("does not let the SPA swallow a known-but-missing mirror path", async () => {
     const worker = await loadWorker();
     // `debian` is a mount, so the request must reach the mirror, never ASSETS.

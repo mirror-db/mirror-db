@@ -23,6 +23,19 @@ var (
 	objectsBucket = []byte("objects")
 	aliasesBucket = []byte("aliases")
 	pendingBucket = []byte("pending")
+	// variantsBucket holds cached representation metadata, keyed by the
+	// normalised identity of a variant (URL plus its Vary contract).
+	variantsBucket = []byte("variants")
+	// variantRefsBucket is the reverse reference: raw body SHA-256 followed by
+	// the variant key. A prefix scan over one digest finds every variant that
+	// points at that body, so body removal can clean them in the same
+	// transaction.
+	variantRefsBucket = []byte("variant-refs")
+	// variantMetaBucket holds small metadata records. Today it is one counter:
+	// how many variant rows exist, maintained transactionally so a write never
+	// has to count the whole bucket.
+	variantMetaBucket = []byte("variant-meta")
+	variantCountKey   = []byte("count")
 )
 
 const recordLen = 8 + 8 + 20 // size, access sequence, sha1
@@ -46,12 +59,19 @@ func openIndex(path string) (*index, error) {
 	}
 	ix := &index{db: db}
 	err = db.Update(func(tx *bolt.Tx) error {
-		for _, name := range [][]byte{objectsBucket, aliasesBucket, pendingBucket} {
+		for _, name := range [][]byte{objectsBucket, aliasesBucket, pendingBucket, variantsBucket, variantRefsBucket, variantMetaBucket} {
 			if _, err := tx.CreateBucketIfNotExists(name); err != nil {
 				return err
 			}
 		}
-		return nil
+		// Recompute the variant count on every open: it repairs drift from an
+		// older index or a manual edit, and makes the limit independent of the
+		// counter's history.
+		count, err := countVariants(tx)
+		if err != nil {
+			return err
+		}
+		return setVariantTotal(tx, count)
 	})
 	if err != nil {
 		_ = db.Close()
@@ -232,7 +252,13 @@ func (ix *index) remove(m objectMeta) error {
 		if err := tx.Bucket(objectsBucket).Delete(key); err != nil {
 			return err
 		}
-		return tx.Bucket(aliasesBucket).Delete(alias)
+		if err := tx.Bucket(aliasesBucket).Delete(alias); err != nil {
+			return err
+		}
+		// Variant metadata is meaningless once the body it names is gone. Drop it
+		// in the same transaction, so a crash cannot leave a variant pointing at
+		// a removed body.
+		return ix.removeVariantsForBody(tx, key)
 	})
 }
 
@@ -255,7 +281,10 @@ func (ix *index) removeAndQueue(m objectMeta) error {
 		if err := tx.Bucket(aliasesBucket).Delete(alias); err != nil {
 			return err
 		}
-		return tx.Bucket(pendingBucket).Put(key, alias)
+		if err := tx.Bucket(pendingBucket).Put(key, alias); err != nil {
+			return err
+		}
+		return ix.removeVariantsForBody(tx, key)
 	})
 }
 

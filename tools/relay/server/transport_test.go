@@ -101,7 +101,8 @@ func TestHandleRequestCarriesPolicy(t *testing.T) {
 	s := newPolicyTestServer(t,
 		[]Mirror{{Name: "debian", Path: "debian", PolicyTags: []string{"apt"}}},
 		Policy{Name: "apt-pool", Match: PolicyMatch{Tag: "apt", PathPrefix: "/pool/"}, Rules: PolicyRules{TrafficPolicy: trafficSpeed}},
-		Policy{Name: "default", Rules: PolicyRules{TrafficPolicy: trafficLatency}},
+		// Unmatched paths keep the implicit latency default. A trailing
+		// catch-all would override the rule above under last-match-wins.
 	)
 	capture := &captureTransport{}
 	s.edge = &edgeSelection{plain: capture}

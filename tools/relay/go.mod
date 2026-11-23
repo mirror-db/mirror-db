@@ -3,6 +3,7 @@ module github.com/mirror-db/mirror-db/tools/relay
 go 1.26.0
 
 require (
+	github.com/andybalholm/brotli v1.2.1
 	github.com/aws/aws-sdk-go-v2 v1.48.0
 	github.com/aws/aws-sdk-go-v2/config v1.33.21
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.116.0
@@ -14,6 +15,7 @@ require (
 	github.com/google/go-lru v1.2.0
 	github.com/gorilla/mux v1.8.1
 	github.com/joho/godotenv v1.5.1
+	github.com/klauspost/compress v1.20.3
 	github.com/libdns/cloudflare v0.2.2
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/viper v1.21.0

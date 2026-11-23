@@ -24,6 +24,15 @@ const BY_HASH = /\/by-hash\/(?:MD5Sum|SHA1|SHA256|SHA512)\/([0-9a-f]{32,128})$/i
 
 const IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable";
 
+/**
+ * `X-MDB-Relay` response control. Mutable APT indexes must never enter a relay
+ * cache: the relay would hold `Release`/`Packages` for its max-age/Valid-Until
+ * window while upstream may already have rotated the index, reintroducing the
+ * Hash Sum mismatch this proxy avoids by not caching them itself.
+ */
+const RELAY_CONTROL_HEADER = "x-mdb-relay";
+const RELAY_NO_STORE = "no-store";
+
 const notFound = (): Response => new Response(null, { status: 404 });
 
 export interface CreateAptProxyOptions {
@@ -99,9 +108,24 @@ async function aptFetchHook(
   const upstream = hash !== null
     ? await cachedfetch(repo.url(rel))
     : await ezfetch(repo.url(rel));
-  return sanitizeResponse(upstream, {
+  const sanitized = sanitizeResponse(upstream, {
     cacheControl: hash !== null ? IMMUTABLE_CACHE_CONTROL : sourceCacheControl(repo),
   });
+
+  // The same generation hazard applies to the relay's default request cache:
+  // tell it not to store a mutable dists index. by-hash objects are
+  // content-addressed and pool payloads are not indexes, so neither gets this.
+  if (hash === null && rel.startsWith("dists/")) {
+    const headers = new Headers(sanitized.headers);
+    headers.set(RELAY_CONTROL_HEADER, RELAY_NO_STORE);
+    return new Response(sanitized.body, {
+      status: sanitized.status,
+      statusText: sanitized.statusText,
+      headers,
+    });
+  }
+
+  return sanitized;
 }
 
 /** `Cache-Control` derived from how long the source index stays valid. */

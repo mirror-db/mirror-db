@@ -1,3 +1,5 @@
+import type { RelayDirective } from "./relay-control";
+
 export interface MirrorStatus {
   health: "initializing" | "healthy" | "unhealthy";
 }
@@ -14,6 +16,11 @@ export interface Mirror {
    * selection.
    */
   policyTags?: string[];
+  /**
+   * `X-MDB-Relay` directives injected on every response by the front-door
+   * middleware. Response-side decisions only; these never enter the manifest.
+   */
+  relayDirectives?: RelayDirective[];
   fetch(request: Request): Promise<Response> | Response;
   status?(): Promise<MirrorStatus> | MirrorStatus;
 }

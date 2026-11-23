@@ -1,6 +1,8 @@
 # ADR 0009 — Distribute relay traffic policies with the mirror manifest
 
-- **Status:** accepted
+- **Status:** accepted (2026-11-17) — the first-match evaluation rule is
+  superseded by [ADR 0012](0012-policy-field-merge-and-passthrough.md); the
+  distribution, matching, manifest ETag and transport decisions stand
 - **Date:** 2026-11-17
 
 ## Context

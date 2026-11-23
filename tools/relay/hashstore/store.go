@@ -9,6 +9,11 @@
 // S3-compatible bucket (RustFS). Everything else — temp files, the index — is
 // always local. A shared bucket is opportunistic reuse only: any relay may
 // delete any object, so reads that lose the race are a cache MISS, not an error.
+//
+// The same local index also holds response-variant metadata: a URL plus the
+// Vary contract and matched request headers, naming one body. It is deliberately
+// local, never written to the shared bucket, and is removed in the same
+// transaction that removes the body it names.
 package hashstore
 
 import (
@@ -43,6 +48,8 @@ var (
 	ErrOversized = errors.New("hashstore: content exceeds max object size")
 	// ErrInvalidDigest means the algorithm or hex length was invalid.
 	ErrInvalidDigest = errors.New("hashstore: invalid digest")
+	// ErrInvalidRange means a range offset is negative or past the body's end.
+	ErrInvalidRange = errors.New("hashstore: invalid range offset")
 	// ErrClosed means the store is shutting down.
 	ErrClosed = errors.New("hashstore: store is closed")
 )
@@ -380,6 +387,41 @@ func (s *Store) Get(ctx context.Context, algo Algorithm, digest string) (io.Read
 	return rc, size, nil
 }
 
+// Range returns a reader for the body from offset to its end, plus the body's
+// total size. It is the building block for a server's Content-Range and
+// multi-range handling: the caller slices or limits the stream itself.
+//
+// offset == size yields an empty read; a negative offset or one past the end is
+// ErrInvalidRange. A hit promotes recency exactly like Get; Stat does not.
+func (s *Store) Range(ctx context.Context, algo Algorithm, digest string, offset int64) (io.ReadCloser, int64, error) {
+	if !s.enter() {
+		return nil, 0, ErrClosed
+	}
+	defer s.leave()
+
+	if offset < 0 {
+		return nil, 0, fmt.Errorf("%w: offset %d", ErrInvalidRange, offset)
+	}
+	sha256, sha1, ok, err := s.resolve(ctx, algo, digest)
+	if err != nil {
+		return nil, 0, err
+	}
+	if !ok {
+		return nil, 0, ErrNotFound
+	}
+	rc, total, err := s.backend.openRange(ctx, sha256, offset)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) && ctx.Err() == nil {
+			s.forget(sha256)
+		}
+		return nil, 0, err
+	}
+	if err := s.touch(ctx, sha256, sha1, total); err != nil {
+		log.Printf("hashstore: promote %s: %v", sha256, err)
+	}
+	return rc, total, nil
+}
+
 // Stat reports whether a body exists and its size, without changing recency.
 func (s *Store) Stat(ctx context.Context, algo Algorithm, digest string) (int64, bool, error) {
 	if !s.enter() {
@@ -504,6 +546,15 @@ func (s *Store) Reconcile(ctx context.Context) error {
 	for sha256 := range present {
 		if s.publishing[sha256] > 0 {
 			// A PUT is between publishing its body and writing its index entry.
+			continue
+		}
+		// A variant can only name a body this instance knows about; an orphan
+		// body has no record, so any metadata naming it is dangling. Drop the
+		// metadata before the body, so a failed object delete leaves an
+		// unreferenced orphan for the next pass, never a variant pointing at a
+		// file that is about to disappear.
+		if err := s.index.removeVariantsForDigest(sha256); err != nil {
+			log.Printf("hashstore: drop variants of orphan %s: %v", sha256, err)
 			continue
 		}
 		if err := s.backend.delete(delCtx, sha256, ""); err != nil {

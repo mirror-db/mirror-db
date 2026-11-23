@@ -130,7 +130,19 @@ func (s *Store) Prune(ctx context.Context) (PruneStats, error) {
 		stats.Stale += dangling
 	}
 
-	// 4. Walk the backend and delete anything this index does not know about.
+	// 4. Drop variant metadata whose body record is gone. Normal eviction and
+	//    deletion already do this in the transaction that removes the record;
+	//    this repairs damage left by an older index or a manual edit. It touches
+	//    only the local index, so it neither changes the counts above nor the
+	//    backend scan below.
+	s.mu.Lock()
+	_, err = s.index.pruneDanglingVariants()
+	s.mu.Unlock()
+	if err != nil {
+		fail(fmt.Errorf("prune dangling variants: %w", err))
+	}
+
+	// 5. Walk the backend and delete anything this index does not know about.
 	err = s.backend.listObjects(ctx, func(ref objectRef) error {
 		if err := ctx.Err(); err != nil {
 			return err

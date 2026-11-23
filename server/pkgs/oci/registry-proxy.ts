@@ -11,7 +11,7 @@
  * can be unit-tested without the Workers runtime.
  */
 
-import { CFCacheLimit, mdbfetch, parseContentLength, sanitizeResponse, STRIP_RESPONSE_HEADERS } from "@server/pkgs/fetch";
+import { CFCacheLimit, mdbfetch, parseContentLength, sanitizeResponse, STRIP_STORED_HEADERS } from "@server/pkgs/fetch";
 
 import {
   basicAuthHeader,
@@ -67,6 +67,9 @@ const STRIP_REQUEST_HEADERS = new Set([
   "authorization",
   "host",
   "cookie",
+  // Relay control headers are Worker/relay context, never upstream input.
+  "x-mdb-relay",
+  "x-mdb-relay-host",
   "x-forwarded-for",
   "x-forwarded-host",
   "x-forwarded-proto",
@@ -278,6 +281,10 @@ export async function proxyRegistryRequest(
     withinCacheLimit(final, opts.maxCacheBytes ?? DEFAULT_MAX_CACHE_BYTES)
   ) {
     const headers = new Headers(final.headers);
+    // Digest-addressed blobs should not vary, but the Cache API refuses to
+    // store a response carrying `Vary` — keep that restriction on the stored
+    // copy only, exactly as the shared read-through cache does.
+    for (const name of STRIP_STORED_HEADERS) headers.delete(name);
     headers.set("cache-control", IMMUTABLE_CACHE_CONTROL);
     const cached = new Response(final.body, {
       status: 200,

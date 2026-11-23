@@ -6,7 +6,10 @@ import { conf } from "./conf";
 import { keys } from "./keys";
 import { scripts } from "./scripts";
 import { handleSpeedtest } from "./speedtest";
+import { handleRelaytest } from "./relaytest";
+import { normalizeRelayRequest, withRelayDirectives } from "./relay-control";
 import { notFoundResponse } from "./not-found";
+import type { Mirror } from "./types";
 
 /** Client-side routes the SPA owns (see `src/router/`). */
 const SPA_ROUTES = new Set(["/", "/about"]);
@@ -19,6 +22,10 @@ const MOUNTS = mirrors
 
 export default {
   async fetch(request) {
+    // A direct client must not be able to inject relay response controls; the
+    // valid relay-host marker is what makes the header trustworthy.
+    request = normalizeRelayRequest(request);
+
     // Route on the host, without any port: a relay or a local dev server on a
     // non-default port still has to resolve to the same mirror.
     const rawHost = request.headers.get("host") || new URL(request.url).host;
@@ -33,7 +40,7 @@ export default {
 
     // Subdomain-routed mirrors (OCI registries) win first.
     const mirror = mirrorsBySubdomain.get(subdomain);
-    if (mirror) return mirror.fetch(request);
+    if (mirror) return serveMirror(mirror, request);
 
     const url = new URL(request.url);
 
@@ -46,9 +53,10 @@ export default {
     const [, firstSeg, ...rest] = url.pathname.split("/");
 
     if (firstSeg === "speedtest") return handleSpeedtest(request, rest[0]);
+    if (firstSeg === "relaytest") return handleRelaytest(request, rest[0]);
 
     const pathMirror = firstSeg && mirrorsByPath.get(firstSeg);
-    if (pathMirror) return pathMirror.fetch(request);
+    if (pathMirror) return serveMirror(pathMirror, request);
 
     if (firstSeg === "") return serveStatic(request);
     if (firstSeg === "keys") return keys.fetch(request);
@@ -64,6 +72,21 @@ export default {
     return serveStaticOr404(request, url.pathname);
   },
 } satisfies ExportedHandler<Env>;
+
+/**
+ * Every mirror response passes through one shared relay-control middleware.
+ * Only mirrors that declare directives are touched; the merge never overrides
+ * a directive the mirror (or upstream) already set.
+ *
+ * Exported so the wiring itself can be tested without reaching an upstream.
+ */
+export async function serveMirror(
+  mirror: Mirror,
+  request: Request,
+): Promise<Response> {
+  const response = await mirror.fetch(request);
+  return withRelayDirectives(response, mirror.relayDirectives);
+}
 
 const notFound = (request: Request): Response =>
   notFoundResponse(request, { pathname: new URL(request.url).pathname, mounts: MOUNTS });

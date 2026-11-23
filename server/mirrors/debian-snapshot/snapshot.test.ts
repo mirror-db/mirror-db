@@ -100,22 +100,26 @@ describe("parseTimestamp", () => {
 describe("debian-snapshot mirror", () => {
   beforeEach(() => vi.clearAllMocks());
 
-  it("proxies an archive file and marks it immutable", async () => {
+  it("does not cache an archive response carrying Vary and keeps it consistent", async () => {
     const { get, fetchImpl, cache } = harness(async () =>
       ok("InRelease-bytes", { "content-type": "text/html", vary: "Accept" }),
     );
+    const path = "archive/debian/20240101T000000Z/dists/bookworm/InRelease";
 
-    const res = await get("archive/debian/20240101T000000Z/dists/bookworm/InRelease");
+    const first = await get(path);
+    const second = await get(path);
 
-    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
     expect(fetchImpl.mock.calls[0][0].url).toBe(
       `${UPSTREAM}archive/debian/20240101T000000Z/dists/bookworm/InRelease`,
     );
-    expect(res.status).toBe(200);
-    expect(res.headers.get("cache-control")).toBe("public, max-age=31536000, immutable");
-    // The upstream `vary` must not reach the client or the store.
-    expect(res.headers.get("vary")).toBeNull();
-    expect(cache.puts).toBe(1);
+    expect(first.status).toBe(200);
+    expect(first.headers.get("cache-control")).toBe("public, max-age=31536000, immutable");
+    // Delivery keeps the upstream `Vary`; a Vary response is not stored at all,
+    // so the next request cannot come from a copy without it.
+    expect(first.headers.get("vary")).toBe("Accept");
+    expect(second.headers.get("vary")).toBe("Accept");
+    expect(cache.puts).toBe(0);
   });
 
   it("serves a second request from the cache", async () => {

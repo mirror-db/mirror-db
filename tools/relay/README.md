@@ -53,7 +53,7 @@ cf:                          # edge selection; every key is optional
   # snapshot_interval: 1h    # also written on shutdown
   # bootstrap_host: ""       # default: hostname of upstream.url
 
-cache:                       # content store; disabled while dir is empty
+cache:                       # content store + request cache; disabled while dir is empty
   # dir: /var/cache/mirror-relay  # CACHE_DIR; enables the store + local work dir
   # capacity: 128GiB       # CACHE_CAPACITY; space the store may use, required
   # max_size: 12GiB        # CACHE_MAX_SIZE; LRU budget + per-body cap,
@@ -124,8 +124,11 @@ sudo ./relay install
 5. Routes by Host header, replacing relay domain with upstream domain:
    - `<sub>.<relay-domain>` → proxies to `<sub>.<upstream-domain>` with same path
    - `<relay-domain>` → proxies to `<upstream-domain>` with same path
-6. Applies the first matching policy to the mirror-relative request path and
-   selects its latency or speed transport. Unmatched requests use latency.
+6. Evaluates the ordered policy list against the mirror-relative request path.
+   Every matching rule merges its fields into the decision (later wins, omitted
+   inherits, `exit` stops evaluation), selecting the latency or speed transport
+   and whether the path is `passthrough`. Unmatched requests use latency and are
+   not passthrough.
 7. Sets `X-MDB-Relay-Host` **only when the client did not already send one**, so
    a multi-tier chain keeps the origin closest to the user.
 
@@ -203,7 +206,7 @@ Both pools are maintained regardless of which one is selected, because routing i
 per-request: a cold high-speed pool cannot be switched to on the first request
 that needs it. That accepts a real cost — **speed probes add 300-500 MB a day**
 against ~10 MB for latency probes at the same cadence — deliberately rather than
-by oversight ([ADR-0012](../cft/docs/adr/0012-measure-both-pools.md)).
+by oversight (ADR-0012 in the separate transport module).
 
 Candidate addresses survive a restart: the top of both pools is written to
 `cf-candidates.csv` every hour and on shutdown, and a restart measures those
@@ -274,9 +277,11 @@ Use for bandwidth testing through the relay.
 
 ## Hash content store
 
-An optional, content-addressed body store. `CACHE_DIR` is the switch: empty
-(default) means no store and no `/hash-content` route; set it and the relay
-starts caching bodies and publishing their digests.
+An optional, content-addressed body store and the switch for relay request
+caching. `CACHE_DIR` is the switch: empty (default) means no store and no
+`/hash-content` route; set it and the relay starts storing bodies, publishing
+their digests, and serving already-resolved mirror `GET`/`HEAD` requests from
+cache (see [Request cache](#request-cache)).
 
 Config (env names in parentheses):
 
@@ -297,8 +302,9 @@ else is configured here.
 Layout:
 
 - `<CACHE_DIR>/.tmp/` — bodies being written. Always local.
-- `<CACHE_DIR>/.index.db` — bbolt index: sizes, SHA-1 aliases, LRU order and any
-  delete still waiting to be retried. Always local.
+- `<CACHE_DIR>/.index.db` — bbolt index: sizes, SHA-1 aliases, LRU order, any
+  delete still waiting to be retried, and the local variant metadata that files
+  cached responses by URL and `Vary` identity. Always local.
 - `<CACHE_DIR>/data/<ab>/<cd>/<sha256>` — bodies, when no bucket is configured.
 - In the bucket: `blobs/sha256/<ab>/<cd>/<sha256>`, plus two tiny pointer objects
   `aliases/sha1/<ab>/<cd>/<sha1>` and `aliases/sha256/<ab>/<cd>/<sha256>` so a
@@ -320,9 +326,13 @@ Behaviour:
   another relay are adopted into this relay's index after a successful read.
 - On startup a local store reconciles in the background: index entries whose
   file vanished are dropped, files without an index entry are removed. A delete
-  that fails is queued in the index and retried.
-- The store is enabled for reads only in this milestone: the proxy does not
-  write into it yet (later milestone).
+  that fails is queued in the index and retried. Variant metadata that names a
+  gone body is removed in the same transaction, and `relay prune` repairs older
+  drift.
+- Variant metadata is capped: 16 variants per URL, 65536 rows in total, 32 KiB
+  per encoded row. A write over a limit is skipped with a log line; nothing is
+  truncated. `S3_BUCKET` does not move this metadata — only bodies and digest
+  pointers leave the host.
 
 ### `/hash-content/<algo>/<digest>`
 
@@ -345,6 +355,88 @@ catch-all and does not depend on the upstream manifest.
 `ReadWritePaths=`. Point `CACHE_DIR` at that path, or add your own directory to
 the unit's `ReadWritePaths=` and give the service user ownership — otherwise
 `ProtectSystem=strict` makes it read-only and the relay fails to start.
+
+## Request cache
+
+With `CACHE_DIR` set, a `GET` or `HEAD` that resolves to a manifest mirror is
+served from the local store when possible. Only those two methods enter the
+chain; everything else is proxied untouched. Internal endpoints never resolve to
+a mirror, and `/relaytest` is skipped explicitly. A policy that resolves to
+`passthrough: true` bypasses the chain before it starts: no lookup, no write, no
+response `X-MDB-Relay` handling, no transcode. Inbound request sanitising still
+runs first for every request.
+
+- **Fresh hit** — no upstream request. Status, stored headers and the local body
+  are delivered; `Content-Length` is rebuilt from the body size and `Age` from
+  the store time. `If-None-Match` / `If-Modified-Since` / `If-Match` /
+  `If-Unmodified-Since` are answered locally (`304` / `412`) before Range.
+- **Stale entry** — revalidated with the stored `ETag` / `Last-Modified`. `304`
+  updates freshness and headers only, `200` replaces the variant (and the body),
+  `404` / `410` delete it. Without validators the relay fetches the full
+  response. A stale ranged request is forwarded instead of revalidated.
+- **MISS** — the upstream body is streamed to the client while a tee writes
+  `<CACHE_DIR>/.tmp` and computes SHA-1 + SHA-256; metadata is committed after a
+  complete `200` GET whose bytes reached the client. Only a complete `200` GET
+  creates an entry, so a `HEAD` never leaves a body-less entry behind.
+- **Client request cache control** — `Cache-Control: no-store` skips both lookup
+  and write; `no-cache` and `max-age=0` force revalidation of a fresh entry
+  (`Pragma: no-cache` only when no `Cache-Control` is present).
+- **Freshness** — `no-cache` stores but is immediately stale; otherwise a shared
+  cache prefers `s-maxage`, then `max-age`, then `Expires`. `X-MDB-Relay:
+  ttl=<seconds>` is a fallback only when none of those is present and defaults to
+  none; it never overrides upstream freshness.
+- **Not stored** — `X-MDB-Relay: no-store`, `Cache-Control: no-store` or
+  `private`, any non-`200`, a `Vary: *` unless `no-vary` was declared, a
+  `206`/`Content-Range`, or a `Content-Encoding` the relay cannot decode.
+
+### `X-MDB-Relay`
+
+A response-control header the upstream sends to the relay, shaped like
+`Cache-Control`: comma-separated `keyword` or `keyword=value`.
+
+| keyword | effect |
+|---|---|
+| `no-store` | do not write this response to the relay cache |
+| `no-vary` | the URL path alone identifies the resource; `Vary` does not split variants, `Vary: *` included |
+| `ttl=<seconds>` | fallback lifetime when the response states none; `0` means none |
+
+The relay reads it and removes it before delivery, except on a `passthrough`
+response. Unknown keywords are ignored; `no-transform` is honoured from the
+standard `Cache-Control`. The Worker injects `no-vary` for the eleven
+`createAptMirror` mounts; every other mirror keeps ordinary `Vary` handling.
+These decisions never appear in the manifest policy.
+
+### Encodings and ranges
+
+Stored codings are `identity`, `gzip`, `deflate`, `br` and `zstd`. Delivery picks
+the best acceptable coding from the request's full `Accept-Encoding` (qvalues,
+`*`, `identity`) and, when it differs, decodes to `identity` and re-encodes on
+the fly. A transcoded response is never stored and never becomes a variant; it
+drops `Content-Length`, `Content-MD5`, `Digest` and `Docker-Content-Digest`, and
+demotes a strong `ETag` to weak. OCI digest paths and entries carrying a digest
+header are never transcoded. zstd decoding accepts a frame window of at most
+8 MiB, so one request cannot allocate an arbitrary decoder buffer.
+
+Range requests are answered locally only from a fresh complete entry whose
+negotiated coding is the stored one: single and multipart `206`, `416`, and
+`If-Range` (strong `ETag` or exact date) are supported. At most 32 ranges are
+served; a larger list is ignored in favour of one complete `200`, preventing
+multipart amplification. A Range MISS is proxied and `206` is never stored; if
+upstream ignores Range and returns a complete `200`, the relay may store it and
+logs one warning about the full-body transfer.
+
+### Failure and concurrency
+
+A cache read or metadata failure before the response starts logs and falls back
+to the ordinary proxy; a definite body absence is a MISS, a transient error
+leaves metadata alone. A write failure only disables the store tee — the client
+still receives the complete upstream response. Nothing retries after response
+headers are sent.
+
+There is **no singleflight**: concurrent misses on the same response each go
+upstream and stream independently. Storage is idempotent by real hash, and
+variant metadata is replaced atomically, so the end state is one body and one
+self-consistent record. Metadata is per-relay; a shared bucket does not share it.
 
 ## `relay prune` — offline cache cleanup
 
@@ -371,10 +463,10 @@ What it does:
 
 - completes deletes that earlier evictions queued but could not finish;
 - drops this instance's index rows whose body is gone (local: a file stat; S3:
-  one HEAD per indexed body) and drops alias rows whose primary record is
-  missing. This is a *fail-closed* cleanup: a permission, timeout or I/O error
-  keeps the index row and fails the run, so a broken bucket cannot silently
-  empty the index;
+  one HEAD per indexed body), drops alias rows whose primary record is missing,
+  and drops variant metadata whose body record is gone. This is a *fail-closed*
+  cleanup: a permission, timeout or I/O error keeps the index row and fails the
+  run, so a broken bucket cannot silently empty the index;
 - then lists the configured bucket prefix (local: the data directory) and
   deletes bodies and pointer objects that are not in the index. The index
   cleanup runs first, so a body another relay removed also loses its pointers

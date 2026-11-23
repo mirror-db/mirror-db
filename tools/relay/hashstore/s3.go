@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path"
+	"strconv"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -166,6 +167,116 @@ func (b *s3Backend) open(ctx context.Context, sha256 string) (io.ReadCloser, int
 		return nil, 0, fmt.Errorf("get %s: %w", key, err)
 	}
 	return out.Body, aws.ToInt64(out.ContentLength), nil
+}
+
+// openRange reads a suffix of a shared body. S3 reports the total size in
+// Content-Range; when the server rejects the offset (416) the body is HEADed to
+// distinguish "exactly at EOF" (an empty read) from a real error.
+func (b *s3Backend) openRange(ctx context.Context, sha256 string, offset int64) (io.ReadCloser, int64, error) {
+	if offset < 0 {
+		return nil, 0, fmt.Errorf("%w: offset %d", ErrInvalidRange, offset)
+	}
+	key := b.bodyKey(sha256)
+	out, err := b.api.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(b.bucket),
+		Key:    aws.String(key),
+		Range:  aws.String(fmt.Sprintf("bytes=%d-", offset)),
+	})
+	if err != nil {
+		if isS3NotFound(err) {
+			return nil, 0, ErrNotFound
+		}
+		if isS3InvalidRange(err) {
+			return b.openRangeAtEOF(ctx, sha256, offset)
+		}
+		return nil, 0, fmt.Errorf("get %s: %w", key, err)
+	}
+
+	total := int64(0)
+	switch cr := aws.ToString(out.ContentRange); {
+	case cr != "":
+		start, size, ok := parseContentRange(cr)
+		if !ok {
+			_ = out.Body.Close()
+			return nil, 0, fmt.Errorf("get %s: unparseable Content-Range %q", key, cr)
+		}
+		if start != offset {
+			_ = out.Body.Close()
+			return nil, 0, fmt.Errorf("get %s: server returned range starting at %d, asked for %d", key, start, offset)
+		}
+		total = size
+	case offset > 0:
+		// Without Content-Range the reader may not even start at offset. Refuse
+		// to hand back bytes that could silently be the wrong suffix.
+		_ = out.Body.Close()
+		return nil, 0, fmt.Errorf("get %s: ranged GET has no Content-Range", key)
+	default:
+		// A full read needs no Content-Range; the length is the whole body.
+		total = aws.ToInt64(out.ContentLength)
+	}
+	if offset > total {
+		_ = out.Body.Close()
+		return nil, 0, fmt.Errorf("%w: offset %d beyond body size %d", ErrInvalidRange, offset, total)
+	}
+	return out.Body, total, nil
+}
+
+// openRangeAtEOF turns the 416 an offset at or past the end produces into the
+// same result local storage gives: an empty read at exactly the size, and an
+// explicit error beyond it.
+func (b *s3Backend) openRangeAtEOF(ctx context.Context, sha256 string, offset int64) (io.ReadCloser, int64, error) {
+	total, exists, err := b.stat(ctx, sha256)
+	if err != nil {
+		return nil, 0, err
+	}
+	if !exists {
+		return nil, 0, ErrNotFound
+	}
+	if offset != total {
+		return nil, 0, fmt.Errorf("%w: offset %d beyond body size %d", ErrInvalidRange, offset, total)
+	}
+	return io.NopCloser(strings.NewReader("")), total, nil
+}
+
+// parseContentRange reads "bytes <start>-<end>/<total>".
+func parseContentRange(raw string) (start, total int64, ok bool) {
+	rest, found := strings.CutPrefix(raw, "bytes ")
+	if !found {
+		return 0, 0, false
+	}
+	span, size, found := strings.Cut(rest, "/")
+	if !found || size == "*" {
+		return 0, 0, false
+	}
+	first, _, found := strings.Cut(span, "-")
+	if !found {
+		return 0, 0, false
+	}
+	start, err := strconv.ParseInt(strings.TrimSpace(first), 10, 64)
+	if err != nil || start < 0 {
+		return 0, 0, false
+	}
+	total, err = strconv.ParseInt(strings.TrimSpace(size), 10, 64)
+	if err != nil || total < 0 {
+		return 0, 0, false
+	}
+	return start, total, true
+}
+
+// isS3InvalidRange reports a 416, whether the server names it with a known code
+// or only with the HTTP status. RustFS and other S3-compatible servers are not
+// consistent here: an empty or unrelated error code must not turn an EOF offset
+// into a 500.
+func isS3InvalidRange(err error) bool {
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		switch apiErr.ErrorCode() {
+		case "InvalidRange", "RequestedRangeNotSatisfiable":
+			return true
+		}
+	}
+	var statusErr interface{ HTTPStatusCode() int }
+	return errors.As(err, &statusErr) && statusErr.HTTPStatusCode() == 416
 }
 
 func (b *s3Backend) stat(ctx context.Context, sha256 string) (int64, bool, error) {

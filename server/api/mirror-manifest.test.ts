@@ -78,7 +78,6 @@ describe("mirror manifest — policies", () => {
       "oci-blobs",
       "apt-packages",
       "large-artifacts",
-      "default",
     ]);
   });
 
@@ -101,17 +100,33 @@ describe("mirror manifest — policies", () => {
     expect(large?.rules).toEqual({ traffic_policy: "speed" });
   });
 
-  it("ends with an explicit latency default", () => {
-    const policy = buildMirrorManifest().policies.at(-1);
-
-    expect(policy?.name).toBe("default");
-    expect(policy?.match).toEqual({});
-    expect(policy?.rules).toEqual({ traffic_policy: "latency" });
+  it("has no catch-all rule that would override an earlier speed selection", () => {
+    // Last-match-win merging means a trailing `match: {}` latency rule would
+    // undo every earlier speed rule. The relay's own default covers the miss.
+    const policies = buildMirrorManifest().policies;
+    expect(policies.at(-1)?.name).toBe("large-artifacts");
+    expect(policies.some((p) => Object.keys(p.match).length === 0)).toBe(false);
   });
 
   it("uses only known traffic policies", () => {
     for (const policy of buildMirrorManifest().policies) {
       expect(["latency", "speed"]).toContain(policy.rules.traffic_policy);
+    }
+  });
+
+  it("never puts response-side or per-mirror cache decisions in policy", () => {
+    for (const policy of buildMirrorManifest().policies) {
+      expect(policy.rules).not.toHaveProperty("cache");
+      expect(policy.rules).not.toHaveProperty("cache_ttl");
+      expect(policy.rules).not.toHaveProperty("no-store");
+      expect(policy.rules).not.toHaveProperty("no-vary");
+      expect(policy.rules).not.toHaveProperty("no-transform");
+    }
+  });
+
+  it("does not expose internal relay directives on a mirror entry", () => {
+    for (const mirror of buildMirrorManifest().mirrors) {
+      expect(mirror).not.toHaveProperty("relayDirectives");
     }
   });
 });
@@ -245,7 +260,7 @@ describe("mirror manifest — GET/HEAD and ETag", () => {
     });
 
     expect(res.status).toBe(200);
-    expect(((await res.json()) as MirrorManifest).policies).toHaveLength(4);
+    expect(((await res.json()) as MirrorManifest).policies).toHaveLength(3);
   });
 });
 

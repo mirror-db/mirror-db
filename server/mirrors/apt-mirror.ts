@@ -38,6 +38,10 @@ export function createAptMirror(config: AptMirrorConfig): Mirror {
     path: config.name,
     keepHTTP: true,
     policyTags: ["apt"],
+    // An APT path names its bytes: `/dists/<suite>/Release` and
+    // `/pool/.../pkg.deb` do not change with request headers, so the relay can
+    // keep one variant per URL. `Vary` is still delivered unchanged.
+    relayDirectives: ["no-vary"],
     fetch(request) {
       const url = new URL(request.url);
       const rel = url.pathname.slice(prefix.length);

@@ -11,12 +11,19 @@ challenges never reach clients.
 ([server/types.ts](server/types.ts)): `name`, optional `host` (subdomain route,
 e.g. `dcr.mirs.uk` → Docker Hub) or `path` (single word, matched as the first
 URL segment, e.g. `mirs.uk/npm/...`), optional `keepHTTP` (serve over plain HTTP
-without redirect), `fetch(request)`, optional `status()`.
+without redirect), optional `relayDirectives` (response-side `X-MDB-Relay`
+keywords; never part of the distributed manifest), `fetch(request)`, optional
+`status()`.
 
 - [server/index.ts](server/index.ts) — entry. Parses subdomain from host header.
   Subdomain mirror wins; on bare `@` splits pathname, looks up first segment in
-  `mirrorsByPath`, then the mount switches: `/speedtest/`, `/keys/`, `/api/`,
-  `/scripts/`, `/conf/`. Everything else is a static asset or a **real 404** — the SPA
+  `mirrorsByPath`, then the mount switches: `/speedtest/`, `/relaytest/`,
+  `/keys/`, `/api/`, `/scripts/`, `/conf/`. Every mirror response goes through
+  `serveMirror`, which applies the shared relay-control middleware
+  ([server/relay-control.ts](server/relay-control.ts)). Inbound requests are
+  normalised first: a request without a valid `X-MDB-Relay-Host` loses any
+  `X-MDB-Relay` request header, so a direct client cannot inject response
+  control. Everything else is a static asset or a **real 404** — the SPA
   shell is only served for `/` and `/about` (the routes `src/router/` owns).
   An unknown first segment must never fall through to the SPA: a 404 page
   ([server/not-found.ts](server/not-found.ts)) answers in two flavours —
@@ -29,10 +36,14 @@ without redirect), `fetch(request)`, optional `status()`.
   live in their own subdir under `mirrors/`.
 - [server/api/index.ts](server/api/index.ts) — Hono app at `/api/`. Endpoints:
   - `GET|HEAD /api/mirrors` — JSON manifest of all mirrors plus ordered relay
-    policies. Mirrors include `keepHTTP` and opaque `policy_tags`; policies select
-    `latency` or `speed` transport by tag, mirror, or mount-relative path. Both
-    methods emit the same deterministic ETag and honour `If-None-Match`. See
-    [ADR 0009](docs/adr/0009-policy-driven-relay-transport.md).
+    policies. Mirrors include `keepHTTP` and opaque `policy_tags`; each policy
+    carries `match` unchanged and `rules` with `traffic_policy` (`latency` or
+    `speed`), `passthrough`, and the evaluation control `exit`. Matching rules
+    merge field by field in order (later wins, omitted inherits). Both methods
+    emit the same deterministic ETag and honour `If-None-Match`. See
+    [ADR 0009](docs/adr/0009-policy-driven-relay-transport.md) for distribution
+    and [ADR 0012](docs/adr/0012-policy-field-merge-and-passthrough.md) for the
+    current merge semantics.
   - `GET /api/status/:name` — per-mirror status snapshot.
 - [server/conf/apt/](server/conf/apt/) — deb822 source presets at
   `/conf/apt/<name>.sources`. Each preset returns `Stanza[]`; explicit metadata,
@@ -57,6 +68,15 @@ without redirect), `fetch(request)`, optional `status()`.
 - [server/speedtest.ts](server/speedtest.ts) — `GET /speedtest/{mb}` on bare
   domain. Streams random bytes (1–1024 MB) via `ReadableStream` +
   `crypto.getRandomValues`. Ignores `?passthrough` (Worker is always origin).
+- [server/relaytest.ts](server/relaytest.ts) — `/relaytest/<case>` on the bare
+  domain: a deterministic upstream for exercising the relay cache from outside.
+  Eight fixed cases (`fresh`, `revalidate`, `ttl`, `vary`, `encoding`, `range`,
+  `no-store`, `digest`) answer a fixed status, header set and body; `GET` and
+  `HEAD` share status and headers, `HEAD` has no body and never evaluates Range.
+  Not a mirror: absent from the manifest, never cached by the Worker, and the
+  relay bypasses `/relaytest` itself (it neither reads nor writes cache there).
+  Production mirrors carry no test configuration; tests point a temporary mirror
+  at a case URL.
 
 ### Relay info — [server/relay.ts](server/relay.ts)
 
@@ -108,6 +128,33 @@ a 404) — `cuda` is `…/compute/cuda/repos/` and only that path lists,
 `config/`, `keys/`, `yumrepos/` as site chrome). See
 [ADR 0007](docs/adr/0007-listing-mounts-declare-their-root.md).
 
+### Relay directive — [server/relay-control.ts](server/relay-control.ts)
+
+`X-MDB-Relay` is the response-side control header, Cache-Control-shaped:
+comma-separated `keyword` or `keyword=value`. The Worker parses/merges it, and
+the relay consumes it (see the Relay server section below).
+Keywords: `no-store`, `no-vary`, `ttl=<seconds>`; unknown keywords are ignored.
+
+- **Injection is per mirror.** `serveMirror` merges `mirror.relayDirectives`
+  into whatever the upstream already sent; an existing directive always wins and
+  is never overridden. Merging is keyword-deduplicated and deterministic.
+- **First batch:** the eleven `createAptMirror` mounts (`debian`,
+  `debian-ports`, `debian-security`, `ubuntu`, `ubuntu-ports`, `mise`,
+  `syncthing-pkgs`, `hashicorp`, `opentofu`, `github-cli`,
+  `gitlab-runner-deb`) add `no-vary`. That states an upstream fact (a path names
+  its bytes regardless of request headers), not a cache policy; other mirrors
+  keep ordinary `Vary` handling. The APT proxy also adds `no-store` to mutable
+  `dists/` indexes (excluding `by-hash/`), so independently cached Release and
+  Packages generations cannot cause a hash/size mismatch.
+- **Inbound copies are meaningless.** `normalizeRelayRequest` removes an
+  `X-MDB-Relay` request header unless a valid `X-MDB-Relay-Host` marks the
+  request as relay-originated. Only request headers are touched.
+- **Directives never enter the manifest.** `no-store`, `no-vary`, `no-transform`,
+  freshness, coding and digests are post-response facts; policies only carry
+  pre-request fields (see [ADR 0012](docs/adr/0012-policy-field-merge-and-passthrough.md)).
+  `sanitizeResponse` strips any third-party `x-mdb-relay`, so only the front-door
+  middleware can add one.
+
 ## Core proxy — [server/pkgs/oci/registry-proxy.ts](server/pkgs/oci/registry-proxy.ts)
 
 `proxyRegistryRequest(request, opts)`. Dependency-injected (`fetchImpl`,
@@ -136,6 +183,9 @@ cached.
   to contain cache-poisoning blast radius (a bad upstream can't poison another
   registry's digest space; client self-verifies sha256 anyway → DoS-only).
 - Forced `Cache-Control: public, max-age=31536000, immutable` on the stored copy.
+- The stored copy also drops `vary` via `STRIP_STORED_HEADERS`: a digest-addressed
+  blob must not vary, and the Cache API refuses to store a `Vary` response. Only
+  the cached copy is affected; the client still receives upstream's `Vary`.
 - **Size guard** `maxCacheBytes` (default 512MB = CF Free/Pro per-object limit).
   Skip when `Content-Length` unknown or over limit (avoids mid-stream
   `cache.put` reject). Override on Business/Enterprise.
@@ -146,9 +196,19 @@ cached.
 
 `STRIP_RESPONSE_HEADERS`: `www-authenticate` (no login prompt), `set-cookie` /
 `set-cookie2` (digest-shared cache would replay one client's cookie to all),
-`vary` (digest content is request-header-independent → avoid spurious misses),
-`age`, hop-by-hop (`connection`/`keep-alive`/`transfer-encoding`). Stripping
-happens **before** cache write, so neither cache nor client sees them.
+`x-mdb-relay` (a third-party upstream must not inject a relay directive; the
+front-door middleware adds the mirror's own after sanitising), `age`, hop-by-hop
+(`connection`/`keep-alive`/`transfer-encoding`). Stripping happens **before**
+cache write, so neither cache nor client sees them.
+
+`vary` is **not** stripped. The relay needs it to build cache variants, and a
+direct client must see the representation negotiation the upstream asked for.
+Responses carrying `Vary` bypass the Worker read-through cache instead of being
+stored without it (see below).
+
+`STRIP_STORED_HEADERS` adds `vary` for the one place a response is stored
+regardless: the OCI digest cache, where a digest-addressed blob must not vary. It
+applies to the stored copy only, so the client still receives upstream's `Vary`.
 
 ## Docker Hub mirror — [server/mirrors/docker/](server/mirrors/docker/)
 
@@ -195,13 +255,17 @@ through these, not bare `fetch`, so user-agent + rate-limiting are uniform.
 
   **What can be stored (learned the hard way):** the Cache API keys by URL
   only and **silently refuses to store a response carrying `Vary`** — verified
-  in workerd, `cache.match` returns nothing. `save()` therefore stores the
-  sanitised header set (`STRIP_RESPONSE_HEADERS`), not whatever the upstream
-  sent. It also materialises document bodies before `put` (≤8 MB, or any
-  textual body): a caller that transforms the response consumes the original
+  in workerd, `cache.match` returns nothing. `save()` therefore **skips any
+  response that carries `Vary`**: stripping it to force a store would make the
+  next hit deliver a different header set than the miss. Those requests always
+  reach the upstream, and variant handling belongs to the relay. For the rest it
+  stores the sanitised header set (`STRIP_RESPONSE_HEADERS`), not whatever the
+  upstream sent. It also materialises document bodies before `put` (≤8 MB, or
+  any textual body): a caller that transforms the response consumes the original
   body, and putting the unread branch of that tee never completes. Binary
   bodies keep streaming. Both failure modes are silent — the cache simply stays
-  empty — so `cache.workers.test.ts` covers them.
+  empty — so `cache.workers.test.ts` covers them. The snapshot mirror applies the
+  same `Vary` skip to its own store.
 
   **Freshness (ADR 0003):** `save()` stamps the entry with `x-mdb-stored-at` and
   `x-mdb-revalidate-after` (default `MdbRevalidateIntervalMs` = 10 min) and lifts
@@ -214,9 +278,11 @@ through these, not bare `fetch`, so user-agent + rate-limiting are uniform.
   live in the stored headers — which are then **stripped on the way out**
   (`mark()`), together with setting `x-mdb-cache: hit|revalidated|miss|bypass`.
 - **`sanitizeResponse(upstream, opts?)`** — strip dangerous headers
-  (`STRIP_RESPONSE_HEADERS`: `www-authenticate`, `set-cookie`, `vary`, `age`,
-  hop-by-hop) from an upstream response before serving to clients. Optional
-  `cacheControl` override on 200s. Shared by both OCI and APT proxies.
+  (`STRIP_RESPONSE_HEADERS`: `www-authenticate`, `set-cookie`, `x-mdb-relay`,
+  `age`, hop-by-hop; **not** `vary`) from an upstream response before serving to
+  clients. `cacheControl` overrides only the cacheability/lifetime directives on
+  a 200; `mergeCacheControl` keeps orthogonal ones such as `no-transform`, which
+  the relay must still see. Shared by both OCI and APT proxies.
 - Constants in [const.ts](server/pkgs/fetch/const.ts): `CFCacheLimit` (512 MB,
   CF Free/Pro per-object cap) = `MdbCacheSizeLimit`, `MdbMaxConcurrentRequests`,
   `MdbCacheName` (`"upstream"`), `MdbUserAgent`, `MdbRevalidateIntervalMs`
@@ -229,7 +295,10 @@ through these, not bare `fetch`, so user-agent + rate-limiting are uniform.
   `server/pkgs/fetch/` — shared upstream fetch + cache + sanitize helpers.
   `server/pkgs/web-list/` — upstream directory-listing proxy (see below).
 - `server/mirrors/proxy/` — composable hook-based HTTP proxy builder (see below).
-- `server/relay/` — relay middleware (request rewrite for single-domain access).
+- `server/relay.ts` — relay host parsing; `server/relay-control.ts` —
+  `X-MDB-Relay` parsing/merging and inbound request normalisation;
+  `server/relaytest.ts` — `/relaytest/<case>` deterministic upstream for relay
+  cache tests.
 - `server/api/` — Hono API routes.
 - `server/keys/` — PGP/SSH key proxy at `/keys/` (see above).
 - `server/mirrors/<name>/` — per-mirror logic + `index.ts` exporting a `Mirror`
@@ -498,6 +567,15 @@ reaching upstreams directly. Mounted in [server/index.ts](server/index.ts) via
 - APT `pool/` files are proxied with `ezfetch` and **do not forward `Range`**:
   a resuming client gets `200` from byte 0 and apt restarts the download. Not
   fixed yet; `dists/` files and by-hash objects are unaffected.
+- Relay request-cache metadata is **local to one relay** (bbolt). A shared
+  `S3_BUCKET` carries bodies and digest pointers only, so two relays never share
+  variant metadata; each rebuilds it from its own upstream traffic.
+- Concurrent cache misses are deliberately not merged (no singleflight in M2), so
+  a cold popular object is fetched once per concurrent request.
+- Shared-storage unit tests use a fake object store. A manual one-shot Docker
+  check against RustFS 1.0.6 passed Put, dual-digest Get, Range, metadata restart,
+  cross-instance adoption, Delete and Prune on 2026-11-23. No deployment has been
+  verified, and that manual check is not part of CI.
 
 ## Commands
 
@@ -588,7 +666,7 @@ cf:                          # edge selection; every key is optional
   # snapshot_interval: 1h    # also written on shutdown
   # bootstrap_host: ""       # default: hostname of upstream.url
 
-cache:                       # content store; disabled while dir is empty
+cache:                       # content store + request cache; disabled while dir is empty
   # dir: /var/cache/mirror-relay  # CACHE_DIR; enables the store, holds .tmp + index
   # capacity: 128GiB       # CACHE_CAPACITY; space the store may use, required
   # max_size: 12GiB        # CACHE_MAX_SIZE; LRU budget + per-body cap,
@@ -610,7 +688,10 @@ acme:
 
 Cache keys have their own env names, unlike the dotted-key default:
 `CACHE_DIR`, `CACHE_CAPACITY`, `CACHE_MAX_SIZE`, `S3_BUCKET`, `S3_ENDPOINT`,
-`S3_PREFIX`, `S3_REGION`.
+`S3_PREFIX`, `S3_REGION`. `CACHE_DIR` enables **both** the content store and
+request caching: empty means no store and every request goes upstream; non-empty
+means an already-resolved mirror `GET`/`HEAD` tries the cache by default (ADR
+0011). There is no separate cache switch and no manifest field for it.
 
 ### Upstream transport
 
@@ -632,20 +713,33 @@ The initial manifest load is a GET. Later checks send HEAD with the saved strong
 ETag every `relay.manifest_sync_interval` (default 10m, jittered); only a changed
 or missing ETag causes another GET. Mirrors, compiled policies, routing maps and
 ETag are one atomic snapshot. Network errors, invalid JSON, duplicate policy
-names, invalid RE2 expressions and unknown traffic policies preserve the last
-known good snapshot.
+names, invalid RE2 expressions, an unknown `traffic_policy`, a non-boolean
+`passthrough` / `exit`, `null`, and an unknown key in `match` or `rules` all
+preserve the last known good snapshot — validation is all-or-nothing.
 
-The first policy whose tag, exact mirror name and mount-relative path conditions
-all match wins; an empty match catches everything and an unmatched request is
-`latency`. Paths exclude the query and keep their case and escaping. For a path
-mount, `/debian/pool/x.deb` is matched as `/pool/x.deb`; for a subdomain mount,
-the path is unchanged. Generic artifact suffixes only apply after mirror
-resolution, never to API, keys, scripts, speedtest or relay control endpoints.
+Evaluation is **field merge, not first-match** (ADR 0012 supersedes the
+first-match rule of ADR 0009; distribution, matching, ETag, atomic replacement
+and transport fallback stand). Every matching rule applies the fields it
+declares to an accumulated decision: later matches override, omitted fields
+inherit, an explicit `false` overrides, and `exit: true` stops evaluation after
+its own merge (`exit` is never part of the result). Defaults for an unmatched
+resolved request are `traffic_policy: latency`, `passthrough: false`. There is no
+catch-all policy: nothing matches before mirror resolution, and a trailing
+latency rule would wrongly override an earlier speed rule under merge semantics.
+Control-plane endpoints and `/relaytest` are bypassed before matching. Paths
+exclude the query and keep their case and escaping. For a path mount,
+`/debian/pool/x.deb` is matched as `/pool/x.deb`; for a subdomain mount, the path
+is unchanged. Generic artifact suffixes only apply after mirror resolution.
+
+The relay never reads a cache field from the manifest: whether to cache is
+`CACHE_DIR` plus the response (ADR 0011). `passthrough` is the only
+policy-level cache decision, and it is knowable before the request.
 
 Initial rules send OCI `blobs/`, APT `pool/`, and common archive, disk-image,
-installer and package suffixes to `speed`, followed by an explicit latency
-default. Bare `.gz` is deliberately absent so `Packages.gz` stays on latency.
-See [ADR 0009](docs/adr/0009-policy-driven-relay-transport.md).
+installer and package suffixes to `speed`; there is no explicit default rule
+because an unmatched request already falls back to `latency`. Bare `.gz` is
+deliberately absent so `Packages.gz` stays on latency.
+See [ADR 0012](docs/adr/0012-policy-field-merge-and-passthrough.md).
 
 ### Edge selection — [tools/relay/server/edge.go](tools/relay/server/edge.go)
 
@@ -759,11 +853,106 @@ themselves. There is no separate TMP_DIR.
   and `GET|HEAD /hash-content/sha256/<64 hex>`. Bad address → 400, absent → 404,
   storage error → 502, other methods → 405. Bodies stream, so a body may be
   evicted mid-transfer.
-- `relay prune` is the offline cleanup (see below), not part of serving. M1 stops
-  at storage and reads: the reverse-proxy MISS write path, prefetch, telemetry and
-  policy are later milestones. `CACHE_DIR` must be writable by the service user;
-  the unit's `ReadWritePaths` covers `/var/cache/mirror-relay`, so a custom
-  directory needs a unit change.
+- `Store.Range` opens a body at an offset and returns the total size, the
+  building block for `Content-Range` and multipart ranges. An offset outside
+  `[0, size]` is `ErrInvalidRange`; a hit promotes recency like `Get`.
+- **Variant metadata lives in the same local index** (`variantsBucket`,
+  `variantRefsBucket`, `variantMetaBucket`). It is local bbolt even with
+  `S3_BUCKET`: the shared bucket carries bodies and digest pointers only.
+  `variantRefsBucket` maps body SHA-256 → variant key so eviction, `Delete`, and
+  `Prune` remove the metadata in the same transaction as the body. Hard bounds:
+  16 variants per URL, 65536 rows globally, 32 KiB per encoded row; an
+  over-limit write returns `ErrVariantLimit` and is ignored, never truncating.
+- `relay prune` is the offline cleanup (see below), not part of serving.
+  Request caching is M2 and lives beside this store; prefetch and telemetry are
+  later milestones. `CACHE_DIR` must be writable by the service user; the unit's
+  `ReadWritePaths` covers `/var/cache/mirror-relay`, so a custom directory needs
+  a unit change.
+
+### Relay request cache — [tools/relay/server/cache.go](tools/relay/server/cache.go)
+
+A hand-written exchange, not `httputil.ReverseProxy`: a hit must serve without
+touching upstream, and a miss must tee the body into the store while the client
+receives the same bytes. Trigger: `CACHE_DIR` set, method `GET`/`HEAD`, request
+resolves to a manifest mirror, and the merged policy did not say `passthrough`.
+Internal endpoints never resolve to a mirror; `/relaytest` is also skipped
+explicitly. `passthrough` takes the ordinary proxy path before the cache chain:
+no lookup, no write, no *response* `X-MDB-Relay` parsing or removal, no
+transcode. (Inbound request sanitising still happens first for every request.)
+
+Key: `mirror://<mirror name><mount-relative escaped path>[?<raw query>]`. Scheme,
+relay domain and method deliberately stay out, so a `GET` and a `HEAD` share one
+entry.
+
+Decision order (`serveCache`):
+
+1. Client `Cache-Control: no-store` runs a **miss that never writes**.
+   `no-cache`, `max-age=0`, or `Pragma: no-cache` without `Cache-Control` force
+   revalidation of a fresh entry.
+2. Zero matching variants → MISS. One → fresh local hit, or stale revalidation;
+   more than one (records with different `Vary` sets all match) → ambiguous,
+   re-fetch and afterwards delete the identities that no longer apply.
+3. A fresh hit writes the stored status/headers/body locally, rebuilds
+   `Content-Length` from the body size and `Age` from `StoredAt`; conditional
+   requests are evaluated first (`If-None-Match` uses weak comparison, `If-Match`
+   strong; date conditions need `Last-Modified`) → `304` / `412`, then Range.
+4. A stale entry is revalidated with `If-None-Match` / `If-Modified-Since`
+   only. `304` folds new freshness/headers into metadata (never `Vary`,
+   `Content-Encoding` or `Content-Length`) and leaves the body; a `304` that
+   newly declares `no-store`/`private`/`Vary: *` drops the entry. `200` replaces
+   the variant, `404`/`410` delete it. A stale ranged request is forwarded
+   instead of revalidated.
+5. MISS streams the upstream response into `<CACHE_DIR>/.tmp` via an
+   `io.Pipe` while writing the client, computes SHA-1 and SHA-256, and commits
+   metadata under a timeout independent of the client connection. Only a
+   complete `200` GET whose body reached the client becomes an entry.
+
+Freshness (`freshnessExpiry`): `no-cache` stores but is immediately stale;
+otherwise shared-cache preference `s-maxage` → `max-age` → `Expires` → the
+`X-MDB-Relay: ttl` fallback (absent by default, `0` is not "forever"). `ttl`
+never overrides upstream freshness.
+
+Store rules (`storable` / `storableMetadata`): refused by `X-MDB-Relay:
+no-store`, `Cache-Control: no-store` or `private`, non-`200`, `Vary: *` unless
+`no-vary` was declared, `Content-Range`, an undecodable `Content-Encoding`, or no
+body. HEAD never writes; a cold HEAD goes upstream and leaves no body-less entry.
+A stale HEAD is revalidated like GET: `304` updates metadata, `200`/`404`/`410`
+invalidates the variant, other statuses write nothing.
+
+`X-MDB-Relay` keywords consumed: `no-store`, `no-vary`, `ttl=<seconds>`. The
+header is stripped before delivery on the cache and normal proxy paths; a
+`passthrough` response is delivered with it intact. `no-transform` is honoured
+from standard `Cache-Control`.
+
+Encoding: stored codings are `identity`, `gzip`, `deflate`, `br`, `zstd`;
+negotiation follows full `Accept-Encoding` qvalues/`*`/`identity` with
+`stored → zstd → br → gzip → deflate` tie-break (explicit coding beats implicit
+`identity`). Transcoding always decodes to `identity` then re-encodes; the
+result is never stored and never creates a variant. A transcoded delivery drops
+`Content-Length`, `Content-MD5`, `Digest`, `Docker-Content-Digest` and demotes a
+strong `ETag` to weak. An OCI digest path or any entry carrying a digest header
+is never transcoded; `no-transform`, no acceptable coding, or a range on a
+to-be-transcoded hit falls back upstream. zstd decoding caps the frame window at
+8 MiB (`encoding_stream.go`), so one request cannot allocate an arbitrary
+decoder window.
+
+Range: answered locally only for a fresh complete entry whose negotiated coding
+equals the stored coding. Single and multipart ranges, `416`, and `If-Range`
+(strong `ETag` or exact date; weak never matches) are built from the local body
+via `Store.Range`. Multipart responses are capped at 32 ranges; a larger list is
+ignored in favour of a complete `200`, preventing read/bandwidth amplification.
+A Range MISS is forwarded and `206` is never stored; if upstream ignores Range
+and returns a complete `200`, the entry may be stored and one warning line
+records the full-body transfer.
+
+Failure and concurrency: a pre-response cache failure logs and falls back to the
+ordinary proxy; a transient body error does not delete metadata, a definite
+absence drops it and becomes a MISS. Write failures only disable the tee — the
+client still gets the complete response. Nothing retries after response headers
+are sent. **No singleflight**: concurrent misses on one variant each go upstream
+and stream independently; `Put` is idempotent by real hash and metadata is
+committed by atomic replacement, so the final state is one body and one
+self-consistent variant.
 
 ### `relay prune` — [tools/relay/prune.go](tools/relay/prune.go)
 
@@ -779,7 +968,10 @@ non-zero error.
 S3 HEAD) and dropped — LRU, object record and its alias — only on a definite
 absence (`stale`); a transient or permission error keeps the row and counts as
 `failed` (fail-closed, never fail open). Dangling alias rows whose primary record
-is missing are then removed in one bbolt transaction (also `stale`). Only after
+is missing are then removed in one bbolt transaction (also `stale`), and variant
+metadata whose body record is gone is dropped from the local index (normal
+eviction already removes it in the same transaction as the body; this repairs
+older drift). Only after
 that does it list the backend and delete every body and digest pointer the index
 does not contain, so pointers of an already-vanished body go in the same pass.
 Shared storage is paged with `ListObjectsV2` under the configured prefix — the
@@ -797,9 +989,22 @@ content is still fetchable upstream.
 ### Key files
 
 - `tools/relay/server/server.go` — Server, routers, `httputil.ReverseProxy`
-  rewrites, `X-MDB-Relay-Host` handling (`RelayHostHeader`), manifest watcher.
-  Internal endpoints: `/.mirror-relay/cert-pack`, `/.mirror-relay/mirrors`,
-  `/.mirror-relay/pool` (all JWT-guarded).
+  rewrites, `X-MDB-Relay-Host` handling (`RelayHostHeader`), manifest watcher,
+  and the `handleRequest` order: policy decision → inbound directive sanitising →
+  cache chain (unless passthrough) → proxy. Internal endpoints:
+  `/.mirror-relay/cert-pack`, `/.mirror-relay/mirrors`, `/.mirror-relay/pool`
+  (all JWT-guarded).
+- `tools/relay/server/cache.go` — request-cache chain: lookup, hits,
+  revalidation, MISS tee-and-store, metadata commit, ambiguity cleanup.
+  `cache_headers.go` — stored-header selection, freshness, conditional
+  evaluation, request cache directives. `cache_range.go` — single/multipart
+  ranges and `416`.
+- `tools/relay/server/encoding.go` — `Accept-Encoding` negotiation and coding
+  parsing; `encoding_stream.go` — decode-to-identity/re-encode streams and the
+  8 MiB zstd window cap.
+- `tools/relay/server/relay_directive.go` — `X-MDB-Relay` parsing and inbound
+  direct-request sanitising; `policy.go` — manifest policy compilation,
+  field-merge evaluation, passthrough decision and transport selection.
 - `tools/relay/server/edge.go` — edge-selection wiring: engine construction,
   `cf.*` → `engine.Config` mapping, `/.mirror-relay/pool` snapshot, shutdown.
 - `tools/relay/server/certmagic.go` — `CertMagicStorage()` is a `sync.OnceValue`:
@@ -818,10 +1023,13 @@ content is still fetchable upstream.
   read-only handler (400/404/405 matrix), registered before the proxy catch-all.
 - `tools/relay/prune.go` — `relay prune` cobra command: offline cache cleanup,
   prints counts to stdout, non-zero on any failure.
-- `tools/relay/hashstore/` — content store: `store.go` (Put/Get/Stat/Delete,
-  capacity + LRU + reconcile), `index.go` (bbolt: sizes, aliases, LRU order,
-  pending deletes), `backend.go` (local bodies), `s3.go` (RustFS bodies +
-  digest pointers).
+- `tools/relay/hashstore/` — content store: `store.go` (Put/Get/Range/Stat/
+  Delete, capacity + LRU + reconcile), `index.go` + `index_variant.go` (bbolt:
+  sizes, aliases, LRU order, pending deletes, variant rows and their reverse
+  body references, the global variant counter), `variant.go` (variant identity,
+  header normalisation, per-URL/global/row limits), `backend.go` (local bodies
+  and offsets), `s3.go` (RustFS bodies + digest pointers), `prune.go` (dangling
+  variant repair).
 - `tools/relay/certclient/` — read-only `certmagic.Storage` that snapshots the
   parent's cert-pack hourly. Mutations return `ErrReadOnly`.
 - `tools/relay/certsrv/` — streams the cert-pack tar; skips lock files.
@@ -846,11 +1054,25 @@ usual hardening (`ProtectHome`, `ProtectKernelTunables`, `RestrictNamespaces`,
 hop-by-hop/`Connection` tokens, `X-MDB-Relay-Host` passthrough, upgrade,
 base path), host matching, `keepHTTP`, cert-name→token mapping, cert-pack
 tar streaming/untar, guard accept/reject matrix, config precedence, the
-`forward` half-close regression, and the hash store (dual digests, strict LRU,
+`forward` half-close regression, the hash store (dual digests, strict LRU,
 oversized bodies, restart/alias recovery, local reconcile, shared S3 via a fake
 object store, pending-delete retry, `/hash-content` 400/404/405 routing, sharded
-bucket keys, and offline prune (paged LIST, only-unindexed deletion, foreign key
-and other-prefix safety, failure counting). CI runs vet + test before building.
+bucket keys, offline prune (paged LIST, only-unindexed deletion, foreign key and
+other-prefix safety, failure counting)), and M2: policy field merge / `exit` /
+invalid-manifest rejection, variant identity and limits, local hits,
+revalidation (`304` / `200` / `404` / `410`), HEAD sharing, conditional requests,
+single/multipart ranges and `416`/`If-Range`, the four transcodings plus
+`no-transform`/digest protection, `X-MDB-Relay` parsing and stripping, ambiguity
+re-fetch, and cache failure fallback. Shared-storage unit cases use a fake object
+store; the separate manual Docker RustFS 1.0.6 check is not part of CI. CI runs
+vet + test before building.
+
+Worker side (`pnpm test`, both vitest projects): `/relaytest` returns all eight
+cases with matching HEAD status/headers, relay-control merges without overriding
+and strips a direct request's `X-MDB-Relay`, mirror-directive injection adds
+`no-vary` after sanitising (tested with `debian` as the representative APT
+mount), and `cache.workers.test.ts` proves a `Vary` response bypasses the Worker
+Cache API instead of being stored without it.
 
 ### Build
 

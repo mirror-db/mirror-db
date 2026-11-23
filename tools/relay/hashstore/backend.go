@@ -52,6 +52,10 @@ type backend interface {
 	// open returns a reader for a body. A missing or unreadable body is
 	// ErrNotFound.
 	open(ctx context.Context, sha256 string) (io.ReadCloser, int64, error)
+	// openRange returns a reader positioned at offset and the body's total size.
+	// offset == size is an empty read; anything outside [0, size] is
+	// ErrInvalidRange.
+	openRange(ctx context.Context, sha256 string, offset int64) (io.ReadCloser, int64, error)
 	// stat reports whether a body exists and how large it is. A definite absence
 	// is (0, false, nil); a transient, permission or I/O error is returned and
 	// must not be mistaken for a miss.
@@ -126,7 +130,14 @@ func (b *localBackend) put(_ context.Context, c Content, tmpPath string) error {
 	return nil
 }
 
-func (b *localBackend) open(_ context.Context, sha256 string) (io.ReadCloser, int64, error) {
+func (b *localBackend) open(ctx context.Context, sha256 string) (io.ReadCloser, int64, error) {
+	return b.openRange(ctx, sha256, 0)
+}
+
+func (b *localBackend) openRange(_ context.Context, sha256 string, offset int64) (io.ReadCloser, int64, error) {
+	if offset < 0 {
+		return nil, 0, fmt.Errorf("%w: offset %d", ErrInvalidRange, offset)
+	}
 	p, err := b.path(sha256)
 	if err != nil {
 		return nil, 0, err
@@ -148,6 +159,16 @@ func (b *localBackend) open(_ context.Context, sha256 string) (io.ReadCloser, in
 	if info.IsDir() {
 		_ = f.Close()
 		return nil, 0, fmt.Errorf("%w: %s is a directory", ErrUnreadable, p)
+	}
+	if offset > info.Size() {
+		_ = f.Close()
+		return nil, 0, fmt.Errorf("%w: offset %d beyond body size %d", ErrInvalidRange, offset, info.Size())
+	}
+	if offset > 0 {
+		if _, err := f.Seek(offset, io.SeekStart); err != nil {
+			_ = f.Close()
+			return nil, 0, err
+		}
 	}
 	return f, info.Size(), nil
 }

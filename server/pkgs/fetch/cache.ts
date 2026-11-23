@@ -163,13 +163,18 @@ export class MdbCacheManager {
     // neither lifted nor ignored.
     if (isUncacheable(resp.headers.get("cache-control"))) return;
 
+    // A response carrying `Vary` cannot be stored by the Cache API (it keys by
+    // URL only and silently refuses one). Do not strip `Vary` and store the
+    // rest: the next hit would then be delivered without the representation
+    // headers the miss had. Let every such request reach the upstream and leave
+    // variant handling to the relay.
+    if (resp.headers.has("vary")) return;
+
     await this.dedupExec(req, async () => {
       const cache = await ResolveCache(this.cache);
       const headers = new Headers(resp.headers);
-      // The Cache API keys by URL only and **refuses to store a response that
-      // carries `Vary`** (verified in workerd: `cache.match` returns nothing).
-      // It also must not hold auth challenges or cookies. Store the sanitised
-      // header set instead of whatever the upstream sent.
+      // The Cache API must not hold auth challenges or cookies either. Store the
+      // sanitised header set instead of whatever the upstream sent.
       for (const name of STRIP_RESPONSE_HEADERS) headers.delete(name);
       headers.set(MDB_STORED_AT, String(this.now()));
       if (!headers.has(MDB_REVALIDATE_AFTER)) {

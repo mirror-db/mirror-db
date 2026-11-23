@@ -1,5 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import { withRelayDirectives } from "@server/relay-control";
+
 import { AptRepo } from "./repo";
 import { createAptProxy } from "./proxy";
 
@@ -152,7 +154,7 @@ describe("createAptProxy — file enforcement", () => {
 });
 
 describe("createAptProxy — cache-control", () => {
-  it("caches a known by-hash file as immutable", async () => {
+  it("caches a known by-hash file as immutable without no-store", async () => {
     const proxy = makeProxy({ ready: true, hashes: [HASH] });
     const res = await proxy.fetch(
       get(`dists/trixie/main/binary-amd64/by-hash/SHA256/${HASH}`),
@@ -161,21 +163,51 @@ describe("createAptProxy — cache-control", () => {
     expect(res.headers.get("cache-control")).toBe(
       "public, max-age=31536000, immutable",
     );
+    expect(res.headers.get("x-mdb-relay")).toBeNull();
   });
 
-  it("caches a dist file with the source freshness window", async () => {
+  it.each([
+    "dists/trixie/InRelease",
+    "dists/trixie/Release",
+    "dists/trixie/main/binary-amd64/Packages.gz",
+  ])("marks the mutable index %s with relay no-store", async (path) => {
     const proxy = makeProxy({
       ready: true,
-      paths: ["dists/trixie/InRelease"],
+      paths: [path],
       validUntil: Date.now() + 3600_000,
     });
-    const res = await proxy.fetch(get("dists/trixie/InRelease"));
+    const res = await proxy.fetch(get(path));
 
     expect(ezfetchMock).toHaveBeenCalled();
+    expect(res.headers.get("x-mdb-relay")).toBe("no-store");
+
+    // Existing freshness is unchanged: the relay decision is additive.
     const cc = res.headers.get("cache-control") ?? "";
     const maxAge = Number(cc.match(/max-age=(\d+)/)?.[1]);
     expect(maxAge).toBeGreaterThan(3500);
     expect(maxAge).toBeLessThanOrEqual(3600);
+  });
+
+  it("keeps no-store when the front middleware adds no-vary", async () => {
+    const proxy = makeProxy({
+      ready: true,
+      paths: ["dists/trixie/InRelease"],
+    });
+    const res = await proxy.fetch(get("dists/trixie/InRelease"));
+
+    const merged = withRelayDirectives(res, ["no-vary"]);
+    expect(merged.headers.get("x-mdb-relay")).toBe("no-store, no-vary");
+    expect(merged.headers.get("cache-control")).toBe(
+      res.headers.get("cache-control"),
+    );
+  });
+
+  it("does not mark pool payloads no-store", async () => {
+    const proxy = makeProxy({ ready: true, paths: [] });
+    const res = await proxy.fetch(get("pool/main/n/nginx/nginx_1.0_amd64.deb"));
+
+    expect(ezfetchMock).toHaveBeenCalled();
+    expect(res.headers.get("x-mdb-relay")).toBeNull();
   });
 
   it("strips set-cookie from upstream responses", async () => {

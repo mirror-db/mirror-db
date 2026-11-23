@@ -134,6 +134,25 @@ describe("cachedfetch", () => {
     expect(cache.entries.has(url)).toBe(false);
   });
 
+  it("does not cache a response carrying Vary; every request reaches upstream", async () => {
+    const url = "https://x.com/vary";
+    state.fetch.mockImplementation(
+      async () =>
+        new Response("body", {
+          headers: { "content-length": "4", vary: "Accept" },
+        }),
+    );
+
+    const first = await cachedfetch(url);
+    const second = await cachedfetch(url);
+
+    expect(first.headers.get("vary")).toBe("Accept");
+    expect(second.headers.get("vary")).toBe("Accept");
+    expect(await second.text()).toBe("body");
+    expect(state.fetch).toHaveBeenCalledTimes(2);
+    expect(cache.entries.has(url)).toBe(false);
+  });
+
   it("bypasses cache entirely for POST", async () => {
     const url = "https://x.com/post";
     await cachedfetch(new Request(url, { method: "POST", body: "x" }));

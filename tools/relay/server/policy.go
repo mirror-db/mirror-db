@@ -1,7 +1,9 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"regexp"
@@ -9,9 +11,9 @@ import (
 	"strings"
 )
 
-// trafficPolicy is the transport preference a policy rule selects. It is a
-// preference, not an availability requirement: the caller falls back to the
-// latency pool when the speed pool is empty.
+// trafficPolicy is the transport preference a rule selects. It is a preference,
+// not an availability requirement: the caller falls back to the latency pool
+// when the speed pool is empty.
 type trafficPolicy string
 
 const (
@@ -19,13 +21,95 @@ const (
 	trafficSpeed   trafficPolicy = "speed"
 )
 
+// ruleBool is a rule field that can be absent, explicitly false, or explicitly
+// true. A pointer would collapse absent and null; a plain bool would collapse
+// absent and false. Both distinctions matter: `passthrough: false` must
+// override an earlier `true`, while an omitted field inherits.
+type ruleBool struct {
+	value bool
+	set   bool
+}
+
+func boolRule(v bool) ruleBool { return ruleBool{value: v, set: true} }
+
+func (b ruleBool) MarshalJSON() ([]byte, error) {
+	return json.Marshal(b.value)
+}
+
+func (b *ruleBool) UnmarshalJSON(data []byte) error {
+	if isJSONNull(data) {
+		return fmt.Errorf("rule boolean: null is not allowed")
+	}
+	b.set = true
+	return json.Unmarshal(data, &b.value)
+}
+
+func isJSONNull(data []byte) bool {
+	return string(bytes.TrimSpace(data)) == "null"
+}
+
 // Policy mirrors one entry of the manifest's ordered `policies` array. Order is
-// part of the public contract: the first complete match wins.
+// part of the public contract: later matches overwrite earlier ones field by
+// field.
 type Policy struct {
 	Name        string      `json:"name"`
 	Description string      `json:"description,omitempty"`
 	Match       PolicyMatch `json:"match"`
 	Rules       PolicyRules `json:"rules"`
+}
+
+// UnmarshalJSON is a strict whitelist for the policy object: only name,
+// description, match and rules are accepted. A misspelled key (for example
+// `matc`) must not be ignored, because the missing match would decode as an
+// empty matcher and turn the rule into a catch-all for every resolved request.
+// Null, unknown keys and wrong types reject the whole manifest, so the relay
+// keeps its last known good snapshot.
+func (p *Policy) UnmarshalJSON(data []byte) error {
+	if isJSONNull(data) {
+		return fmt.Errorf("policy: null is not allowed")
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return fmt.Errorf("policy: %w", err)
+	}
+
+	var out Policy
+	for key, value := range raw {
+		switch key {
+		case "name":
+			if isJSONNull(value) {
+				return fmt.Errorf("policy.name: null is not allowed")
+			}
+			if err := json.Unmarshal(value, &out.Name); err != nil {
+				return fmt.Errorf("policy.name: %w", err)
+			}
+		case "description":
+			if isJSONNull(value) {
+				return fmt.Errorf("policy.description: null is not allowed")
+			}
+			if err := json.Unmarshal(value, &out.Description); err != nil {
+				return fmt.Errorf("policy.description: %w", err)
+			}
+		case "match":
+			if isJSONNull(value) {
+				return fmt.Errorf("policy.match: null is not allowed")
+			}
+			if err := json.Unmarshal(value, &out.Match); err != nil {
+				return fmt.Errorf("policy.match: %w", err)
+			}
+		case "rules":
+			if isJSONNull(value) {
+				return fmt.Errorf("policy.rules: null is not allowed")
+			}
+			if err := json.Unmarshal(value, &out.Rules); err != nil {
+				return fmt.Errorf("policy.rules: %w", err)
+			}
+		default:
+			return fmt.Errorf("policy: unknown field %q", key)
+		}
+	}
+	*p = out
+	return nil
 }
 
 // PolicyMatch selects requests. Every non-empty field must match (AND). An
@@ -43,10 +127,127 @@ type PolicyMatch struct {
 	PathPattern string `json:"path_pattern,omitempty"`
 }
 
-// PolicyRules is what a matched policy does. The only rule in this version is
-// the traffic policy.
+// UnmarshalJSON is a strict whitelist. `match: null` is a configuration error,
+// not a synonym for omission, and an unknown key is an error too: silently
+// dropping a misspelled condition would turn a narrow rule into an empty match
+// and make it catch every resolved request. The whole manifest is not decoded
+// with DisallowUnknownFields — only the objects whose shape is a contract
+// (policy, match and rules) reject stray keys.
+func (m *PolicyMatch) UnmarshalJSON(data []byte) error {
+	if isJSONNull(data) {
+		return fmt.Errorf("match: null is not allowed")
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return fmt.Errorf("match: %w", err)
+	}
+
+	var out PolicyMatch
+	for key, value := range raw {
+		var dst *string
+		switch key {
+		case "tag":
+			dst = &out.Tag
+		case "mirror":
+			dst = &out.Mirror
+		case "path_prefix":
+			dst = &out.PathPrefix
+		case "path_suffix":
+			dst = &out.PathSuffix
+		case "path_pattern":
+			dst = &out.PathPattern
+		default:
+			return fmt.Errorf("match: unknown field %q", key)
+		}
+		if isJSONNull(value) {
+			return fmt.Errorf("match.%s: null is not allowed", key)
+		}
+		if err := json.Unmarshal(value, dst); err != nil {
+			return fmt.Errorf("match.%s: %w", key, err)
+		}
+	}
+	*m = out
+	return nil
+}
+
+// PolicyRules is what a matched rule does. Every field is optional: an omitted
+// field inherits the value already accumulated from earlier matching rules.
+//
+// `exit` is rule-local evaluation control, not a merged value, so it never
+// appears in policyDecision. Caching is not a policy field: whether a response
+// may be stored is decided after the upstream responds (X-MDB-Relay and
+// Cache-Control), not before the request is issued.
 type PolicyRules struct {
-	TrafficPolicy trafficPolicy `json:"traffic_policy"`
+	TrafficPolicy trafficPolicy `json:"traffic_policy,omitempty"`
+	Passthrough   ruleBool      `json:"passthrough,omitempty"`
+	Exit          ruleBool      `json:"exit,omitempty"`
+}
+
+// MarshalJSON emits only the fields the rule actually declares. The zero
+// option type is an internal detail and must not leak into the debugging
+// endpoint's wire shape.
+func (r PolicyRules) MarshalJSON() ([]byte, error) {
+	out := struct {
+		TrafficPolicy *string `json:"traffic_policy,omitempty"`
+		Passthrough   *bool   `json:"passthrough,omitempty"`
+		Exit          *bool   `json:"exit,omitempty"`
+	}{}
+	if r.TrafficPolicy != "" {
+		name := string(r.TrafficPolicy)
+		out.TrafficPolicy = &name
+	}
+	if r.Passthrough.set {
+		v := r.Passthrough.value
+		out.Passthrough = &v
+	}
+	if r.Exit.set {
+		v := r.Exit.value
+		out.Exit = &v
+	}
+	return json.Marshal(out)
+}
+
+// UnmarshalJSON rejects null, unknown fields and an explicit empty
+// traffic_policy. Empty is rejected here rather than treated as omission:
+// omission inherits, while an explicit empty string is a configuration error.
+func (r *PolicyRules) UnmarshalJSON(data []byte) error {
+	if isJSONNull(data) {
+		return fmt.Errorf("rules: null is not allowed")
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return fmt.Errorf("rules: %w", err)
+	}
+
+	var out PolicyRules
+	for key, value := range raw {
+		switch key {
+		case "traffic_policy":
+			if isJSONNull(value) {
+				return fmt.Errorf("rules.traffic_policy: null is not allowed")
+			}
+			var name string
+			if err := json.Unmarshal(value, &name); err != nil {
+				return fmt.Errorf("rules.traffic_policy: %w", err)
+			}
+			if name == "" {
+				return fmt.Errorf("rules.traffic_policy: empty string is not allowed")
+			}
+			out.TrafficPolicy = trafficPolicy(name)
+		case "passthrough":
+			if err := json.Unmarshal(value, &out.Passthrough); err != nil {
+				return fmt.Errorf("rules.passthrough: %w", err)
+			}
+		case "exit":
+			if err := json.Unmarshal(value, &out.Exit); err != nil {
+				return fmt.Errorf("rules.exit: %w", err)
+			}
+		default:
+			return fmt.Errorf("rules: unknown field %q", key)
+		}
+	}
+	*r = out
+	return nil
 }
 
 // compiledPolicy is a validated policy with its regular expression compiled.
@@ -71,11 +272,14 @@ func compilePolicies(in []Policy) ([]compiledPolicy, error) {
 		}
 		seen[p.Name] = true
 
-		switch p.Rules.TrafficPolicy {
-		case trafficLatency, trafficSpeed:
-		default:
-			return nil, fmt.Errorf("policy %q: traffic_policy %q is not latency or speed",
-				p.Name, p.Rules.TrafficPolicy)
+		// An omitted traffic_policy inherits; only a declared one is validated.
+		if p.Rules.TrafficPolicy != "" {
+			switch p.Rules.TrafficPolicy {
+			case trafficLatency, trafficSpeed:
+			default:
+				return nil, fmt.Errorf("policy %q: traffic_policy %q is not latency or speed",
+					p.Name, p.Rules.TrafficPolicy)
+			}
 		}
 
 		cp := compiledPolicy{Policy: p}
@@ -115,17 +319,48 @@ func (p *compiledPolicy) matches(m Mirror, path string) bool {
 	return true
 }
 
-// policyFor returns the traffic policy of the first policy that matches the
-// resolved mirror and mount-relative path. Unmatched requests prefer latency.
-func (m *manifestState) policyFor(mirror Mirror, path string) trafficPolicy {
+// policyDecision is the merged result of evaluating the policy list. It is what
+// the request handler needs before the upstream request is issued:
+// TrafficPolicy selects the edge pool, Passthrough tells the later cache chain
+// to skip the exchange entirely because the upstream is known to stream it
+// through.
+type policyDecision struct {
+	TrafficPolicy trafficPolicy
+	Passthrough   bool
+}
+
+// defaultPolicyDecision is the value an unmatched request gets.
+var defaultPolicyDecision = policyDecision{TrafficPolicy: trafficLatency}
+
+// apply overlays the fields this rule declares onto d. Omitted fields inherit.
+func (p *compiledPolicy) apply(d *policyDecision) {
+	if p.Rules.TrafficPolicy != "" {
+		d.TrafficPolicy = p.Rules.TrafficPolicy
+	}
+	if p.Rules.Passthrough.set {
+		d.Passthrough = p.Rules.Passthrough.value
+	}
+}
+
+// policyFor evaluates every matching rule in array order, shallow-merging rule
+// fields at the top level: later matches win, omitted fields inherit. A
+// matching rule with `exit: true` stops evaluation after its own merge; `exit`
+// itself is not part of the result.
+func (m *manifestState) policyFor(mirror Mirror, path string) policyDecision {
+	d := defaultPolicyDecision
 	if m != nil {
 		for i := range m.policies {
-			if m.policies[i].matches(mirror, path) {
-				return m.policies[i].Rules.TrafficPolicy
+			p := &m.policies[i]
+			if !p.matches(mirror, path) {
+				continue
+			}
+			p.apply(&d)
+			if p.Rules.Exit.set && p.Rules.Exit.value {
+				break
 			}
 		}
 	}
-	return trafficLatency
+	return d
 }
 
 // policyList returns the policies in the manifest's wire shape, for the
@@ -138,18 +373,24 @@ func (m *manifestState) policyList() []Policy {
 	return out
 }
 
-// matchTrafficPolicy selects the transport policy for an inbound request.
+// matchPolicy returns the merged policy decision for an inbound request.
 //
 // Only a request that resolves to a mirror in the current manifest can match a
 // policy: control-plane endpoints, unknown hosts and unknown paths keep the
 // latency default even when a policy has an empty match.
-func (s *Server) matchTrafficPolicy(r *http.Request) trafficPolicy {
+func (s *Server) matchPolicy(r *http.Request) policyDecision {
 	st := s.manifest.Load()
 	mirror, path, ok := s.resolveMirror(st, r)
 	if !ok {
-		return trafficLatency
+		return defaultPolicyDecision
 	}
 	return st.policyFor(mirror, path)
+}
+
+// matchTrafficPolicy selects the transport policy for an inbound request. The
+// full decision is available through matchPolicy; this is the transport view.
+func (s *Server) matchTrafficPolicy(r *http.Request) trafficPolicy {
+	return s.matchPolicy(r).TrafficPolicy
 }
 
 // resolveMirror reports the manifest mirror an inbound request targets and the
@@ -197,19 +438,38 @@ func (s *Server) resolveMirror(st *manifestState, r *http.Request) (Mirror, stri
 	return Mirror{}, "", false
 }
 
-// trafficPolicyKey carries the request's selected policy from the handler to the
-// per-request RoundTripper.
-type trafficPolicyKey struct{}
+// policyDecisionKey carries the merged decision from the handler to everything
+// downstream: the transport reads the traffic policy, the cache chain reads
+// passthrough.
+type policyDecisionKey struct{}
 
+func withPolicyDecision(ctx context.Context, d policyDecision) context.Context {
+	return context.WithValue(ctx, policyDecisionKey{}, d)
+}
+
+func policyDecisionFromContext(ctx context.Context) policyDecision {
+	if d, ok := ctx.Value(policyDecisionKey{}).(policyDecision); ok {
+		return d
+	}
+	return defaultPolicyDecision
+}
+
+// withTrafficPolicy updates only the transport field, preserving passthrough
+// already placed on the context.
 func withTrafficPolicy(ctx context.Context, p trafficPolicy) context.Context {
-	return context.WithValue(ctx, trafficPolicyKey{}, p)
+	d := policyDecisionFromContext(ctx)
+	d.TrafficPolicy = p
+	return withPolicyDecision(ctx, d)
 }
 
 func trafficPolicyFromContext(ctx context.Context) trafficPolicy {
-	if p, ok := ctx.Value(trafficPolicyKey{}).(trafficPolicy); ok {
-		return p
-	}
-	return trafficLatency
+	return policyDecisionFromContext(ctx).TrafficPolicy
+}
+
+// passthroughFromContext reports whether the relay already knows, before
+// issuing the upstream request, that the response must bypass the cache chain.
+func passthroughFromContext(ctx context.Context) bool {
+	return policyDecisionFromContext(ctx).Passthrough
 }
 
 // policyTransport sends each request through the pool its policy selected.

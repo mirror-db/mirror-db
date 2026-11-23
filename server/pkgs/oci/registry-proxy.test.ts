@@ -173,7 +173,7 @@ describe("proxyRegistryRequest", () => {
     expect(authHeader(last.init)).toBeNull();
   });
 
-  it("strips Set-Cookie and Vary from the response", async () => {
+  it("strips Set-Cookie but delivers Vary", async () => {
     const { fetchImpl } = mockFetch(
       () =>
         new Response("ok", {
@@ -191,7 +191,30 @@ describe("proxyRegistryRequest", () => {
     });
 
     expect(res.headers.get("set-cookie")).toBeNull();
-    expect(res.headers.get("vary")).toBeNull();
+    // The relay needs Vary to build its variants; the Worker only drops it from
+    // the Cache API copy (which refuses to store a response carrying Vary).
+    expect(res.headers.get("vary")).toBe("Accept");
+  });
+
+  it("does not store Vary in the Cache API copy", async () => {
+    const { cache, store } = mockCache();
+    const { fetchImpl } = mockFetch(
+      () =>
+        new Response("LAYER", {
+          status: 200,
+          headers: { "content-length": "5", vary: "Accept" },
+        }),
+    );
+
+    await proxyRegistryRequest(req(`/v2/library/nginx/blobs/${DIGEST}`), {
+      upstream: "registry-1.docker.io",
+      fetchImpl,
+      cache,
+    });
+
+    const entry = [...store.values()][0];
+    expect(entry).toBeDefined();
+    expect(entry.headers.get("vary")).toBeNull();
   });
 
   it("never caches a Set-Cookie header", async () => {
@@ -216,6 +239,26 @@ describe("proxyRegistryRequest", () => {
     const entry = [...store.values()][0];
     expect(entry).toBeDefined();
     expect(entry.headers.get("set-cookie")).toBeNull();
+  });
+
+  it("does not forward relay control headers upstream", async () => {
+    const { fetchImpl, calls } = mockFetch(() => new Response("ok", { status: 200 }));
+
+    await proxyRegistryRequest(
+      req("/v2/library/nginx/manifests/latest", {
+        headers: {
+          "x-mdb-relay": "no-store",
+          "x-mdb-relay-host": "relay.example.com",
+          "x-keep": "yes",
+        },
+      }),
+      { upstream: "registry-1.docker.io", fetchImpl },
+    );
+
+    const headers = new Headers(calls[0].init?.headers);
+    expect(headers.has("x-mdb-relay")).toBe(false);
+    expect(headers.has("x-mdb-relay-host")).toBe(false);
+    expect(headers.get("x-keep")).toBe("yes");
   });
 
   it("does not forward the client's Authorization header upstream", async () => {

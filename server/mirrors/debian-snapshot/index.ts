@@ -29,6 +29,7 @@ import {
   mdbfetch,
   parseContentLength,
   sanitizeResponse,
+  STRIP_RESPONSE_HEADERS,
 } from "@server/pkgs/fetch";
 import type { Mirror } from "@server/types";
 
@@ -208,11 +209,22 @@ export function createDebianSnapshot(opts: DebianSnapshotOptions = {}): Mirror {
       if (
         store &&
         final.status === 200 &&
+        !final.headers.has("vary") &&
         withinCacheLimit(final, maxCacheBytes)
       ) {
-        // Store the sanitised copy: the Cache API refuses a response carrying
-        // `Vary`, and only the sanitised headers are meant to reach clients.
-        const write = store.put(key, final.clone()).catch(() => {});
+        // A `Vary` response is never stored: the Cache API would refuse it, and
+        // stripping `Vary` to force a store would make the next hit deliver a
+        // different header set than the miss. Let every request reach upstream;
+        // the relay owns variants.
+        const stored = final.clone();
+        const headers = new Headers(stored.headers);
+        for (const name of STRIP_RESPONSE_HEADERS) headers.delete(name);
+        const entry = new Response(stored.body, {
+          status: stored.status,
+          statusText: stored.statusText,
+          headers,
+        });
+        const write = store.put(key, entry).catch(() => {});
         waitUntil(write);
       }
 

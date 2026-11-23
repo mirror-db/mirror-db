@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -33,7 +34,14 @@ type fakeS3 struct {
 	headErr       error
 	listErr       error
 	pageSize      int
-	requested     []string
+	// omitContentRange models an object store that answers a ranged GET with a
+	// 206 but no Content-Range, which the backend must refuse rather than risk
+	// serving the wrong suffix.
+	omitContentRange bool
+	// rangeErr replaces the 416 an out-of-range GET returns, so tests can model
+	// servers whose error code is empty or unrelated.
+	rangeErr  error
+	requested []string
 }
 
 func newFakeS3() *fakeS3 { return &fakeS3{objects: map[string][]byte{}} }
@@ -63,10 +71,37 @@ func (f *fakeS3) GetObject(_ context.Context, in *s3.GetObjectInput, _ ...func(*
 	if !ok {
 		return nil, &smithy.GenericAPIError{Code: "NoSuchKey", Message: *in.Key}
 	}
-	return &s3.GetObjectOutput{
+	out := &s3.GetObjectOutput{
 		Body:          io.NopCloser(bytes.NewReader(data)),
 		ContentLength: aws.Int64(int64(len(data))),
-	}, nil
+	}
+	if in.Range == nil {
+		return out, nil
+	}
+
+	// Model S3's one-sided range: starting at or past the end is 416
+	// (InvalidRange), even at exactly the size.
+	spec, ok := strings.CutPrefix(aws.ToString(in.Range), "bytes=")
+	if !ok || !strings.HasSuffix(spec, "-") {
+		return nil, fmt.Errorf("unsupported range %q", aws.ToString(in.Range))
+	}
+	start, err := strconv.ParseInt(strings.TrimSuffix(spec, "-"), 10, 64)
+	if err != nil || start < 0 {
+		return nil, fmt.Errorf("bad range %q", aws.ToString(in.Range))
+	}
+	total := int64(len(data))
+	if start >= total {
+		if f.rangeErr != nil {
+			return nil, f.rangeErr
+		}
+		return nil, &smithy.GenericAPIError{Code: "InvalidRange", Message: aws.ToString(in.Range)}
+	}
+	if !f.omitContentRange {
+		out.ContentRange = aws.String(fmt.Sprintf("bytes %d-%d/%d", start, total-1, total))
+	}
+	out.Body = io.NopCloser(bytes.NewReader(data[start:]))
+	out.ContentLength = aws.Int64(total - start)
+	return out, nil
 }
 
 func (f *fakeS3) HeadObject(_ context.Context, in *s3.HeadObjectInput, _ ...func(*s3.Options)) (*s3.HeadObjectOutput, error) {
@@ -162,6 +197,24 @@ func (f *fakeS3) setPageSize(n int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.pageSize = n
+}
+
+func (f *fakeS3) setOmitContentRange(v bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.omitContentRange = v
+}
+
+func (f *fakeS3) setRangeErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.rangeErr = err
+}
+
+func (f *fakeS3) lenObjects() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.objects)
 }
 
 func (f *fakeS3) setFailDeleteKey(key string) {

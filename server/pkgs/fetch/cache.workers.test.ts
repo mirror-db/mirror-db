@@ -1,6 +1,6 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 
-import { MdbCacheManager } from "./cache";
+import { MdbCacheManager, cachedfetch, mdbCache } from "./cache";
 
 /**
  * The digest of the cache behaviour is only observable inside the runtime: the
@@ -69,10 +69,10 @@ describe("MdbCacheManager (workerd)", () => {
     expect(await hit!.text()).toBe('{"name":"pkg"}');
   });
 
-  it("stores a response that carries Vary", async () => {
-    // The Cache API refuses to store a response with `Vary` (it keys by URL
-    // only), which silently disabled caching for every upstream that sends one
-    // — npm metadata, PyPI Simple pages. The stored copy must be sanitised.
+  it("does not store a response carrying Vary", async () => {
+    // The Cache API refuses a response with `Vary` (it keys by URL only).
+    // Stripping it and storing the rest would make a later hit deliver a
+    // different header set than the miss, so the response bypasses the cache.
     const request = new Request(uniqueUrl("vary"));
     await mgr.save(
       request,
@@ -80,16 +80,52 @@ describe("MdbCacheManager (workerd)", () => {
         headers: {
           "content-type": "application/json",
           vary: "accept-encoding, accept",
-          "set-cookie": "a=b",
+        },
+      }),
+    );
+
+    expect(await mgr.match(request)).toBeUndefined();
+  });
+
+  it("serves a Vary response from upstream on every request", async () => {
+    const url = uniqueUrl("vary-delivery");
+    const upstream = vi
+      .spyOn(globalThis, "fetch")
+      .mockImplementation(async () =>
+        new Response("body", {
+          headers: { "content-length": "4", vary: "Accept" },
+        }),
+      );
+
+    try {
+      const first = await cachedfetch(url);
+      const second = await cachedfetch(url);
+
+      expect(first.headers.get("vary")).toBe("Accept");
+      expect(second.headers.get("vary")).toBe("Accept");
+      expect(await second.text()).toBe("body");
+      expect(upstream).toHaveBeenCalledTimes(2);
+      expect(await mdbCache.match(new Request(url))).toBeUndefined();
+    } finally {
+      upstream.mockRestore();
+    }
+  });
+
+  it("drops an upstream X-MDB-Relay directive from the stored copy", async () => {
+    const request = new Request(uniqueUrl("relay-control"));
+    await mgr.save(
+      request,
+      new Response("x", {
+        headers: {
+          "content-length": "1",
+          "x-mdb-relay": "no-store",
         },
       }),
     );
 
     const hit = await mgr.match(request);
     expect(hit).toBeDefined();
-    expect(await hit!.text()).toBe('{"ok":1}');
-    expect(hit!.headers.get("vary")).toBeNull();
-    expect(hit!.headers.get("set-cookie")).toBeNull();
+    expect(hit!.headers.get("x-mdb-relay")).toBeNull();
   });
 
   it("stamps the store time and keeps the client lifetime beside the entry", async () => {

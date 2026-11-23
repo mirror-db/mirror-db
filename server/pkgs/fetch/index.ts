@@ -15,7 +15,9 @@ export {
   parseRange,
   parseContentLength,
   sanitizeResponse,
+  mergeCacheControl,
   STRIP_RESPONSE_HEADERS,
+  STRIP_STORED_HEADERS,
   type SanitizeOptions,
 } from "./http";
 export * from "./const";

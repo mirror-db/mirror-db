@@ -58,6 +58,10 @@ type Server struct {
 	// ready is closed after the first successful manifest fetch. Until then the
 	// proxy answers 502 instead of an empty allow-list.
 	ready atomic.Bool
+
+	// now is the clock the cache chain uses for Age and freshness. Tests inject
+	// it; production leaves it nil and gets time.Now.
+	now func() time.Time
 }
 
 // mirrorsResponse matches the JSON shape from GET /api/mirrors.
@@ -204,11 +208,27 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The policy is carried on the request context so the per-request
-	// RoundTripper can pick a pool without rewriting the reverse proxy.
-	c := r.Context()
-	if p := s.matchTrafficPolicy(r); p != trafficLatency {
-		r = r.WithContext(withTrafficPolicy(c, p))
+	// The merged policy decision is carried on the request context so both the
+	// transport (traffic pool) and the cache chain (passthrough) see the same
+	// snapshot.
+	decision := s.matchPolicy(r)
+	r = r.WithContext(withPolicyDecision(r.Context(), decision))
+
+	// A request that did not come through a relay may not smuggle response
+	// control inward. This runs before the relay fills in X-MDB-Relay-Host, so
+	// a direct client's X-MDB-Relay is always dropped, while a multi-tier
+	// request that already carries the host header keeps its own.
+	SanitizeInboundRelayDirective(r)
+	if r.Header.Get(RelayHostHeader) == "" {
+		if _, base := s.matchBaseDomain(requestHost(r)); base != "" {
+			r.Header.Set(RelayHostHeader, base)
+		}
+	}
+
+	// passthrough is a pre-request decision: the response is proxy bytes,
+	// untouched. No cache lookup, no directive parsing or removal, no write.
+	if !decision.Passthrough && s.serveCache(w, r) {
+		return
 	}
 	s.proxy.ServeHTTP(w, r)
 }
@@ -221,6 +241,15 @@ func (s *Server) newReverseProxy() *httputil.ReverseProxy {
 		Rewrite:       s.rewriteUpstream,
 		Transport:     s.upstreamTransport(),
 		FlushInterval: 100 * time.Millisecond,
+		// The relay control header describes a response to the relay, not to a
+		// client. A passthrough request is the single exception: its response
+		// is delivered byte for byte, including the header.
+		ModifyResponse: func(res *http.Response) error {
+			if res.Request == nil || !passthroughFromContext(res.Request.Context()) {
+				res.Header.Del(RelayDirectiveHeader)
+			}
+			return nil
+		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			// Client cancellations are normal; don't spam the log.
 			if r.Context().Err() != nil {

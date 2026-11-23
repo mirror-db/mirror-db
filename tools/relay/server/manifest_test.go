@@ -30,8 +30,8 @@ const (
 			{"name": "docker", "host": "dcr", "policy_tags": ["oci"]}
 		],
 		"policies": [
-			{"name": "apt-pool", "match": {"tag": "apt", "path_prefix": "/pool/"}, "rules": {"traffic_policy": "speed"}},
-			{"name": "default", "match": {}, "rules": {"traffic_policy": "latency"}}
+			{"name": "default", "match": {}, "rules": {"traffic_policy": "latency"}},
+			{"name": "apt-pool", "match": {"tag": "apt", "path_prefix": "/pool/"}, "rules": {"traffic_policy": "speed"}}
 		]
 	}`
 
@@ -156,7 +156,7 @@ func TestManifestFirstLoadIsGET(t *testing.T) {
 	if _, ok := st.keepHTTP["debian"]; !ok {
 		t.Errorf("keepHTTP missing path mirror: %v", st.keepHTTP)
 	}
-	if got := st.policyFor(Mirror{Name: "debian", PolicyTags: []string{"apt"}}, "/pool/x.deb"); got != trafficSpeed {
+	if got := st.policyFor(Mirror{Name: "debian", PolicyTags: []string{"apt"}}, "/pool/x.deb").TrafficPolicy; got != trafficSpeed {
 		t.Errorf("policyFor = %q, want speed", got)
 	}
 }
@@ -231,7 +231,7 @@ func TestManifestChangedETagTriggersGET(t *testing.T) {
 	if len(st.mirrors) != 3 {
 		t.Fatalf("mirrors = %d, want 3", len(st.mirrors))
 	}
-	if got := st.policyFor(Mirror{Name: "npm"}, "/x"); got != trafficSpeed {
+	if got := st.policyFor(Mirror{Name: "npm"}, "/x").TrafficPolicy; got != trafficSpeed {
 		t.Fatalf("new policies not active: %q", got)
 	}
 }
@@ -292,6 +292,34 @@ func TestManifestInvalidUpdateKeepsSnapshot(t *testing.T) {
 			{"name": "a", "match": {"path_pattern": "(?<=x)/y"}, "rules": {"traffic_policy": "speed"}}]}`},
 		{"unknown traffic policy", `{"mirrors": [], "policies": [
 			{"name": "a", "rules": {"traffic_policy": "turbo"}}]}`},
+		{"explicit empty traffic policy", `{"mirrors": [], "policies": [
+			{"name": "a", "rules": {"traffic_policy": ""}}]}`},
+		{"null traffic policy", `{"mirrors": [], "policies": [
+			{"name": "a", "rules": {"traffic_policy": null}}]}`},
+		{"null passthrough", `{"mirrors": [], "policies": [
+			{"name": "a", "rules": {"passthrough": null}}]}`},
+		{"null exit", `{"mirrors": [], "policies": [
+			{"name": "a", "rules": {"exit": null}}]}`},
+		{"non-boolean passthrough", `{"mirrors": [], "policies": [
+			{"name": "a", "rules": {"passthrough": "yes"}}]}`},
+		{"null rules", `{"mirrors": [], "policies": [
+			{"name": "a", "rules": null}]}`},
+		{"null match", `{"mirrors": [], "policies": [
+			{"name": "a", "match": null, "rules": {"traffic_policy": "speed"}}]}`},
+		// A misspelled matcher used to decode as an empty match, silently
+		// turning a narrow rule into a catch-all.
+		{"misspelled match field", `{"mirrors": [], "policies": [
+			{"name": "a", "match": {"path_prefx": "/pool/"}, "rules": {"traffic_policy": "speed"}}]}`},
+		// A misspelled top-level key left match absent, which decoded as an
+		// empty match and caught every resolved request.
+		{"misspelled top-level match", `{"mirrors": [], "policies": [
+			{"name": "a", "matc": {"path_prefix": "/pool/"}, "rules": {"traffic_policy": "speed"}}]}`},
+		// Caching is decided by the upstream response (X-MDB-Relay), never by
+		// the manifest, so a stale cache field is a manifest error.
+		{"obsolete cache field", `{"mirrors": [], "policies": [
+			{"name": "a", "rules": {"cache": true}}]}`},
+		{"obsolete cache_ttl field", `{"mirrors": [], "policies": [
+			{"name": "a", "rules": {"cache_ttl": 600}}]}`},
 		{"malformed json", `{"mirrors": [`},
 	}
 
