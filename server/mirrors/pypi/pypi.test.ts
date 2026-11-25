@@ -3,6 +3,7 @@ import { describe, expect, it, vi, beforeEach } from "vitest";
 // Mock cachedfetch + sanitizeResponse before importing the module under test.
 vi.mock("@server/pkgs/fetch", () => ({
   cachedfetch: vi.fn(),
+  mdbfetch: vi.fn(),
   sanitizeResponse: vi.fn((res: Response) => res),
 }));
 

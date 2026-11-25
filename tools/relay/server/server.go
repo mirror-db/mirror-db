@@ -49,6 +49,15 @@ type Server struct {
 	// are then not registered at all.
 	hashStore *hashstore.Store
 
+	// prefetch is the in-memory lease table and background runner. It is nil
+	// when the content store is disabled: prefetch has nowhere to put a result.
+	prefetch *prefetchScheduler
+
+	// aptIndexes holds the latest normalised APT metadata index per mirror.
+	// It is memory only: a restart waits for a real Release request to discover
+	// the repository again.
+	aptIndexes aptIndexTable
+
 	// manifest is the single snapshot a request reads: mirrors, compiled
 	// policies, keepHTTP and the ETag they were loaded with. One pointer keeps
 	// them consistent; separate atomics could tear across a refresh.
@@ -144,6 +153,15 @@ func NewServer() (*Server, error) {
 		}
 		log.Printf("hash content store: dir=%s backend=%s capacity=%d max_size=%d",
 			cacheCfg.Dir, kind, cacheCfg.Capacity, cacheCfg.MaxSize)
+
+		s.prefetch = newPrefetchScheduler(
+			s.currentTime,
+			config.GetPrefetchConcurrency(),
+			config.GetPrefetchMaxTasks(),
+			s.runPrefetchTask,
+		)
+		s.prefetch.jitter = defaultPrefetchJitter
+		s.prefetch.Start()
 	}
 
 	s.proxy = s.newReverseProxy()
@@ -373,6 +391,9 @@ func (s *Server) handlePool(w http.ResponseWriter, r *http.Request) {
 // Close stops background work. The edge engine owns goroutines that would
 // otherwise keep probing a network nobody is serving from.
 func (s *Server) Close() {
+	if s.prefetch != nil {
+		s.prefetch.Close()
+	}
 	if s.edge != nil {
 		s.edge.Close()
 	}

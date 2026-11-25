@@ -127,6 +127,8 @@ func newCacheServer(t *testing.T, upstream string, opts cacheServerOptions) (*Se
 	s.manifest.Store(st)
 	s.ready.Store(true)
 	s.proxy = s.newReverseProxy()
+	s.prefetch = newPrefetchScheduler(s.currentTime, 4, 4096, s.runPrefetchTask)
+	t.Cleanup(s.prefetch.Close)
 	return s, store
 }
 

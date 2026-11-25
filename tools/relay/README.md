@@ -64,6 +64,10 @@ cache:                       # content store + request cache; disabled while dir
   #   prefix: relay              # S3_PREFIX
   #   region: us-east-1          # S3_REGION
 
+prefetch:                    # background metadata refresh; needs CACHE_DIR
+  # concurrency: 4           # PREFETCH_CONCURRENCY; parallel refreshes
+  # max_tasks: 4096          # PREFETCH_MAX_TASKS; in-memory leases
+
 acme:
   source: acme                # "acme" = DNS-01; "upstream" = sync from upstream.url; or a URL origin
   email: acme@mirror-db.net
@@ -80,6 +84,8 @@ Some have explicit names:
   `RELAY_BASE_DOMAINS='[{"domain":"r.example.com","cf_api_token":"tok"}]'`
 - `CACHE_DIR`, `CACHE_CAPACITY`, `CACHE_MAX_SIZE`, `S3_BUCKET`, `S3_ENDPOINT`,
   `S3_PREFIX`, `S3_REGION` — content store (see [Hash content store](#hash-content-store)).
+- `PREFETCH_CONCURRENCY`, `PREFETCH_MAX_TASKS` — background refresh bounds (see
+  [Metadata prefetch](#metadata-prefetch)); defaults 4 / 4096.
 
 ### `acme.source`
 
@@ -374,6 +380,10 @@ runs first for every request.
   updates freshness and headers only, `200` replaces the variant (and the body),
   `404` / `410` delete it. Without validators the relay fetches the full
   response. A stale ranged request is forwarded instead of revalidated.
+- **Index prediction** — no matching variant is not always a MISS: a fresh APT
+  metadata index can name the body of a package file by digest, and the relay
+  then serves it from the store (see [Hash prediction](#hash-prediction-apt)).
+  A client that asked to revalidate is always sent upstream.
 - **MISS** — the upstream body is streamed to the client while a tee writes
   `<CACHE_DIR>/.tmp` and computes SHA-1 + SHA-256; metadata is committed after a
   complete `200` GET whose bytes reached the client. Only a complete `200` GET
@@ -398,13 +408,16 @@ A response-control header the upstream sends to the relay, shaped like
 |---|---|
 | `no-store` | do not write this response to the relay cache |
 | `no-vary` | the URL path alone identifies the resource; `Vary` does not split variants, `Vary: *` included |
+| `prefetch` | the resource is eligible for background refresh while the relay keeps seeing demand for it; storage and delivery of this response are unchanged |
 | `ttl=<seconds>` | fallback lifetime when the response states none; `0` means none |
 
 The relay reads it and removes it before delivery, except on a `passthrough`
 response. Unknown keywords are ignored; `no-transform` is honoured from the
 standard `Cache-Control`. The Worker injects `no-vary` for the eleven
 `createAptMirror` mounts; every other mirror keeps ordinary `Vary` handling.
-These decisions never appear in the manifest policy.
+It injects `prefetch` on `Release`/`InRelease` of the five snapshot APT mounts
+and on the `/pypi/simple/` root index only (both on `200`/`304`). These
+decisions never appear in the manifest policy.
 
 ### Encodings and ranges
 
@@ -437,6 +450,56 @@ There is **no singleflight**: concurrent misses on the same response each go
 upstream and stream independently. Storage is idempotent by real hash, and
 variant metadata is replaced atomically, so the end state is one body and one
 self-consistent record. Metadata is per-relay; a shared bucket does not share it.
+
+### Hash prediction (APT)
+
+When a request resolves to an apt-tagged mirror and the relay holds a fresh
+schema-1 metadata index for it, a package file whose path the index declares can
+be delivered from the content store without contacting upstream.
+The relay tries the declared SHA-256 first and SHA-1 second, checks the size,
+and serves the body through the same hit path as a cache hit (`GET`, `HEAD` and
+Range). This creates no long-lived URL variant and its freshness never outlives
+the index. Metadata paths (`Release`, `Packages`, …) are never delivered this
+way. A missing body, a size mismatch, a stale index, a client request that
+demands revalidation, or a client that refuses `identity` falls back to the
+ordinary upstream path. A stored variant whose body disagrees with the fresh
+index is dropped before it can be served.
+
+The index is fetched from `/<mount>/.mdb/apt-index.json`, a Worker-owned
+document; the relay only parses that JSON and never parses APT metadata itself.
+
+## Metadata prefetch
+
+A lease-based, demand-driven refresh (ADR 0014). The relay creates a lease only
+when it serves a response carrying `X-MDB-Relay: prefetch`. Nothing is persisted
+and nothing is discovered by scanning, so a restart starts with an empty table
+and waits for real traffic.
+
+- **3-day lease.** `GET`/`HEAD` for the same resource renews it. After three days
+  without demand the lease and any pending refresh are dropped.
+- **Refresh follows freshness.** At the resource's freshness expiry the relay
+  sends a conditional `GET` (`If-None-Match` / `If-Modified-Since`). `304`
+  folds new freshness and headers into metadata, `200` replaces the stored
+  variant, `404`/`410` deletes it. A resource that states no freshness is not
+  refreshed automatically — a live request still revalidates it.
+- **`no-store` wins.** A prefetch lease never makes a `no-store` response
+  storable; the conflict is logged once per state change.
+- **APT is one index task per mirror.** Every `Release`/`InRelease` on an
+  apt-tagged mirror renews the same task, whose target is the mirror's fixed
+  `/.mdb/apt-index.json`. The index's freshness is the earliest `Valid-Until`
+  across its suites, or one hour from generation when none is stated. A `304`
+  can extend the current generation's deadline.
+- **Bounded and quiet on failure.** Default 4 concurrent refreshes and 4096
+  in-memory tasks, configurable; at the task limit a new lease is refused with a
+  warning and no active lease is evicted. Expiries carry a small jitter. A
+  failed refresh backs off 1, 5, 15, then 30 minutes (cap) and never deletes the
+  last good data. Everything is disabled while `CACHE_DIR` is empty. A body is
+  still bounded by `CACHE_MAX_SIZE`.
+
+The refresh replays the variant's `Vary`-matched request headers and pins
+`Accept-Encoding: identity`, so it never invents a variant or stores a
+transcoded body. A background run is always `GET`: a `HEAD` may create or renew
+a lease, but never becomes the refresh method.
 
 ## `relay prune` — offline cache cleanup
 

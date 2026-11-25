@@ -79,15 +79,33 @@ func (s *Server) serveCache(w http.ResponseWriter, r *http.Request) bool {
 		return false
 	}
 
+	// A fresh APT index is authoritative for the paths it covers. A variant
+	// whose body contradicts the index must not be served; dropping it lets the
+	// hash-prediction path (or a normal miss) answer instead.
+	expected, expectedGen, expectedOK := s.freshAPTFile(mirror, path, s.currentTime())
 	matches := matchingVariants(variants, r.Header)
+	if expectedOK && len(matches) == 1 && !s.variantMatchesExpectedFile(r.Context(), matches[0], expected) {
+		log.Printf("relay prefetch: dropping variant %q: body hash disagrees with the fresh index", key)
+		s.dropVariant(matches[0])
+		matches = nil
+	}
 	switch len(matches) {
 	case 0:
+		// A client that asked for revalidation (no-cache, max-age=0, Pragma:
+		// no-cache) must reach the upstream, even though the predicted delivery
+		// would satisfy the request without one.
+		if expectedOK && !requestPolicy.forceRevalidate && s.servePredicted(w, r, key, path, expected, expectedGen) {
+			return true
+		}
 		s.serveMiss(w, r, key, path, nil, true, false)
 		return true
 	case 1:
 		v := matches[0]
 		fresh := s.currentTime().Before(v.ExpiresAt) && !requestPolicy.forceRevalidate
 		if fresh {
+			if s.prefetch != nil {
+				s.prefetch.TouchNormalVariant(key, v, s.currentTime())
+			}
 			return s.serveHit(w, r, key, path, v)
 		}
 		// A ranged request is answered by forwarding it: turning a 206 into a
@@ -374,6 +392,15 @@ func (s *Server) serveRevalidation(w http.ResponseWriter, r *http.Request, key, 
 			// the next request start over as a MISS.
 			s.dropVariant(v)
 		}
+		if s.prefetch != nil {
+			noStore := directives.NoStore ||
+				cacheControlHas(resp.Header.Values("Cache-Control"), "no-store") ||
+				cacheControlHas(resp.Header.Values("Cache-Control"), "private")
+			if mirror, _, ok := s.resolveMirror(s.manifest.Load(), r); ok {
+				s.prefetch.ObserveNormalVariant(mirror, key, path, r.URL.Path, r.URL.EscapedPath(), r.URL.RawQuery,
+					next, s.currentTime(), directives.Prefetch, noStore)
+			}
+		}
 		if !s.serveHit(w, r, key, path, next) {
 			s.proxy.ServeHTTP(w, r)
 		}
@@ -444,6 +471,7 @@ func (s *Server) serveMiss(w http.ResponseWriter, r *http.Request, key, path str
 // either streams it with a tee or passes it through.
 func (s *Server) deliverUpstream(w http.ResponseWriter, r *http.Request, resp *http.Response, key string, old *hashstore.Variant, writable, cleanupAmbiguous bool) {
 	directives := RelayDirectivesFromHeader(resp.Header)
+	s.notePrefetchResponse(r, resp.Header)
 
 	// A ranged request that received a full 200 means upstream ignored Range.
 	// The full response may be cached, but the operator should be able to see

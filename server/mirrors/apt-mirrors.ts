@@ -8,8 +8,10 @@ import { createAptMirror, type AptMirrorConfig } from "./apt-mirror";
  * Each entry maps 1:1 to an upstream APT repository and is served at
  * `mirs.uk/<name>/`. Suites are curated where the full listing would
  * overwhelm the Worker's CPU budget; omit to auto-discover.
+ *
+ * Exported so tests can assert which mounts carry a metadata snapshot.
  */
-const aptConfigs: AptMirrorConfig[] = [
+export const aptConfigs: AptMirrorConfig[] = [
   {
     name: "debian",
     base: "http://ftp.us.debian.org/debian/",
@@ -95,6 +97,7 @@ const aptConfigs: AptMirrorConfig[] = [
     name: "mise",
     base: "https://mise.jdx.dev/deb/",
     suites: ["stable"],
+    snapshot: true,
   },
   {
     // `apt.syncthing.dev` no longer resolves; the archive moved to `.net`. The
@@ -104,6 +107,7 @@ const aptConfigs: AptMirrorConfig[] = [
     name: "syncthing-pkgs",
     base: "https://apt.syncthing.net/",
     suites: ["syncthing"],
+    snapshot: true,
   },
   {
     // A real APT repo (Artifactory, components main + test), not a file tree:
@@ -113,16 +117,19 @@ const aptConfigs: AptMirrorConfig[] = [
     name: "hashicorp",
     base: "https://apt.releases.hashicorp.com/",
     suites: ["trixie", "bookworm", "noble", "jammy", "focal", "resolute"],
+    snapshot: true,
   },
   {
     name: "opentofu",
     base: "https://packages.opentofu.org/opentofu/tofu/any/",
     suites: ["any"],
+    snapshot: true,
   },
   {
     name: "github-cli",
     base: "https://cli.github.com/packages/",
     suites: ["stable"],
+    snapshot: true,
   },
   {
     name: "gitlab-runner-deb",

@@ -222,6 +222,46 @@ describe("createAptProxy — cache-control", () => {
 
     expect(res.headers.has("set-cookie")).toBe(false);
   });
+
+  it("adds prefetch to Release/InRelease only when the mirror opts in", async () => {
+    ezfetchMock.mockImplementation(async () =>
+      new Response("r", {
+        status: 200,
+        headers: { "x-mdb-relay": "evil", "content-length": "1" },
+      }),
+    );
+    const proxy = createAptProxy(
+      makeRepo({ ready: true, paths: ["dists/trixie/InRelease", "dists/trixie/main/binary-amd64/Packages"] }),
+      { prefetchRelease: true },
+    );
+
+    const release = await proxy.fetch(get("dists/trixie/InRelease"));
+    // The upstream's own directive is sanitised away, then ours is merged in.
+    expect(release.headers.get("x-mdb-relay")).toBe("no-store, prefetch");
+
+    const index = await proxy.fetch(get("dists/trixie/main/binary-amd64/Packages"));
+    expect(index.headers.get("x-mdb-relay")).toBe("no-store");
+
+    // A failed release fetch is not an invitation to refresh it.
+    ezfetchMock.mockImplementation(async () => new Response(null, { status: 404 }));
+    const missing = await proxy.fetch(get("dists/trixie/InRelease"));
+    expect(missing.headers.get("x-mdb-relay")).toBe("no-store");
+  });
+
+  it("keeps prefetch on a 304 revalidation of Release/InRelease", async () => {
+    ezfetchMock.mockImplementation(async () =>
+      new Response(null, { status: 304, headers: { etag: '"release"' } }),
+    );
+    const proxy = createAptProxy(
+      makeRepo({ ready: true, paths: ["dists/trixie/InRelease"] }),
+      { prefetchRelease: true },
+    );
+
+    const res = await proxy.fetch(get("dists/trixie/InRelease"));
+
+    expect(res.status).toBe(304);
+    expect(res.headers.get("x-mdb-relay")).toBe("no-store, prefetch");
+  });
 });
 
 describe("createAptProxy — directory listing", () => {
@@ -258,6 +298,112 @@ describe("createAptProxy — directory listing", () => {
     // does not get pinned to the Worker's own origin (bypassing the relay).
     expect(res.status).toBe(308);
     expect(res.headers.get("location")).toBe("/dists/");
+  });
+});
+
+describe("createAptProxy — method forwarding", () => {
+  const head = (path: string) =>
+    new Request(`https://mirs.uk/${path}`, { method: "HEAD" });
+
+  it("forwards HEAD for an ordinary pool file and answers without a body", async () => {
+    const proxy = makeProxy({ ready: true, paths: [] });
+    const res = await proxy.fetch(
+      head("pool/main/n/nginx/nginx_1.0_amd64.deb"),
+    );
+
+    expect(ezfetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = ezfetchMock.mock.calls[0]!;
+    expect(url).toBe("https://up.example/debian/pool/main/n/nginx/nginx_1.0_amd64.deb");
+    expect(init).toEqual({ method: "HEAD" });
+    // The mocked upstream returns a body regardless; a HEAD must not relay it.
+    expect(await res.text()).toBe("");
+  });
+
+  it("forwards HEAD for a by-hash file and answers without a body", async () => {
+    const proxy = makeProxy({ ready: true, hashes: [HASH] });
+    const res = await proxy.fetch(
+      head(`dists/trixie/main/binary-amd64/by-hash/SHA256/${HASH}`),
+    );
+
+    expect(cachedfetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = cachedfetchMock.mock.calls[0]!;
+    expect(url).toBe(
+      `https://up.example/debian/dists/trixie/main/binary-amd64/by-hash/SHA256/${HASH}`,
+    );
+    expect(init).toEqual({ method: "HEAD" });
+    expect(res.headers.get("cache-control")).toBe(
+      "public, max-age=31536000, immutable",
+    );
+    expect(await res.text()).toBe("");
+  });
+
+  it("leaves a GET without a method override", async () => {
+    const proxy = makeProxy({ ready: true, paths: [] });
+    const res = await proxy.fetch(get("pool/main/n/nginx/nginx_1.0_amd64.deb"));
+
+    expect(ezfetchMock.mock.calls[0]![1]).toBeUndefined();
+    expect(await res.text()).toBe("data");
+  });
+});
+
+describe("createAptProxy — snapshot facts", () => {
+  const knownSets = (paths: string[], hashes: string[] = []) => async () => ({
+    paths: new Set(paths),
+    hashes: new Set(hashes),
+    suites: new Set(
+      paths
+        .filter((path) => path.startsWith("dists/"))
+        .map((path) => path.slice("dists/".length).split("/")[0]!),
+    ),
+  });
+
+  it("redirects a pool directory addressed without a trailing slash", async () => {
+    const proxy = createAptProxy(makeRepo({ ready: false }), {
+      known: knownSets(["pool/main/n/nginx/nginx_1.0_amd64.deb"]),
+    });
+
+    const res = await proxy.fetch(get("pool/main/n/nginx"));
+    expect(res.status).toBe(308);
+    expect(res.headers.get("location")).toBe("/pool/main/n/nginx/");
+    expect(ezfetchMock).not.toHaveBeenCalled();
+  });
+
+  it("redirects the dists root the same way", async () => {
+    const proxy = createAptProxy(makeRepo({ ready: false }), {
+      known: knownSets(["dists/trixie/InRelease"]),
+    });
+
+    const res = await proxy.fetch(get("dists"));
+    expect(res.status).toBe(308);
+    expect(res.headers.get("location")).toBe("/dists/");
+  });
+
+  it("leaves an unknown pool file to the ordinary file path", async () => {
+    const proxy = createAptProxy(makeRepo({ ready: false }), {
+      known: knownSets(["pool/main/n/nginx/nginx_1.0_amd64.deb"]),
+    });
+
+    const res = await proxy.fetch(get("pool/main/x/other/other_1.0_amd64.deb"));
+    expect(res.status).toBe(200);
+    expect(ezfetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("prefers the snapshot hashes over a stale repo index", async () => {
+    const fresh = "f".repeat(64);
+    const proxy = createAptProxy(makeRepo({ ready: true, hashes: [] }), {
+      known: knownSets(["dists/trixie/InRelease"], [fresh]),
+    });
+
+    // Without `known` the same request 404s — the repo never saw this hash.
+    const stale = await createAptProxy(makeRepo({ ready: true, hashes: [] })).fetch(
+      get(`dists/trixie/main/binary-amd64/by-hash/SHA256/${fresh}`),
+    );
+    expect(stale.status).toBe(404);
+
+    const res = await proxy.fetch(
+      get(`dists/trixie/main/binary-amd64/by-hash/SHA256/${fresh}`),
+    );
+    expect(res.status).toBe(200);
   });
 });
 

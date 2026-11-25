@@ -71,4 +71,4 @@
 
 已完成（M2，2026-11-23；未部署验证）。实现要点：manifest policy 只下发 relay 发起上游请求之前必须知道的信息；缓存开关与兜底生命周期不由 policy 决定（`CACHE_DIR` 启用后已解析 mirror 的 GET/HEAD 默认尝试缓存，兜底生命周期由 `X-MDB-Relay: ttl` 表达）；`traffic_policy`、`passthrough`（bool，默认 `false`）与 `exit`（bool 求值控制）同为 `rules` 顶层字段，`match` 不变；`passthrough` 匹配后响应不拆包、完全跳过缓存与响应控制处理，仅作用于已解析 mirror 的请求，内部端点与 `/relaytest` 旁路；按字段合并、last match win、`exit` 应用当前规则后停止且不进入结果；顶层浅合并，缺失继承，显式 `false` 覆盖，`null` 非法；响应侧决定只走响应头；不做协议兼容，破坏式覆盖下发。
 
-后续：prefetch 的自动更新标记属于 M3，另行设计。实现细节（bbolt 键模型、测试临时配置）由实现决定，不作为用户待决。
+后续：prefetch 已确定为响应侧 directive（`X-MDB-Relay: prefetch`），由 relay 按真实请求在本机建立按需 lease 并在 freshness 到期时刷新，不作为 policy 字段；M2 的 policy 边界与已实现语义不变，prefetch 已在 M3 落地（见 [ADR 0014](../../docs/adr/0014-demand-driven-prefetch-leases.md)）。实现细节（bbolt 键模型、测试临时配置）由实现决定，不作为用户待决。

@@ -40,6 +40,11 @@ func init() {
 	viper.SetDefault("acme.ca", "production")
 	viper.SetDefault("acme.agree", true)
 
+	// Prefetch scheduler bounds. Zero/invalid values fall back to these so a
+	// missing key never disables background refresh silently.
+	viper.SetDefault("prefetch.concurrency", DefaultPrefetchConcurrency)
+	viper.SetDefault("prefetch.max_tasks", DefaultPrefetchMaxTasks)
+
 	// Env override (highest priority).
 	viper.AutomaticEnv()
 	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
@@ -170,6 +175,33 @@ func hashStoreConfigFrom(v *viper.Viper) (*hashstore.Config, error) {
 
 // DefaultManifestSyncInterval is the manifest refresh cadence when unset.
 const DefaultManifestSyncInterval = 10 * time.Minute
+
+// Prefetch defaults. The scheduler lives only in memory; the limits bound a
+// single relay's background work, not the store.
+const (
+	DefaultPrefetchConcurrency = 4
+	DefaultPrefetchMaxTasks    = 4096
+)
+
+// GetPrefetchConcurrency is how many background refreshes one relay may run at
+// once. A non-positive or missing value means the default.
+func GetPrefetchConcurrency() int {
+	n := viper.GetInt("prefetch.concurrency")
+	if n <= 0 {
+		return DefaultPrefetchConcurrency
+	}
+	return n
+}
+
+// GetPrefetchMaxTasks bounds the in-memory lease table. A non-positive or
+// missing value means the default.
+func GetPrefetchMaxTasks() int {
+	n := viper.GetInt("prefetch.max_tasks")
+	if n <= 0 {
+		return DefaultPrefetchMaxTasks
+	}
+	return n
+}
 
 // GetManifestSyncInterval is how often the mirror manifest is revalidated. It
 // must be a positive duration: a non-positive or unparsable value is an error

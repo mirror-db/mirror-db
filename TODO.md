@@ -23,8 +23,9 @@ real CN client, or only from the relay? Needs one test from a domestic host
 `apt.syncthing.dev` has no DNS record; the archive lives at
 `https://apt.syncthing.net/` with suite `syncthing` (components `stable`,
 `stable-v2`, `candidate`, `nightly`). The mirror now points there; `dists/` has
-no listing upstream, so the suite list stays explicit and directory browsing on
-this mount answers 404 by design.
+no listing upstream, so the suite list stays explicit. Since M3 the mount is a
+snapshot mount, so directory browsing is synthesised from its metadata instead
+of answering `404`.
 
 ## 2b. Syncthing's second signing certificate
 

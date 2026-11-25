@@ -422,6 +422,22 @@ func (s *Store) Range(ctx context.Context, algo Algorithm, digest string, offset
 	return rc, total, nil
 }
 
+// Resolve maps either address for a body onto its canonical SHA-256 and known
+// SHA-1 alias, without touching recency. It is a lookup, not an existence check:
+// a shared backend can know an address whose body another relay has already
+// removed, so callers still use Stat or Get before serving.
+func (s *Store) Resolve(ctx context.Context, algo Algorithm, digest string) (sha256Hex, sha1Hex string, ok bool, err error) {
+	if !s.enter() {
+		return "", "", false, ErrClosed
+	}
+	defer s.leave()
+
+	if err := ctx.Err(); err != nil {
+		return "", "", false, err
+	}
+	return s.resolve(ctx, algo, digest)
+}
+
 // Stat reports whether a body exists and its size, without changing recency.
 func (s *Store) Stat(ctx context.Context, algo Algorithm, digest string) (int64, bool, error) {
 	if !s.enter() {

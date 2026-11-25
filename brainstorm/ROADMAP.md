@@ -31,15 +31,17 @@
 
 ## M3：元数据递归与自动更新
 
-- **状态**：未开始
-- **目标**：为不可列出的 APT 仓库提供元数据目录和 relay 哈希预判，并按策略自动更新指定元数据。
-- **进入条件**：M2 完成；CF/relay 解析一致性方案及 prefetch 调度、规模和失败边界确认。
+- **状态**：已完成（2026-11-23；Worker 与 relay 代码、测试落地，未部署验证；同日对五个真实上游 `syncthing-pkgs`、`hashicorp`、`mise`、`opentofu`、`github-cli` 完成一次快照构建与稳定 ETag 验证，`hashicorp` 一代去重后解析 15 个索引、约 5.92 MiB；该验证未加入 CI）
+- **目标**：为不可列出的 APT 仓库提供元数据目录和 relay 哈希预判，并按响应指令自动更新最近实际使用的元数据。
+- **进入条件**：已满足。M2 已完成；Worker 独占解析与固定 schema 1 索引契约、整代校验与原子切换、目录与双哈希预判的边界、prefetch 作为响应 directive 的按需 lease、并发与任务上限、退避和失败边界均已确认。
 - **包含的 features**：[APT 元数据索引](features/apt-metadata-index.md)、[元数据 Prefetch](features/metadata-prefetch.md)
+- **决策记录**：[ADR 0013](../docs/adr/0013-worker-owned-apt-metadata-index.md)、[ADR 0014](../docs/adr/0014-demand-driven-prefetch-leases.md)
 - **不包含**：包体递归预热、完整仓库镜像、通用网页链接抓取。
 - **完成条件**：
-  1. CF mirror 可从递归 APT 元数据合成目录，relay 可据此建立哈希预判。
-  2. 被 policy 标记的 Releases、PyPI 主目录等路径可自动保持更新。
-  3. 递归范围仅限元数据，不因引用关系自动下载包体。
+  1. 无原生 listing 的 APT 挂载由 CF mirror 依据 Worker 独占解析的规范化索引合成目录，relay 消费同一索引建立资源—哈希预判；不存在第二套 APT 解析器，索引不进入 manifest。
+  2. 索引按固定 `/<mount>/.mdb/apt-index.json` schema 1 输出：Release 引用的元数据及 Packages/Sources 引用的包文件都带路径、大小与双哈希；只从同一代 Release 构建，整代校验通过才原子切换，失败保留上一代；递归只到元数据，不因引用关系下载包体。
+  3. `X-MDB-Relay: prefetch` 是响应侧指令而非 policy 字段；relay 只在真实请求发现后建立本机内存 lease（3 天），GET/HEAD 续期，freshness 到期后台条件 GET，`no-store` 优先，无 freshness 不循环，重启不恢复；APT 每个 mirror 只维护一个聚合索引任务。
+  4. prefetch 默认 4 并发、4096 个内存任务且可配置，失败按退避重试，`CACHE_DIR` 为空时完全禁用；哈希预判仅用于索引声明的不可变包文件，body 缺失或索引过期时普通回源。
 - **依赖**：M2。
 
 ## M4：运行遥测

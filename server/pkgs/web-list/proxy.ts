@@ -32,6 +32,15 @@ export type WebListFetchHook = (
   request: Request,
 ) => Response | null | undefined | Promise<Response | null | undefined>;
 
+/**
+ * Directory source for {@link WebListProxy}. `WebListFs` is the default; a
+ * mirror that synthesises listings (APT metadata snapshot) supplies its own.
+ */
+export interface WebListSource {
+  readdir(rel?: string): Promise<WebListEntry[]>;
+  fetch(rel?: string, init?: RequestInit): Promise<Response>;
+}
+
 export interface WebListProxyOptions {
   /** Upstream base URL, e.g. `"http://ftp.us.debian.org/debian/"`. */
   baseURL: string;
@@ -62,6 +71,12 @@ export interface WebListProxyOptions {
    * reflect the actual URL prefix the proxy is served under.
    */
   baseHref?: string;
+  /**
+   * Optional directory source. Defaults to a {@link WebListFs} over `baseURL`.
+   * Overrides `fetchImpl`/`parsers` for listing reads; a custom source usually
+   * delegates `fetch` back to that FS.
+   */
+  source?: WebListSource;
 }
 
 const ALLOWED_METHODS = new Set(["OPTIONS", "GET", "HEAD", "PROPFIND"]);
@@ -85,14 +100,14 @@ function listingFailure(error: unknown): Response {
 }
 
 export class WebListProxy {
-  private readonly fs: WebListFs;
+  private readonly fs: WebListSource;
   private readonly render: WebListProxyOptions["render"];
   private readonly fetchHook: WebListFetchHook | undefined;
   /** The base href used in WebDAV responses (derived from upstream URL path). */
   private readonly baseHref: string;
 
   constructor(opts: WebListProxyOptions) {
-    this.fs = new WebListFs(opts.baseURL, {
+    this.fs = opts.source ?? new WebListFs(opts.baseURL, {
       fetchImpl: opts.fetchImpl,
       parsers: opts.parsers,
     });

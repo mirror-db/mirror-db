@@ -3,6 +3,11 @@
  *
  * Fetches the static HTML shell from assets and injects entry data as JSON
  * into a `<script>` block. Client-side Vue app picks it up and renders.
+ *
+ * Entry names come from upstream listings, so they are untrusted: a file called
+ * `</script><script>…` must not become markup here. The injected JSON escapes
+ * the characters that could close the script element, and the no-JS fallback
+ * escapes text and attributes.
  */
 
 import { env } from "cloudflare:workers";
@@ -17,6 +22,32 @@ async function getShell(): Promise<string> {
   return shellCache;
 }
 
+const HTML_ESCAPES: Record<string, string> = {
+  "&": "&amp;",
+  "<": "&lt;",
+  ">": "&gt;",
+  '"': "&quot;",
+  "'": "&#39;",
+};
+
+/** Escape text for HTML content or a quoted attribute value. */
+export function escapeHtml(value: string): string {
+  return value.replace(/[&<>"']/g, (char) => HTML_ESCAPES[char]!);
+}
+
+/**
+ * `JSON.stringify` with the code points that could terminate or confuse an
+ * inline `<script>` escaped. Valid JSON either way, and safe in HTML.
+ */
+export function encodeInlineJson(value: unknown): string {
+  return JSON.stringify(value)
+    .replace(/</g, "\\u003c")
+    .replace(/>/g, "\\u003e")
+    .replace(/&/g, "\\u0026")
+    .replace(/\u2028/g, "\\u2028")
+    .replace(/\u2029/g, "\\u2029");
+}
+
 /**
  * Render a directory listing page.
  *
@@ -29,14 +60,15 @@ export async function defaultRender(
 ): Promise<Response> {
   const shell = await getShell();
 
-  const meta = JSON.stringify({ path, entries });
-  const title = `/${path}`;
+  const meta = encodeInlineJson({ path, entries });
+  const title = escapeHtml(`/${path}`);
 
   // Fallback: plain list for no-JS / crawlers
   const fallbackHtml = entries
     .map((e) => {
       const href = e.type === "directory" ? `${e.name}/` : e.name;
-      return `<a href="${href}">${href}</a>`;
+      const escaped = escapeHtml(href);
+      return `<a href="${escaped}">${escaped}</a>`;
     })
     .join("\n");
 

@@ -32,7 +32,7 @@
 ## 交互
 
 1. **本地命中**：该 URL 下存在与请求的命中比较字段逐字段相等的缓存元数据且仍新鲜时，直接用持久化的状态、响应头与内容哈希交付本地 body，**不发起上游请求**。命中判断只比较字段取值，不经过摘要或指纹。命中后先按「条件请求」求值 `If-*`，再按「Range」求值范围，最后交付。HEAD 命中交付同一套元数据但不发 body、不求值 Range，见「HEAD 请求」。
-2. **哈希预判**（依赖后续里程碑的元数据索引）：从仓库元数据生成的资源—哈希映射直接定位本地 body，命中即交付，跳过上游探测。
+2. **哈希预判**（M3）：若请求解析到带 APT 标签的 mirror，且内存中的索引快照新鲜，索引声明的**不可变包文件**按路径查到预期 SHA-256（优先）或 SHA-1（回退），直接定位本地 body 并按本地命中路径交付（含 HEAD 与 Range），跳过上游探测。元数据文件（Release/Packages 等）不做这种交付；索引过期、body 缺失或大小不符时按普通 MISS 回源；交付不新建长期 URL variant，其 freshness 不超过索引。客户端显式要求重验（`no-cache` / `max-age=0`）时仍然回源，预判不满足该请求。
 3. **重验与探测**：在上游要求每次重验（`no-cache`）、元数据不新鲜或缺失时发生。有验证器时发条件 GET（`If-None-Match` / `If-Modified-Since`）；无验证器时完整重新获取。M2 不引入 HEAD 探测：不新增 policy 字段，也不自行用 HEAD 代替 GET 重验；客户端发来的 HEAD 请求按「HEAD 请求」处理。
 4. **重验结果**：`304` 只更新元数据（新鲜度、响应头），不动 body；`200` 替换该 variant 的元数据与 body 引用；`404` / `410` 视为该 variant 确定缺失，删除条目。以上针对 GET 重验；HEAD 重验拿不到 body，`200` 只让 variant 失效而不替换（客户端 GET 因此继续走完整 MISS），见「HEAD 请求」。
 5. **缓存交付**：命中后若本地 body 不存在或读取失败，回退上游；存储缺失按缓存 MISS 处理，不作为持久性错误。回退与故障判定的边界见「故障处理」。
@@ -123,7 +123,7 @@
 - 非 `passthrough` 链路中，relay 只从上游响应里读取该头，交付客户端前移除。`passthrough: true` 的响应不进入响应控制处理：不解析、不移除，按上游原样交付。
 - 入站请求上的同名头没有语义：请求未携带 `X-MDB-Relay-Host`（直接来源）时，relay 与 Worker 的 mirror 层都剥除它；响应上的 `X-MDB-Relay` 不受影响。
 - 未知关键字忽略；标准 `Cache-Control: no-store` 与 `X-MDB-Relay: no-store` 同效。
-- 响应决定只走响应头：`no-store`、`no-vary`、`ttl`、`no-transform`、实际新鲜度、实际编码与摘要都是 relay 拿到响应后才能判断的事实，不进入 mirrors manifest 的 policy。`no-transform` 直接按标准 `Cache-Control: no-transform` 识别；将来需要新增响应侧控制时按需加入 `X-MDB-Relay` 关键字。
+- 响应决定只走响应头：`no-store`、`no-vary`、`prefetch`、`ttl`、`no-transform`、实际新鲜度、实际编码与摘要都是 relay 拿到响应后才能判断的事实，不进入 mirrors manifest 的 policy。`no-transform` 直接按标准 `Cache-Control: no-transform` 识别；将来需要新增响应侧控制时按需加入 `X-MDB-Relay` 关键字。
 - 旧名 `X-MDB-Relay-No-Store` 不再使用。
 
 ## 响应头存储
@@ -207,4 +207,4 @@
 
 已完成（M2，2026-11-23；未部署验证）。实现要点：`X-MDB-Relay` 控制头定义 `no-store`、`no-vary` 与 `ttl=<seconds>`，只读上游、交付前移除（`passthrough` 响应不解析也不移除）、未知关键字忽略；请求未携带 `X-MDB-Relay-Host` 时 relay 与 Worker 都剥除入站请求上的 `X-MDB-Relay`，响应控制不受影响；响应决定只走响应头（`X-MDB-Relay` 或标准 `Cache-Control`），不进入 policy；`CACHE_DIR` 非空即启用缓存，已解析 mirror 的 GET/HEAD 默认尝试缓存，完整 200 GET 默认允许写，`passthrough: true` 是唯一的策略级跳过；仅 GET/HEAD 且内部端点与 `/relaytest` 旁路；新鲜度来自上游 `s-maxage` / `max-age` / `Expires`，三者皆无时由 `X-MDB-Relay: ttl` 兜底（缺省 0）；客户端 `Cache-Control: no-store` 跳过查询与写入，`no-cache` / `max-age=0` 强制重验；`no-cache` 存但每次重验；`no-store` / `private` / `Vary: *` 不存，`no-vary` 覆盖 `Vary: *` 且仅限 variant 划分，首批 11 个 `createAptMirror` 挂载注入 `no-vary`；过期后条件重验，`304` 更新元数据、`200` 替换、确定缺失删除；无验证器完整重取；variant identity 只是上游 `Vary` 所列请求头的规范化取值（`X-MDB-Relay: no-vary` 时忽略 `Vary`、单一 variant，`Vary: *` 亦然），`Accept-Encoding` 不参与匹配、`Content-Encoding` 不建立 variant，交付/重验响应头单独保存；同一 URL 与同一比较字段组合原子替换；编码偏好按完整 `Accept-Encoding` qvalue/通配/identity 协商，平手按已存编码 → `zstd` → `br` → `gzip` → `deflate`，显式编码优先隐式 `identity`，统一解码到 `identity` 再编码目标，库为标准库 `gzip` / `zlib` + `andybalholm/brotli` + `klauspost/compress/zstd`；转码不改写 variant、不写回缓存，仅改交付头（去掉 `Content-Length`、`Content-MD5`、`Digest`、`Docker-Content-Digest`，强 `ETag` 转弱）；OCI digest 路径、带内容摘要头的条目、`Cache-Control: no-transform` 与无可接受编码均回源；需转码的 Range 回源，编码一致才本地 Range；本地命中按 `If-*` 回答 `304` / `412`，`If-None-Match` 弱比较、`If-Match` 强比较，`If-Range` 只认强 `ETag` 或日期；不做 singleflight，并发 MISS 各自回源、Put 幂等、variant 元数据原子替换；响应开始前缓存故障回退上游，写失败不影响交付，开始后不重试；存储端到端头并排除 hop-by-hop 等，交付重建长度、Range 与 Age；Worker 统一通用 middleware 保留 `Vary` 交付、不改 Cache API 存储规则（带 `Vary` 的响应由 Worker 缓存旁路、relay 接管），不加隐藏头，当前不做 per-mirror 生产调优；`relaytest` 是 Worker 侧受控测试上游，测试通过临时 mirror/上游配置指向 case；元数据只在本机 bbolt，body 回收同步清元数据；完整 200 缓存支持单/多 Range、416、If-Range；Range 未命中透传且不写 206；`relaytest` 固定 8 个 case：`fresh` / `revalidate` / `ttl` / `vary` / `encoding` / `range` / `no-store` / `digest`；GET 与 HEAD 共用同一 URL 与 variant 空间，只有完整 200 的 GET 建立条目，HEAD 从不建立条目（新鲜命中原样由 GET 元数据回答且不发上游，冷 HEAD 回源且不留条目，已有 body 的 stale HEAD 按条件重验——`304` 只更新元数据，`200` / `404` / `410` 使 variant 失效但不凭 HEAD 建新 body，其余状态不写）；其余方法不写缓存；HEAD 的编码协商、`no-transform` 与摘要禁止转码规则与 GET 相同，需转码只改交付头不带 body、冲突回源，HEAD 不求值 Range，8 个 `relaytest` case 均支持 HEAD（同状态/头无 body）；同一 URL 下字段集不同的多条记录同时匹配视为歧义并回源重验；Range MISS 时上游忽略 Range 返回完整 200 可写缓存并记一行 warning，`206` 不写；M2 不新增 HEAD 探测与 prefetch 的 policy 字段，prefetch 归 M3。
 
-后续：prefetch 与遥测归 M3/M4；policy 边界与字段见[Relay 策略下发](relay-policy.md)。实现细节（bbolt 键模型、`relaytest` 临时配置的构造与清理）不在本功能语义内。2026-11-23 已通过一次性 Docker RustFS 1.0.6 真实 S3 联测（未加入 CI）；部署验证尚未进行。
+后续：prefetch 已在 M3 落地为响应侧 `X-MDB-Relay: prefetch` 指令（[元数据 Prefetch](metadata-prefetch.md)），不进入 policy；同一里程碑也给 APT 包文件加了索引驱动的哈希预判，见上文「哈希预判」。遥测归 M4；policy 边界与字段见[Relay 策略下发](relay-policy.md)。实现细节（bbolt 键模型、`relaytest` 临时配置的构造与清理）不在本功能语义内。2026-11-23 已通过一次性 Docker RustFS 1.0.6 真实 S3 联测（未加入 CI）；部署验证尚未进行。

@@ -33,7 +33,7 @@ export interface AptRepoOptions {
 }
 
 /** Used when a suite's Release omits `Valid-Until`, and as the re-resolve floor. */
-const DEFAULT_TTL_MS = 60 * 60 * 1000; // 1 hour
+export const DEFAULT_TTL_MS = 60 * 60 * 1000; // 1 hour
 /** Throttle for retrying a resolve that produced nothing (avoid hammering upstream). */
 const RETRY_COOLDOWN_MS = 60 * 1000;
 
@@ -251,7 +251,7 @@ export class AptRepo {
  * body so `apt-parser` sees plain `Release` content. Unsigned text is returned
  * unchanged.
  */
-function stripClearsign(text: string): string {
+export function stripClearsign(text: string): string {
   if (!text.includes("BEGIN PGP SIGNED MESSAGE")) return text;
   // Body starts after the blank line following the armor + `Hash:` headers.
   const blank = text.indexOf("\n\n");

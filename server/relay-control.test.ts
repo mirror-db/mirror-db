@@ -49,6 +49,15 @@ describe("relay directives — merge", () => {
     ).toBe("no-vary, no-store");
   });
 
+  it("merges prefetch after an existing no-store", () => {
+    expect(mergeRelayDirectives("no-store", ["prefetch"])).toBe(
+      "no-store, prefetch",
+    );
+    expect(mergeRelayDirectives("no-store, prefetch", ["no-vary"])).toBe(
+      "no-store, prefetch, no-vary",
+    );
+  });
+
   it("never produces an empty header from empty input", () => {
     expect(mergeRelayDirectives(null, [])).toBe("");
     expect(mergeRelayDirectives("  ,  ", [])).toBe("");

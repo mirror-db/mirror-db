@@ -3,10 +3,10 @@
  *
  * The value is Cache-Control-style: comma-separated `keyword` or
  * `keyword=value` tokens. It carries response decisions the relay can only make
- * after seeing the upstream answer — currently `no-store`, `no-vary` and
- * `ttl=<seconds>` — and is deliberately absent from the mirror manifest policy
- * (see `server/relay-policy.ts`). The relay reads it and removes it before
- * delivering to a client.
+ * after seeing the upstream answer — currently `no-store`, `no-vary`,
+ * `prefetch` and `ttl=<seconds>` — and is deliberately absent from the mirror
+ * manifest policy (see `server/relay-policy.ts`). The relay reads it and removes
+ * it before delivering to a client.
  *
  * When a mirror has no explicit directive, the header is untouched. When it
  * does, the middleware merges: an existing directive always wins, so a response
@@ -24,7 +24,11 @@ export const RELAY_HOST_HEADER = "x-mdb-relay-host";
  * Directives a mirror may declare. Unknown keywords are tolerated on the wire
  * (relays ignore them), but the Worker only emits these.
  */
-export type RelayDirective = "no-store" | "no-vary" | `ttl=${number}`;
+export type RelayDirective =
+  | "no-store"
+  | "no-vary"
+  | "prefetch"
+  | `ttl=${number}`;
 
 /** Split a directive list on commas outside quoted strings. */
 function splitDirectives(value: string): string[] {

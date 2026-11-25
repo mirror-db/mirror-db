@@ -14,6 +14,33 @@ import (
 // Before the fix it was only read by one caller, so the config file could be
 // loaded from one directory while secret.key and certmagic/ were written to
 // another.
+func TestPrefetchBounds(t *testing.T) {
+	oldConcurrency := viper.Get("prefetch.concurrency")
+	oldMaxTasks := viper.Get("prefetch.max_tasks")
+	t.Cleanup(func() {
+		viper.Set("prefetch.concurrency", oldConcurrency)
+		viper.Set("prefetch.max_tasks", oldMaxTasks)
+	})
+
+	viper.Set("prefetch.concurrency", 0)
+	viper.Set("prefetch.max_tasks", 0)
+	if got := GetPrefetchConcurrency(); got != DefaultPrefetchConcurrency {
+		t.Fatalf("default concurrency = %d", got)
+	}
+	if got := GetPrefetchMaxTasks(); got != DefaultPrefetchMaxTasks {
+		t.Fatalf("default max tasks = %d", got)
+	}
+
+	viper.Set("prefetch.concurrency", 2)
+	viper.Set("prefetch.max_tasks", 7)
+	if got := GetPrefetchConcurrency(); got != 2 {
+		t.Fatalf("configured concurrency = %d", got)
+	}
+	if got := GetPrefetchMaxTasks(); got != 7 {
+		t.Fatalf("configured max tasks = %d", got)
+	}
+}
+
 func TestConfigDirEnvIsSingleSourceOfTruth(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("RELAY_CONFIG_DIR", dir)

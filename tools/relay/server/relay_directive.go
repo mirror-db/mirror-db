@@ -24,6 +24,9 @@ type RelayDirectives struct {
 	// It is meaningful only when TTLSet is true.
 	TTL    time.Duration
 	TTLSet bool
+	// Prefetch marks the resource eligible for relay-driven background refresh.
+	// It never changes how the current response is stored or delivered.
+	Prefetch bool
 }
 
 // ParseRelayDirectives parses one or more X-MDB-Relay field values.
@@ -50,6 +53,8 @@ func ParseRelayDirectives(values []string) RelayDirectives {
 				d.NoStore = true
 			case "no-vary":
 				d.NoVary = true
+			case "prefetch":
+				d.Prefetch = true
 			case "ttl":
 				seconds, ok := parseNonNegativeSeconds(strings.TrimSpace(arg))
 				if !ok {

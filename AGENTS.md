@@ -133,7 +133,8 @@ a 404) — `cuda` is `…/compute/cuda/repos/` and only that path lists,
 `X-MDB-Relay` is the response-side control header, Cache-Control-shaped:
 comma-separated `keyword` or `keyword=value`. The Worker parses/merges it, and
 the relay consumes it (see the Relay server section below).
-Keywords: `no-store`, `no-vary`, `ttl=<seconds>`; unknown keywords are ignored.
+Keywords: `no-store`, `no-vary`, `prefetch`, `ttl=<seconds>`; unknown keywords
+are ignored.
 
 - **Injection is per mirror.** `serveMirror` merges `mirror.relayDirectives`
   into whatever the upstream already sent; an existing directive always wins and
@@ -146,14 +147,78 @@ Keywords: `no-store`, `no-vary`, `ttl=<seconds>`; unknown keywords are ignored.
   keep ordinary `Vary` handling. The APT proxy also adds `no-store` to mutable
   `dists/` indexes (excluding `by-hash/`), so independently cached Release and
   Packages generations cannot cause a hash/size mismatch.
+- **`prefetch` is opt-in per response.** The five snapshot APT mounts add it to
+  `Release`/`InRelease` only (status `200` or `304`), and PyPI adds it to the
+  `/pypi/simple/` root index only (status `200` or `304`). A `Packages` index,
+  a package body and a per-package PyPI page never carry it. PyPI sends a
+  conditional request (either validator) straight upstream instead of answering
+  it from its own read-through cache, so a relay rebuilding a lease after a
+  restart gets a real `304`; an unconditional request stays on the Worker cache.
+  The relay learns eligibility only by serving the response; nothing about it is
+  distributed.
 - **Inbound copies are meaningless.** `normalizeRelayRequest` removes an
   `X-MDB-Relay` request header unless a valid `X-MDB-Relay-Host` marks the
   request as relay-originated. Only request headers are touched.
-- **Directives never enter the manifest.** `no-store`, `no-vary`, `no-transform`,
-  freshness, coding and digests are post-response facts; policies only carry
-  pre-request fields (see [ADR 0012](docs/adr/0012-policy-field-merge-and-passthrough.md)).
-  `sanitizeResponse` strips any third-party `x-mdb-relay`, so only the front-door
-  middleware can add one.
+- **Directives never enter the manifest.** `no-store`, `no-vary`, `prefetch`,
+  `no-transform`, freshness, coding and digests are post-response facts; policies
+  only carry pre-request fields (see
+  [ADR 0012](docs/adr/0012-policy-field-merge-and-passthrough.md)). Prefetch is
+  no exception: it declares eligibility from a response and creates local state,
+  not a distributed rule ([ADR 0014](docs/adr/0014-demand-driven-prefetch-leases.md)).
+  `sanitizeResponse` strips any third-party
+  `x-mdb-relay`, so only the front-door middleware can add one.
+
+### APT metadata snapshot — [server/mirrors/apt-mirror.ts](server/mirrors/apt-mirror.ts)
+
+Five APT mounts point at upstreams with a real archive but no autoindex
+(`syncthing-pkgs`, `hashicorp`, `mise`, `opentofu`, `github-cli`). They set
+`snapshot: true` and must declare a non-empty `suites` list — there is no
+listing to discover suites from, so construction fails without one. Every other
+APT mount keeps the plain proxy path.
+
+- **One builder, one contract.** [snapshot.ts](server/pkgs/apt/snapshot.ts)
+  pins each suite's `InRelease` (else `Release`), registers every file the
+  release names, then downloads and parses only `Packages`/`Sources`. It
+  prefers `by-hash` over the mutable path and verifies every fetched index
+  against the release's size and SHA-256/SHA-1. No package body is ever
+  fetched. The full generation is published by one reference swap; any failure,
+  limit overflow, path escape or conflicting digest rejects it and the previous
+  generation keeps serving.
+- **Bound 8 / 64 / 50 000.** One `Packages`/`Sources` may expand to 8 MiB
+  decompressed, one mirror generation may parse 64 MiB (counted once per
+  identical content — the Release digest is the identity, so a file repeated
+  under several suites costs one download and one parse) and retain 50 000
+  de-duplicated files. Index groups run at most four at a time
+  (`GROUP_CONCURRENCY`), because each buffers its compressed body while
+  decompressing. Only gzip and plain indexes are supported; an xz/bz2/zstd-only
+  repository has no schema-1 index.
+- **Three directory modes, one generation.** HTML, `?format=json` and read-only
+  WebDAV (`PROPFIND` Depth 0/1) all read the current snapshot through a
+  `WebListSource`; file bodies still stream from upstream through `WebListFs`.
+  An unknown directory is `404`/`502`, never an empty listing. The mount root
+  without a trailing slash is a relative `308`.
+- **Fixed endpoint.** `/<mount>/.mdb/apt-index.json` serves one `schema: 1`
+  JSON document (mirror, generation/expiry, each suite's release identity, the
+  release's metadata files and the de-duplicated package files with path, size,
+  SHA-256 and SHA-1). Paths are mount-relative; there is no absolute upstream
+  URL and no unrelated package field. Other paths under `.mdb/` are `404`.
+  `GET`/`HEAD` both answer; a matching `If-None-Match` is `304`.
+- **Stable content ETag.** The validator hashes the document minus
+  `generated_at`/`expires_at`, so a rebuild of unchanged upstream metadata keeps
+  the same ETag while the times still appear in the body.
+- **Same generation for both consumers.** `knownPaths` and `knownHashes` come
+  from the published generation and decide existence and `by-hash` acceptance.
+  The generation's own expiry drives both the endpoint's `Cache-Control` and
+  the relay's index refresh (see prefetch below).
+- **Release siblings stay reachable.** An `InRelease` generation lists only the
+  signed name it actually verified; `Release` and `Release.gpg` in the same
+  known suite are still passed through, because apt chooses between them. An
+  unknown path inside a known suite is `404`; a path the generation does not
+  cover is otherwise unjudged, so a real package body is never denied for being
+  absent from a metadata-only table.
+- **Method, not Range.** A HEAD reaches upstream as a HEAD (a body read from the
+  read-through cache is dropped before delivery). `Range` is still **not**
+  forwarded for APT `pool/` files.
 
 ## Core proxy — [server/pkgs/oci/registry-proxy.ts](server/pkgs/oci/registry-proxy.ts)
 
@@ -291,7 +356,8 @@ through these, not bare `fetch`, so user-agent + rate-limiting are uniform.
 ## Layout
 
 - `server/pkgs/oci/` — reusable OCI components (proxy, creds, www-authenticate,
-  host factory). `server/pkgs/apt/` — APT repo index + proxy + status.
+  host factory). `server/pkgs/apt/` — APT repo index, proxy, status, metadata
+  snapshot (`metadata.ts`, `snapshot.ts`, `stanza.ts`).
   `server/pkgs/fetch/` — shared upstream fetch + cache + sanitize helpers.
   `server/pkgs/web-list/` — upstream directory-listing proxy (see below).
 - `server/mirrors/proxy/` — composable hook-based HTTP proxy builder (see below).
@@ -531,11 +597,13 @@ reaching upstreams directly. Mounted in [server/index.ts](server/index.ts) via
 ## Docs
 
 - [CONTEXT.md](CONTEXT.md) — the project's glossary (mirror, mount, front door,
-  listing site, res resource, relay, absolute reference, cache key…). Keep it a
-  glossary: no implementation detail.
+  listing site, res resource, relay, relay directive, prefetch lease, metadata
+  index, absolute reference, cache key…). Keep it a glossary: no implementation
+  detail.
 - [docs/adr/](docs/adr/) — decisions, including rejected ones (0001 mirror
-  kinds, 0005 registry token realm scope, 0006 external probes). A rejected ADR
-  keeps the reasoning so it is not re-proposed from scratch.
+  kinds, 0005 registry token realm scope, 0006 external probes, 0013 one
+  Worker-owned APT index, 0014 demand-driven prefetch). A rejected ADR keeps the
+  reasoning so it is not re-proposed from scratch.
 - [TODO.md](TODO.md) — reviewed-but-open items (dead upstreams, a passthrough
   that needs a token, the 48 MB PyPI index) with the evidence that produced
   them.
@@ -552,8 +620,8 @@ reaching upstreams directly. Mounted in [server/index.ts](server/index.ts) via
   problem when it shows up.
 - `apt.syncthing.net` serves a real archive (`dists/syncthing/…`) but no
   directory listings — `/dists/` is `404` and a wrong component answers `403`.
-  The suite list is therefore explicit, and the mount's HTML/JSON listing is
-  `404` by design.
+  The suite list is therefore explicit. `syncthing-pkgs` is a snapshot mount, so
+  its directories are synthesised from metadata instead of upstream listings.
 - The bare Kubernetes repository prefix returns `403`, but concrete
   `core:/stable:/v<minor>/deb/` trees are anonymous and work. Its signing key URL
   is versioned; the key table follows the latest stable minor.
@@ -565,8 +633,17 @@ reaching upstreams directly. Mounted in [server/index.ts](server/index.ts) via
   keeps its self-signatures). Sequoi rejects that certificate as *bound* because
   its self-signature is SHA-1 — a warning, not an error: `sqv` exits 0.
 - APT `pool/` files are proxied with `ezfetch` and **do not forward `Range`**:
-  a resuming client gets `200` from byte 0 and apt restarts the download. Not
+  a resuming client gets `200` from byte 0 and apt restarts the download. The
+  request method itself is preserved (a `HEAD` reaches upstream as `HEAD`). Not
   fixed yet; `dists/` files and by-hash objects are unaffected.
+- A schema-1 APT index only parses gzip and plain `Packages`/`Sources`. A
+  repository that publishes only xz, bz2 or zstd has no synthetic listing and no
+  hash prediction, by design (ADR 0013). The same generation is also bounded to
+  8 MiB per index, 64 MiB parsed per generation and 50 000 retained files, so an
+  upstream that exceeds those limits simply keeps the previous generation.
+- The relay's APT index, prefetch leases and their scheduling state are **memory
+  only**. A restart serves no prediction and refreshes nothing until real
+  requests teach it again; two relays learn independently.
 - Relay request-cache metadata is **local to one relay** (bbolt). A shared
   `S3_BUCKET` carries bodies and digest pointers only, so two relays never share
   variant metadata; each rebuilds it from its own upstream traffic.
@@ -604,7 +681,9 @@ post-deploy).
     Pure logic, mocked fetch.
   - **`workers`** — `*.workers.test.ts`. Runs inside workerd via
     `@cloudflare/vitest-pool-workers` ([vitest.workers.config.ts](vitest.workers.config.ts)).
-    Real `HTMLRewriter`, `caches`, etc. Used by `web-list` parsing tests.
+    Real `HTMLRewriter`, `caches`, etc. Used by `web-list` parsing tests, the
+    APT metadata snapshot's compression path, and the APT proxy's HEAD method
+    tests.
 - `caches` global absent in Node → `defaultCache()` returns `undefined` outside
   the runtime; caching is a no-op in unit tests unless a mock `cache` is passed.
 - Node `Response(str)` does **not** auto-set `Content-Length` → cache tests must
@@ -677,6 +756,10 @@ cache:                       # content store + request cache; disabled while dir
   #   prefix: relay              # S3_PREFIX
   #   region: us-east-1          # S3_REGION
 
+prefetch:                    # background refresh; disabled while CACHE_DIR is empty
+  # concurrency: 4         # PREFETCH_CONCURRENCY; parallel background refreshes
+  # max_tasks: 4096        # PREFETCH_MAX_TASKS; in-memory leases, not evicted
+
 acme:
   source: acme               # "acme" | "upstream" | URL origin
 ```
@@ -691,7 +774,10 @@ Cache keys have their own env names, unlike the dotted-key default:
 `S3_PREFIX`, `S3_REGION`. `CACHE_DIR` enables **both** the content store and
 request caching: empty means no store and every request goes upstream; non-empty
 means an already-resolved mirror `GET`/`HEAD` tries the cache by default (ADR
-0011). There is no separate cache switch and no manifest field for it.
+0011). There is no separate cache switch and no manifest field for it. Prefetch
+is created only when the store exists, and reads
+`prefetch.concurrency` / `prefetch.max_tasks` (`PREFETCH_CONCURRENCY`,
+`PREFETCH_MAX_TASKS`); a non-positive value falls back to the default 4 / 4096.
 
 ### Upstream transport
 
@@ -864,10 +950,10 @@ themselves. There is no separate TMP_DIR.
   16 variants per URL, 65536 rows globally, 32 KiB per encoded row; an
   over-limit write returns `ErrVariantLimit` and is ignored, never truncating.
 - `relay prune` is the offline cleanup (see below), not part of serving.
-  Request caching is M2 and lives beside this store; prefetch and telemetry are
-  later milestones. `CACHE_DIR` must be writable by the service user; the unit's
-  `ReadWritePaths` covers `/var/cache/mirror-relay`, so a custom directory needs
-  a unit change.
+  Request caching is M2 and prefetch M3, both beside this store; telemetry is
+  still a later milestone. `CACHE_DIR` must be writable by the service user; the
+  unit's `ReadWritePaths` covers `/var/cache/mirror-relay`, so a custom directory
+  needs a unit change.
 
 ### Relay request cache — [tools/relay/server/cache.go](tools/relay/server/cache.go)
 
@@ -889,8 +975,14 @@ Decision order (`serveCache`):
 1. Client `Cache-Control: no-store` runs a **miss that never writes**.
    `no-cache`, `max-age=0`, or `Pragma: no-cache` without `Cache-Control` force
    revalidation of a fresh entry.
-2. Zero matching variants → MISS. One → fresh local hit, or stale revalidation;
-   more than one (records with different `Vary` sets all match) → ambiguous,
+2. Zero matching variants → MISS, unless a fresh APT metadata index covers the
+   path as an immutable package file: hash prediction then looks the declared
+   SHA-256 (SHA-1 fallback) up in the store and, when the body and size match,
+   delivers it locally (`GET`, `HEAD` and Range) without building a URL variant.
+   A client that asked for revalidation is never answered this way. A single
+   stored variant whose body contradicts the fresh index is dropped before
+   matching. One remaining match → fresh local hit, or stale revalidation; more
+   than one (records with different `Vary` sets all match) → ambiguous,
    re-fetch and afterwards delete the identities that no longer apply.
 3. A fresh hit writes the stored status/headers/body locally, rebuilds
    `Content-Length` from the body size and `Age` from `StoredAt`; conditional
@@ -919,10 +1011,12 @@ body. HEAD never writes; a cold HEAD goes upstream and leaves no body-less entry
 A stale HEAD is revalidated like GET: `304` updates metadata, `200`/`404`/`410`
 invalidates the variant, other statuses write nothing.
 
-`X-MDB-Relay` keywords consumed: `no-store`, `no-vary`, `ttl=<seconds>`. The
-header is stripped before delivery on the cache and normal proxy paths; a
-`passthrough` response is delivered with it intact. `no-transform` is honoured
-from standard `Cache-Control`.
+`X-MDB-Relay` keywords consumed: `no-store`, `no-vary`, `prefetch`,
+`ttl=<seconds>`. `prefetch` only feeds the lease table below; it never changes
+how the current response is stored, transcoded or delivered. The header is
+stripped before delivery on the cache and normal proxy paths; a `passthrough`
+response is delivered with it intact. `no-transform` is honoured from standard
+`Cache-Control`.
 
 Encoding: stored codings are `identity`, `gzip`, `deflate`, `br`, `zstd`;
 negotiation follows full `Accept-Encoding` qvalues/`*`/`identity` with
@@ -953,6 +1047,66 @@ are sent. **No singleflight**: concurrent misses on one variant each go upstream
 and stream independently; `Put` is idempotent by real hash and metadata is
 committed by atomic replacement, so the final state is one body and one
 self-consistent variant.
+
+### Metadata prefetch — [tools/relay/server/prefetch.go](tools/relay/server/prefetch.go)
+
+Demand-driven and relay-local (ADR 0014). A lease is created only by serving a
+response that carried `X-MDB-Relay: prefetch`; nothing is persisted or
+discovered by scanning, so a restarted relay starts empty and waits for real
+traffic. `GET`/`HEAD` for the same resource renews the lease.
+
+- **Three-day lease, no persisted job list.** `prefetchRetention` = 72 h;
+  `dispatchDue` drops an expired lease (and any pending run) before dispatching.
+  The scheduler owns the table behind one mutex and runs at most
+  `prefetch.concurrency` refreshes (default 4) out of at most
+  `prefetch.max_tasks` leases (default 4096). At the limit a new lease is
+  refused with a warning; no active lease is evicted.
+- **Freshness, not a clock.** A normal resource is refreshed with a conditional
+  `GET` (`If-None-Match` / `If-Modified-Since`) at `freshnessExpiry`. `304`
+  folds new freshness/headers into metadata, `200` replaces the variant
+  atomically through the store, `404`/`410` drops it; other statuses only back
+  off. A resource with no freshness is never queued automatically — a live
+  request still revalidates synchronously. A failure backs off 1, 5, 15, then
+  30 minutes (cap) and never deletes the last good data. Each expiry gets up to
+  10% (max 30 s) deterministic jitter keyed by the task.
+- **Variant identity is preserved.** A normal task stores the URL key plus the
+  variant's `Vary`-matched request headers, replays them on the background
+  request, and pins `Accept-Encoding: identity`. A background run is always
+  `GET`; `HEAD` may create or renew a lease but never becomes the refresh
+  method. An ambiguous URL (several matching variants) is left to a real
+  request.
+- **`no-store` wins, once per state change.** A prefetch lease never makes a
+  response storable. An ordinary `no-store` plus `prefetch` response schedules
+  nothing and logs one warning per resource when the conflict state changes, not
+  per request. The APT exception below schedules only the independent metadata
+  index, never a client-cacheable Release/Packages variant.
+- **APT is one task per mirror.** Every `Release`/`InRelease` on an apt-tagged
+  mirror registers or renews a single task targeting
+  `/<mount>/.mdb/apt-index.json` (`aptTaskKey`). A `304` extends the current
+  generation's effective deadline when it states later freshness; a `200` is
+  validated (`schema: 1`, mirror match, safe paths, package needs a digest) and
+  published as a new generation atomically. A document with an `expires_at`
+  already in the past retries after `defaultAPTIndexTTL` (1 h), not in a loop.
+  A mirror whose mount moved is retargeted and fetched immediately.
+- **Shutdown is bounded.** `Close` stops dispatch, cancels the scheduler
+  context (so an in-flight refresh aborts), waits for running work, and is safe
+  if `Start` never ran. The whole scheduler is absent when the store is
+  disabled.
+
+**Hash prediction** ([prefetch_apt.go](tools/relay/server/prefetch_apt.go)) uses
+the same generation for delivery, not just refresh. `serveCache` asks
+`freshAPTFile`: while the generation is fresh, a package path's declared
+SHA-256 is tried first and SHA-1 second, with the size checked through
+`Store.Stat`; `Store.Resolve` gives the canonical SHA-256 digest of the body.
+The delivery
+reuses the M2 hit path (`servePredicted` → `serveHit`) with synthetic headers
+(content type from the extension, a digest-based `ETag`, `Accept-Ranges`,
+`Digest`, and `Cache-Control` capped by `gen.until`), so `GET`, `HEAD` and Range
+work without a URL variant. Metadata files are never delivered this way. A
+stored variant whose body disagrees with the fresh index is dropped before it
+can hit; a missing body, a size mismatch, a stale index or an unacceptable
+`identity` coding falls back to the ordinary upstream path. Nothing here writes
+a long-lived variant: the cache key is not populated by the predicted delivery.
 
 ### `relay prune` — [tools/relay/prune.go](tools/relay/prune.go)
 
@@ -995,13 +1149,19 @@ content is still fetchable upstream.
   `/.mirror-relay/cert-pack`, `/.mirror-relay/mirrors`, `/.mirror-relay/pool`
   (all JWT-guarded).
 - `tools/relay/server/cache.go` — request-cache chain: lookup, hits,
-  revalidation, MISS tee-and-store, metadata commit, ambiguity cleanup.
+  revalidation, MISS tee-and-store, metadata commit, ambiguity cleanup, index
+  hash-prediction delivery, and prefetch observation.
   `cache_headers.go` — stored-header selection, freshness, conditional
   evaluation, request cache directives. `cache_range.go` — single/multipart
   ranges and `416`.
 - `tools/relay/server/encoding.go` — `Accept-Encoding` negotiation and coding
   parsing; `encoding_stream.go` — decode-to-identity/re-encode streams and the
   8 MiB zstd window cap.
+- `tools/relay/server/prefetch.go` — in-memory lease scheduler: lazy
+  registration, renewal, retention expiry, freshness-driven conditional refresh,
+  backoff, jitter, concurrency/task bounds, shutdown; `prefetch_apt.go` — the
+  schema-1 index parser, per-mirror generation table with a 304-extendable
+  deadline, the APT index task, and hash-predicted delivery.
 - `tools/relay/server/relay_directive.go` — `X-MDB-Relay` parsing and inbound
   direct-request sanitising; `policy.go` — manifest policy compilation,
   field-merge evaluation, passthrough decision and transport selection.
@@ -1024,7 +1184,7 @@ content is still fetchable upstream.
 - `tools/relay/prune.go` — `relay prune` cobra command: offline cache cleanup,
   prints counts to stdout, non-zero on any failure.
 - `tools/relay/hashstore/` — content store: `store.go` (Put/Get/Range/Stat/
-  Delete, capacity + LRU + reconcile), `index.go` + `index_variant.go` (bbolt:
+  Resolve/Delete, capacity + LRU + reconcile), `index.go` + `index_variant.go` (bbolt:
   sizes, aliases, LRU order, pending deletes, variant rows and their reverse
   body references, the global variant counter), `variant.go` (variant identity,
   header normalisation, per-URL/global/row limits), `backend.go` (local bodies
@@ -1063,16 +1223,33 @@ invalid-manifest rejection, variant identity and limits, local hits,
 revalidation (`304` / `200` / `404` / `410`), HEAD sharing, conditional requests,
 single/multipart ranges and `416`/`If-Range`, the four transcodings plus
 `no-transform`/digest protection, `X-MDB-Relay` parsing and stripping, ambiguity
-re-fetch, and cache failure fallback. Shared-storage unit cases use a fake object
-store; the separate manual Docker RustFS 1.0.6 check is not part of CI. CI runs
-vet + test before building.
+re-fetch, and cache failure fallback; and M3: lease creation/renewal/expiry,
+freshness-driven scheduling, backoff and task limit, concurrency bound, clean
+shutdown, `no-store`/`prefetch` conflict, variant-header replay, HEAD renewing
+but never refreshing, escaped-path replay, schema-1 index parsing (unknown
+fields, bad digests, unsafe paths, conflicting entries), per-mirror aggregate
+task and retargeting, 304 deadline extension, hash-predicted GET/HEAD/Range and
+`If-Range`, SHA-1 fallback, mismatched-variant drop, metadata-kind refusal, and
+skipping prediction for a client revalidation. Shared-storage unit cases use a
+fake object store; the separate manual Docker RustFS 1.0.6 check is not part of
+CI. CI runs vet + test before building.
 
 Worker side (`pnpm test`, both vitest projects): `/relaytest` returns all eight
 cases with matching HEAD status/headers, relay-control merges without overriding
 and strips a direct request's `X-MDB-Relay`, mirror-directive injection adds
 `no-vary` after sanitising (tested with `debian` as the representative APT
 mount), and `cache.workers.test.ts` proves a `Vary` response bypasses the Worker
-Cache API instead of being stored without it.
+Cache API instead of being stored without it. M3 adds: metadata path/hash/limit
+tests, snapshot build (index choice, by-hash verification, content dedupe,
+atomic rejection, releases and transient-vs-absent), the five snapshot mounts
+end to end (HTML/JSON/WebDAV, redirects, index ETag/304/502, `prefetch`
+injection), HEAD-method forwarding through the real fetch helpers, PyPI
+conditional passthrough, and HTML/JSON escaping of hostile listing names.
+
+A one-off manual check on 2026-11-23 built snapshots for all five real upstreams
+and confirmed the content ETag stays stable across rebuilds (`hashicorp`
+de-duplicated to 15 parsed indexes, ~5.92 MiB). It is **not** part of CI, and no
+deployment has been verified.
 
 ### Build
 

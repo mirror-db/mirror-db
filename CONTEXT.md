@@ -92,11 +92,13 @@ returned to the client, never grant access.
 
 A response header (`X-MDB-Relay`) by which an upstream tells the relay how to
 treat that response. Its value has the shape of `Cache-Control`: comma-separated
-`keyword` or `keyword=value`. Three keywords are defined: `no-store` — do not
+`keyword` or `keyword=value`. Four keywords are defined: `no-store` — do not
 keep this response at all; `no-vary` — the URL path alone identifies the
-resource, so `Vary` must not split it into variants, `Vary: *` included; and
+resource, so `Vary` must not split it into variants, `Vary: *` included;
 `ttl=<seconds>` — the lifetime to fall back on when the response states no
-freshness, zero meaning none. Unknown keywords are ignored.
+freshness, zero meaning none; and `prefetch` — the mirror declares this resource
+eligible for relay-driven refresh while the relay continues to see demand for
+it. Unknown keywords are ignored.
 
 The header only describes a response. A relay consumes it and never forwards it
 to the client, except on a passthrough path, where no response control is
@@ -104,11 +106,12 @@ applied at all. A request that did not arrive through a relay is not allowed to
 influence anything with a request-side copy: the relay and the Worker remove
 `X-MDB-Relay` from an inbound request that carries no relay-host header.
 
-A directive carries only what is knowable *after* the upstream responds, such as
-whether to store the response or whether transforming it is allowed. That is
-never a policy field: a policy states what the relay must know before it makes
-the request. Where an upstream forbids transformation with the standard
-`Cache-Control: no-transform`, the relay honours that header as well.
+A directive travels with a response rather than being distributed as request
+policy. It may control that response or declare eligibility for background
+refresh. It never selects transport or passthrough: those remain policy fields
+because the relay must know them before it makes the request. Where an upstream
+forbids transformation with the standard `Cache-Control: no-transform`, the
+relay honours that header as well.
 
 ### Policy tag
 
@@ -148,6 +151,33 @@ A policy outcome in which the relay forwards a matched request without unpacking
 the response: no cache read or write, no response control, no transformation,
 and the response is delivered as received. It is decided before the request is
 made, so it is a policy field rather than a relay directive.
+
+### Prefetch lease
+
+A relay-local, in-memory record showing that a recently requested resource is
+eligible for background refresh. It is learned from a `prefetch` response
+directive, renewed by subsequent requests, and abandoned after three days
+without demand. It is never persisted or reconstructed by scanning an upstream.
+A refresh is driven by the resource's freshness; `no-store` still forbids an
+ordinary cached response even when a prefetch lease exists.
+
+### Metadata index
+
+One coherent, Worker-parsed snapshot of an APT repository's metadata. It relates
+metadata files and the package files they reference to their sizes and content
+hashes, and supports both synthetic directory listings and relay hash
+expectations. It is replaced only as a whole, so a listing and its hash
+expectations always describe the same upstream generation, and it is
+authoritative for the paths it covers only while fresh. Building or refreshing
+it never downloads the referenced package bodies.
+
+### Hash prediction
+
+Delivering a requested package path from an already stored body because a fresh
+metadata index names that body's digest. It applies only to the immutable
+package files the index declares; a missing body or a stale index falls back to
+the ordinary request path, and a prediction never creates a long-lived cached
+variant of its own.
 
 ### Direct request
 
