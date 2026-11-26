@@ -46,9 +46,9 @@
 
 ## M4：运行遥测
 
-- **状态**：未开始
+- **状态**：设计已确认，待实现
 - **目标**：提供 relay 遥测接口，使缓存命中、上游回退、容量回收和 prefetch 运行状态可观察。
-- **进入条件**：M3 完成；遥测接口路径、鉴权、格式和指标清单确认。
+- **进入条件**：已满足。M3 完成；OTel Prometheus exporter、固定 Bearer token 端点、低基数属性、指标清单、histogram bucket 和进程内生命周期均已确认。
 - **包含的 features**：[Relay 遥测](features/relay-telemetry.md)
 - **不包含**：外部指标存储、告警与展示系统。
 - **完成条件**：

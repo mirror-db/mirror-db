@@ -182,6 +182,13 @@ package files the index declares; a missing body or a stale index falls back to
 the ordinary request path, and a prediction never creates a long-lived cached
 variant of its own.
 
+### Telemetry
+
+Relay operational measurements emitted through OpenTelemetry. Metrics aggregate
+cache outcomes, traffic, storage and prefetch activity without identifying an
+individual URL, digest, variant or client. Foreground mirror traffic and
+background work such as prefetch are separate measurement sources.
+
 ### Direct request
 
 A request that reached the relay or the Worker without passing through a relay,
