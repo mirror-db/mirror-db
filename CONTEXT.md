@@ -128,8 +128,11 @@ earlier one; `exit` ends evaluation after its rule has merged and is not itself
 part of the result, and a request that matches nothing keeps the defaults.
 
 A policy distributes only what the relay must know **before it asks the
-upstream**: the traffic preference and whether the path is passed through
-untouched. A decision that can only be made from the response — store it or not,
+upstream**: the traffic preference, whether the path is passed through
+untouched, and whether the path's bytes are immutable. An immutability fact names
+an expression over the mount-relative path and may capture the content digest
+through a named group; it is a statement about the bytes, not about freshness or
+transport. A decision that can only be made from the response — store it or not,
 transform it or not, its actual age, coding or digest — is not a policy field; it
 is a relay directive. Whether the relay caches at all is neither: it belongs to
 the relay's own content store, not to a rule. Policy fields sit beside each other
@@ -198,6 +201,29 @@ An immutable body addressed by its real SHA-1 and SHA-256 digests. Both digests
 identify the same stored body, which exists once and is not scoped to a mirror.
 A relay may lose or evict the object at any time; callers treat that as a cache
 miss, never as proof that the upstream content disappeared.
+
+### Fragment cache
+
+A temporary, partial representation of an immutable object while its bytes are
+being obtained. Once the complete object store takes over, the fragment storage
+is reclaimed. That reclamation is distinct from eviction of the complete hash
+object, which continues to follow the content store's own capacity policy.
+
+### Active cache index
+
+A process-local association between an object identity and the fragment cache
+currently filling that object. The identity is the content hash when one is
+known, otherwise the immutable path being assembled. It is not durable: a restart
+abandons incomplete work, while completed hash objects remain discoverable through
+the content store.
+
+### Disk watermark
+
+The minimum free space that must remain on the filesystem holding the cache.
+Below it, new fragment and complete-object storage writes stop and requests
+continue without caching; existing objects remain readable, and deletion and
+pruning remain available. It applies to local temporary files as well as cache
+bodies, not to remote object storage.
 
 ### Variant identity
 

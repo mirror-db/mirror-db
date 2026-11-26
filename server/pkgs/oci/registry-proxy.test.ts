@@ -347,33 +347,65 @@ describe("proxyRegistryRequest caching", () => {
     expect(calls).toHaveLength(1); // no second upstream fetch
   });
 
-  it("skips caching a blob larger than the size limit", async () => {
+  it("skips caching a blob larger than the size limit but still advertises immutable", async () => {
     const { cache, store } = mockCache();
     const { fetchImpl } = mockFetch(
       () =>
         new Response("BIG", {
           status: 200,
-          headers: { "content-length": String(2 * 1024 * 1024 * 1024) },
+          headers: {
+            "content-length": String(2 * 1024 * 1024 * 1024),
+            "cache-control": "no-store, no-transform",
+          },
         }),
     );
 
-    await proxyRegistryRequest(req(`/v2/library/nginx/blobs/${DIGEST}`), {
+    const res = await proxyRegistryRequest(req(`/v2/library/nginx/blobs/${DIGEST}`), {
       upstream: "registry-1.docker.io",
       fetchImpl,
       cache,
     });
     expect(store.size).toBe(0);
+    // Delivery still states the digest's immutable freshness even when the
+    // Worker cannot cache the body; the orthogonal directive survives.
+    const cacheControl = res.headers.get("cache-control")!;
+    expect(cacheControl).toContain("public");
+    expect(cacheControl).toContain("max-age=31536000");
+    expect(cacheControl).toContain("immutable");
+    expect(cacheControl).toContain("no-transform");
+    expect(cacheControl).not.toContain("no-store");
   });
 
-  it("skips caching when Content-Length is unknown", async () => {
+  it("skips caching when Content-Length is unknown but still advertises immutable", async () => {
     const { cache, store } = mockCache();
     const { fetchImpl } = mockFetch(() => new Response("data", { status: 200 }));
 
-    await proxyRegistryRequest(req(`/v2/library/nginx/blobs/${DIGEST}`), {
+    const res = await proxyRegistryRequest(req(`/v2/library/nginx/blobs/${DIGEST}`), {
       upstream: "registry-1.docker.io",
       fetchImpl,
       cache,
     });
+    expect(store.size).toBe(0);
+    expect(res.headers.get("cache-control")).toContain("immutable");
+  });
+
+  it("advertises immutable on a HEAD of a digest-addressed blob", async () => {
+    const { cache, store } = mockCache();
+    const { fetchImpl } = mockFetch(
+      () =>
+        new Response(null, {
+          status: 200,
+          headers: { "content-length": "5" },
+        }),
+    );
+
+    const res = await proxyRegistryRequest(req(`/v2/library/nginx/blobs/${DIGEST}`, { method: "HEAD" }), {
+      upstream: "registry-1.docker.io",
+      fetchImpl,
+      cache,
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("cache-control")).toContain("immutable");
     expect(store.size).toBe(0);
   });
 
@@ -384,11 +416,27 @@ describe("proxyRegistryRequest caching", () => {
     );
     const opts = { upstream: "registry-1.docker.io", fetchImpl, cache };
 
-    await proxyRegistryRequest(req("/v2/library/nginx/manifests/latest"), opts);
-    await proxyRegistryRequest(req("/v2/library/nginx/manifests/latest"), opts);
+    const first = await proxyRegistryRequest(req("/v2/library/nginx/manifests/latest"), opts);
+    const second = await proxyRegistryRequest(req("/v2/library/nginx/manifests/latest"), opts);
 
     expect(store.size).toBe(0);
     expect(calls).toHaveLength(2);
+    // A tag is mutable: freshness is not forced on it.
+    expect(first.headers.get("cache-control")).toBeNull();
+    expect(second.headers.get("cache-control")).toBeNull();
+  });
+
+  it("does not force immutable onto a non-200 digest response", async () => {
+    const { fetchImpl } = mockFetch(
+      () => new Response("missing", { status: 404 }),
+    );
+
+    const res = await proxyRegistryRequest(req(`/v2/library/nginx/blobs/${DIGEST}`), {
+      upstream: "registry-1.docker.io",
+      fetchImpl,
+    });
+    expect(res.status).toBe(404);
+    expect(res.headers.get("cache-control")).toBeNull();
   });
 
   it("caches a manifest fetched by digest", async () => {
@@ -407,6 +455,84 @@ describe("proxyRegistryRequest caching", () => {
       cache,
     });
     expect(store.size).toBe(1);
+  });
+
+  it("a ranged digest GET bypasses a hot cache entry and reaches upstream for a 206", async () => {
+    const { cache, store } = mockCache();
+    const { fetchImpl, calls } = mockFetch((_url, init) => {
+      const range = new Headers(init?.headers).get("range");
+      if (range) {
+        return new Response("CDATA", {
+          status: 206,
+          headers: { "content-range": "bytes 2-6/8", "content-length": "5" },
+        });
+      }
+      return new Response("BLOBDATA", {
+        status: 200,
+        headers: { "content-length": "8" },
+      });
+    });
+    const opts = { upstream: "registry-1.docker.io", fetchImpl, cache };
+
+    await proxyRegistryRequest(req(`/v2/library/nginx/blobs/${DIGEST}`), opts);
+    expect(store.size).toBe(1);
+
+    const ranged = await proxyRegistryRequest(
+      req(`/v2/library/nginx/blobs/${DIGEST}`, { headers: { range: "bytes=2-6" } }),
+      opts,
+    );
+
+    // The stored copy is a complete 200 and must not answer a Range request.
+    expect(ranged.status).toBe(206);
+    expect(await ranged.text()).toBe("CDATA");
+    expect(ranged.headers.get("content-range")).toBe("bytes 2-6/8");
+    expect(calls).toHaveLength(2);
+    expect(new Headers(calls[1].init?.headers).get("range")).toBe("bytes=2-6");
+    // No second entry: the digest cache still holds only the complete object.
+    expect(store.size).toBe(1);
+  });
+
+  it("never stores a 206 answered to a ranged digest request", async () => {
+    const { cache, store } = mockCache();
+    const { fetchImpl } = mockFetch(
+      () =>
+        new Response("CDATA", {
+          status: 206,
+          headers: { "content-range": "bytes 2-6/8", "content-length": "5" },
+        }),
+    );
+
+    const res = await proxyRegistryRequest(
+      req(`/v2/library/nginx/blobs/${DIGEST}`, { headers: { range: "bytes=2-6" } }),
+      { upstream: "registry-1.docker.io", fetchImpl, cache },
+    );
+
+    expect(res.status).toBe(206);
+    expect(store.size).toBe(0);
+  });
+
+  it("forces identity on a digest request but leaves tag negotiation alone", async () => {
+    const { fetchImpl, calls } = mockFetch(() => new Response("ok", { status: 200 }));
+    const opts = { upstream: "registry-1.docker.io", fetchImpl };
+
+    await proxyRegistryRequest(
+      req(`/v2/library/nginx/blobs/${DIGEST}`, {
+        headers: { "accept-encoding": "gzip" },
+      }),
+      opts,
+    );
+    await proxyRegistryRequest(
+      req("/v2/library/nginx/manifests/latest", {
+        headers: { "accept-encoding": "gzip" },
+      }),
+      opts,
+    );
+
+    // One digest names one byte sequence, so its representation cannot depend on
+    // what the client can decode.
+    expect(new Headers(calls[0].init?.headers).get("accept-encoding")).toBe("identity");
+    // A tag manifest is negotiated normally.
+    expect(new Headers(calls[1].init?.headers).get("accept-encoding")).toBe("gzip");
   });
 
   it("schedules the cache write via waitUntil when provided", async () => {

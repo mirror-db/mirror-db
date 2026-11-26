@@ -58,6 +58,12 @@ cache:                       # content store + request cache; disabled while dir
   # capacity: 128GiB       # CACHE_CAPACITY; space the store may use, required
   # max_size: 12GiB        # CACHE_MAX_SIZE; LRU budget + per-body cap,
   #                        # default 10% of capacity
+  # disk_water_mark: 4GiB  # CACHE_DISK_WATER_MARK; min free local bytes,
+  #                        # 0/absent disables the guard
+  # active_capacity: 2GiB  # CACHE_ACTIVE_CAPACITY; in-process assembly budget,
+  #                        # default cache.max_size, never above it; 0 disables
+  # active_max_entries: 64 # CACHE_ACTIVE_MAX_ENTRIES; live assemblies; 0 disables
+  # active_idle_timeout: 10m  # CACHE_ACTIVE_IDLE_TIMEOUT; idle entry lifetime
   # s3:                    # optional shared RustFS bucket; bodies live there
   #   bucket: mirror-cache       # S3_BUCKET
   #   endpoint: https://rustfs.internal:9000  # S3_ENDPOINT (required with bucket)
@@ -82,8 +88,11 @@ Some have explicit names:
 - `RELAY_CONFIG_DIR` — config/key/cert directory (see above).
 - `RELAY_BASE_DOMAINS` — JSON array, replaces the yaml list entirely:
   `RELAY_BASE_DOMAINS='[{"domain":"r.example.com","cf_api_token":"tok"}]'`
-- `CACHE_DIR`, `CACHE_CAPACITY`, `CACHE_MAX_SIZE`, `S3_BUCKET`, `S3_ENDPOINT`,
-  `S3_PREFIX`, `S3_REGION` — content store (see [Hash content store](#hash-content-store)).
+- `CACHE_DIR`, `CACHE_CAPACITY`, `CACHE_MAX_SIZE`, `CACHE_DISK_WATER_MARK`,
+  `CACHE_ACTIVE_CAPACITY`, `CACHE_ACTIVE_MAX_ENTRIES`,
+  `CACHE_ACTIVE_IDLE_TIMEOUT`, `S3_BUCKET`, `S3_ENDPOINT`, `S3_PREFIX`,
+  `S3_REGION` — content store and active segment (see
+  [Hash content store](#hash-content-store)).
 - `PREFETCH_CONCURRENCY`, `PREFETCH_MAX_TASKS` — background refresh bounds (see
   [Metadata prefetch](#metadata-prefetch)); defaults 4 / 4096.
 
@@ -132,9 +141,10 @@ sudo ./relay install
    - `<relay-domain>` → proxies to `<upstream-domain>` with same path
 6. Evaluates the ordered policy list against the mirror-relative request path.
    Every matching rule merges its fields into the decision (later wins, omitted
-   inherits, `exit` stops evaluation), selecting the latency or speed transport
-   and whether the path is `passthrough`. Unmatched requests use latency and are
-   not passthrough.
+   inherits, `exit` stops evaluation), selecting the latency or speed transport,
+   whether the path is `passthrough`, and whether the path is immutable (with an
+   optional captured digest). Unmatched requests use latency, are not passthrough,
+   and are not immutable.
 7. Sets `X-MDB-Relay-Host` **only when the client did not already send one**, so
    a multi-tier chain keeps the origin closest to the user.
 
@@ -296,6 +306,10 @@ Config (env names in parentheses):
 | `cache.dir` (`CACHE_DIR`) | local working directory; enables the store |
 | `cache.capacity` (`CACHE_CAPACITY`) | disk space the store may use, e.g. `128GiB`; required |
 | `cache.max_size` (`CACHE_MAX_SIZE`) | LRU budget, and the largest body kept; default 10% of capacity |
+| `cache.disk_water_mark` (`CACHE_DISK_WATER_MARK`) | minimum free local bytes; `0`/absent disables the guard |
+| `cache.active_capacity` (`CACHE_ACTIVE_CAPACITY`) | in-process assembly byte budget; default `cache.max_size`, larger is rejected, `0` disables the segment |
+| `cache.active_max_entries` (`CACHE_ACTIVE_MAX_ENTRIES`) | live assemblies; default 64, `0` disables the segment |
+| `cache.active_idle_timeout` (`CACHE_ACTIVE_IDLE_TIMEOUT`) | idle assembly lifetime; default 10m |
 | `cache.s3.bucket` (`S3_BUCKET`) | use a shared RustFS bucket instead of local bodies |
 | `cache.s3.endpoint` (`S3_ENDPOINT`) | RustFS endpoint; required with a bucket |
 | `cache.s3.prefix` (`S3_PREFIX`) | key prefix inside the bucket |
@@ -322,6 +336,17 @@ Behaviour:
 
 - A body is stored once, keyed by its real SHA-256, and is readable through
   either digest. SHA-1 is an alias, not a second copy.
+- Two ways in: `Put` copies a reader into `.tmp` while hashing it, and `Adopt`
+  publishes a file another component already wrote in full there. `Adopt`
+  re-reads the file to compute **both** digests, requires a completed regular
+  file of the declared size inside `<CACHE_DIR>/.tmp`, and treats an expected
+  digest as a check — a mismatch publishes nothing. A local store renames the
+  file into `data/`; a shared bucket uploads it.
+- `cache.disk_water_mark` stops new local writes (`Put`, `Adopt`, and the active
+  segment's admission) when free space on `CACHE_DIR`'s filesystem drops below
+  it, re-probing during a large write. Reads, deletes and pruning still work, and
+  requests continue uncached. A failed probe degrades to "no watermark" with one
+  warning.
 - `cache.max_size` is both the total cache budget (strict byte LRU over logical
   body bytes) and the largest single body. It defaults to 10% of the available
   capacity; a larger body is skipped and never evicts anything.
@@ -334,7 +359,7 @@ Behaviour:
   file vanished are dropped, files without an index entry are removed. A delete
   that fails is queued in the index and retried. Variant metadata that names a
   gone body is removed in the same transaction, and `relay prune` repairs older
-  drift.
+  drift. `.tmp` is emptied, so an interrupted active assembly is never resumed.
 - Variant metadata is capped: 16 variants per URL, 65536 rows in total, 32 KiB
   per encoded row. A write over a limit is skipped with a log line; nothing is
   truncated. `S3_BUCKET` does not move this metadata — only bodies and digest
@@ -384,6 +409,13 @@ runs first for every request.
   metadata index can name the body of a package file by digest, and the relay
   then serves it from the store (see [Hash prediction](#hash-prediction-apt)).
   A client that asked to revalidate is always sent upstream.
+- **Immutable active path** — a `GET` whose merged policy matched
+  `rules.immutable` may assemble the object once in process: concurrent readers
+  and different byte ranges share one upstream fetch, and the complete body is
+  published into the store by digest (see
+  [Immutable active cache](#immutable-active-cache)). A stale variant on such a
+  path, or an OCI digest address, can also be served locally without
+  revalidation. Nothing else changes for a non-immutable request.
 - **MISS** — the upstream body is streamed to the client while a tee writes
   `<CACHE_DIR>/.tmp` and computes SHA-1 + SHA-256; metadata is committed after a
   complete `200` GET whose bytes reached the client. Only a complete `200` GET
@@ -398,6 +430,39 @@ runs first for every request.
 - **Not stored** — `X-MDB-Relay: no-store`, `Cache-Control: no-store` or
   `private`, any non-`200`, a `Vary: *` unless `no-vary` was declared, a
   `206`/`Content-Range`, or a `Content-Encoding` the relay cannot decode.
+
+### Immutable active cache
+
+`rules.immutable` (ADR 0015) says a path names bytes that cannot change, and may
+capture the content digest. The relay uses that for an in-process assembly
+segment (ADR 0016), built on `go-tiered-cache`:
+
+- **Eligibility** — active manager present, merged policy matched `immutable`, no
+  client-forced revalidation, client accepts `identity`, method `GET`. A `HEAD`
+  may reuse a body already addressable by digest but never creates an entry, and
+  a request carrying its own `If-*` validators is answered by upstream.
+- **One assembly per key** — the key is `sha256:<hex>` / `sha1:<hex>` when the
+  pattern captured a digest (so different mounts and URLs share it), otherwise
+  the URL. The first requester fetches; later ones wait and, if it fails, take the
+  ordinary path. This is the only singleflight in the relay.
+- **Ranges** — a cold `Range` GET seeds from the first interval of its `Range`
+  header; the remaining bytes are fetched on demand. A `200` answering a ranged
+  request, a `206` without a total size, an unknown or zero length, a body larger
+  than `cache.max_size`, a full segment or a low disk watermark falls back to the
+  ordinary response.
+- **Publication** — the complete fragment is adopted into the store by its real
+  digest. The digest from policy is an expectation: a mismatch publishes nothing.
+  Once published, the entry leaves the active map, the scratch name is reclaimed,
+  and readers already streaming keep their open descriptor until they finish.
+  LRU and eviction remain the store's.
+- **Variant** — after the delivery that completed the object, the relay writes
+  the normal URL variant, so a later request without a digest capture is local.
+- **Limits** — `cache.active_max_entries`, `cache.active_capacity` and
+  `cache.active_idle_timeout` bound only new entries; an admitted assembly is
+  never truncated. Fragments live in `<CACHE_DIR>/.tmp` and are discarded on
+  restart, so only complete objects survive. An explicit `0` for
+  `active_max_entries` or `active_capacity` disables the active segment while
+  the passive store keeps running.
 
 ### `X-MDB-Relay`
 
@@ -430,13 +495,15 @@ demotes a strong `ETag` to weak. OCI digest paths and entries carrying a digest
 header are never transcoded. zstd decoding accepts a frame window of at most
 8 MiB, so one request cannot allocate an arbitrary decoder buffer.
 
-Range requests are answered locally only from a fresh complete entry whose
-negotiated coding is the stored one: single and multipart `206`, `416`, and
-`If-Range` (strong `ETag` or exact date) are supported. At most 32 ranges are
-served; a larger list is ignored in favour of one complete `200`, preventing
-multipart amplification. A Range MISS is proxied and `206` is never stored; if
-upstream ignores Range and returns a complete `200`, the relay may store it and
-logs one warning about the full-body transfer.
+On the ordinary path, range requests are answered locally only from a fresh
+complete entry whose negotiated coding is the stored one: single and multipart
+`206`, `416`, and `If-Range` (strong `ETag` or exact date) are supported. At most
+32 ranges are served; a larger list is ignored in favour of one complete `200`,
+preventing multipart amplification. A Range MISS is proxied and its `206` never
+becomes a stored variant; if upstream ignores Range and returns a complete `200`,
+the relay may store it and logs one warning about the full-body transfer. The
+immutable active path is the exception: a cold ranged `GET` can seed an assembly,
+and a range that covers the whole object publishes the complete body.
 
 ### Failure and concurrency
 
@@ -446,8 +513,9 @@ leaves metadata alone. A write failure only disables the store tee — the clien
 still receives the complete upstream response. Nothing retries after response
 headers are sent.
 
-There is **no singleflight**: concurrent misses on the same response each go
-upstream and stream independently. Storage is idempotent by real hash, and
+There is **no singleflight on the ordinary variant path**: concurrent misses on
+the same response each go upstream and stream independently. An immutable `GET`
+does coalesce in the active segment above. Storage is idempotent by real hash, and
 variant metadata is replaced atomically, so the end state is one body and one
 self-consistent record. Metadata is per-relay; a shared bucket does not share it.
 

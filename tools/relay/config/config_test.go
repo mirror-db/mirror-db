@@ -309,3 +309,208 @@ func TestHashStoreConfigS3PrefixIsCleaned(t *testing.T) {
 		}
 	}
 }
+
+func TestHashStoreConfigDiskWaterMark(t *testing.T) {
+	v := freshCacheViper()
+	v.Set("cache.dir", t.TempDir())
+	v.Set("cache.capacity", "1GiB")
+
+	cfg, err := hashStoreConfigFrom(v)
+	if err != nil {
+		t.Fatalf("config: %v", err)
+	}
+	if cfg.DiskWaterMark != 0 {
+		t.Errorf("default water mark = %d, want 0 (disabled)", cfg.DiskWaterMark)
+	}
+
+	v.Set("cache.disk_water_mark", "512MiB")
+	cfg, err = hashStoreConfigFrom(v)
+	if err != nil {
+		t.Fatalf("config: %v", err)
+	}
+	if cfg.DiskWaterMark != 512<<20 {
+		t.Errorf("water mark = %d, want %d", cfg.DiskWaterMark, int64(512<<20))
+	}
+
+	// Explicit zero is how an operator disables a previously configured floor.
+	v.Set("cache.disk_water_mark", "0")
+	cfg, err = hashStoreConfigFrom(v)
+	if err != nil {
+		t.Fatalf("config: %v", err)
+	}
+	if cfg.DiskWaterMark != 0 {
+		t.Errorf("water mark = %d, want 0", cfg.DiskWaterMark)
+	}
+}
+
+func TestHashStoreConfigDiskWaterMarkRejectsInvalid(t *testing.T) {
+	for _, raw := range []string{"-1", "-1GiB", "lots", "1XB"} {
+		t.Run(raw, func(t *testing.T) {
+			v := freshCacheViper()
+			v.Set("cache.dir", t.TempDir())
+			v.Set("cache.capacity", "1GiB")
+			v.Set("cache.disk_water_mark", raw)
+			if _, err := hashStoreConfigFrom(v); err == nil {
+				t.Fatalf("CACHE_DISK_WATER_MARK=%q must fail", raw)
+			}
+		})
+	}
+}
+
+func TestActiveCacheConfigDefaults(t *testing.T) {
+	dir := t.TempDir()
+	v := freshCacheViper()
+	v.Set("cache.dir", dir)
+	v.Set("cache.capacity", "1GiB")
+
+	cfg, err := activeCacheConfigFrom(v)
+	if err != nil {
+		t.Fatalf("config: %v", err)
+	}
+	if cfg.Dir != dir {
+		t.Errorf("dir = %q, want %q", cfg.Dir, dir)
+	}
+	maxSize := int64(1<<30) / 10
+	if cfg.Capacity != maxSize {
+		t.Errorf("capacity = %d, want cache.max_size %d", cfg.Capacity, maxSize)
+	}
+	if cfg.MaxEntries != DefaultActiveMaxEntries {
+		t.Errorf("max entries = %d, want %d", cfg.MaxEntries, DefaultActiveMaxEntries)
+	}
+	if cfg.IdleTimeout != DefaultActiveIdleTimeout {
+		t.Errorf("idle timeout = %v, want %v", cfg.IdleTimeout, DefaultActiveIdleTimeout)
+	}
+	if cfg.DiskWaterMark != 0 {
+		t.Errorf("water mark = %d, want 0", cfg.DiskWaterMark)
+	}
+}
+
+func TestActiveCacheConfigDisabledWithoutCacheDir(t *testing.T) {
+	v := freshCacheViper()
+	v.Set("cache.dir", "")
+	cfg, err := activeCacheConfigFrom(v)
+	if err != nil || cfg != nil {
+		t.Fatalf("got (%v,%v), want nil config and no error", cfg, err)
+	}
+}
+
+func TestActiveCacheConfigExplicitZeroDisables(t *testing.T) {
+	for _, key := range []string{"cache.active_capacity", "cache.active_max_entries"} {
+		t.Run(key, func(t *testing.T) {
+			v := freshCacheViper()
+			v.Set("cache.dir", t.TempDir())
+			v.Set("cache.capacity", "1GiB")
+			v.Set(key, "0")
+			cfg, err := activeCacheConfigFrom(v)
+			if err != nil || cfg != nil {
+				t.Fatalf("got (%v,%v), want nil config and no error", cfg, err)
+			}
+		})
+	}
+}
+
+func TestActiveCacheConfigFromYAML(t *testing.T) {
+	dir := t.TempDir()
+	v := freshCacheViper()
+	v.SetConfigType("yaml")
+	raw := `
+cache:
+  dir: ` + dir + `
+  capacity: 10GiB
+  max_size: 2GiB
+  active_capacity: 512MiB
+  active_max_entries: 32
+  active_idle_timeout: 5m
+  disk_water_mark: 1GiB
+`
+	if err := v.ReadConfig(strings.NewReader(raw)); err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+
+	cfg, err := activeCacheConfigFrom(v)
+	if err != nil {
+		t.Fatalf("config: %v", err)
+	}
+	if cfg.Dir != dir {
+		t.Errorf("dir = %q, want %q", cfg.Dir, dir)
+	}
+	if cfg.Capacity != 512<<20 {
+		t.Errorf("capacity = %d", cfg.Capacity)
+	}
+	if cfg.MaxEntries != 32 {
+		t.Errorf("max entries = %d", cfg.MaxEntries)
+	}
+	if cfg.IdleTimeout != 5*time.Minute {
+		t.Errorf("idle timeout = %v", cfg.IdleTimeout)
+	}
+	if cfg.DiskWaterMark != 1<<30 {
+		t.Errorf("water mark = %d", cfg.DiskWaterMark)
+	}
+
+	store, err := hashStoreConfigFrom(v)
+	if err != nil {
+		t.Fatalf("store config: %v", err)
+	}
+	if store.DiskWaterMark != 1<<30 {
+		t.Errorf("store water mark = %d", store.DiskWaterMark)
+	}
+}
+
+func TestActiveCacheConfigEnv(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CACHE_DIR", dir)
+	t.Setenv("CACHE_CAPACITY", "1GiB")
+	t.Setenv("CACHE_ACTIVE_CAPACITY", "64MiB")
+	t.Setenv("CACHE_ACTIVE_MAX_ENTRIES", "128")
+	t.Setenv("CACHE_ACTIVE_IDLE_TIMEOUT", "30m")
+	t.Setenv("CACHE_DISK_WATER_MARK", "2GiB")
+
+	cfg, err := activeCacheConfigFrom(freshCacheViper())
+	if err != nil {
+		t.Fatalf("config: %v", err)
+	}
+	if cfg.Dir != dir {
+		t.Errorf("dir = %q, want %q", cfg.Dir, dir)
+	}
+	if cfg.Capacity != 64<<20 {
+		t.Errorf("capacity = %d", cfg.Capacity)
+	}
+	if cfg.MaxEntries != 128 {
+		t.Errorf("max entries = %d", cfg.MaxEntries)
+	}
+	if cfg.IdleTimeout != 30*time.Minute {
+		t.Errorf("idle timeout = %v", cfg.IdleTimeout)
+	}
+	if cfg.DiskWaterMark != 2<<30 {
+		t.Errorf("water mark = %d", cfg.DiskWaterMark)
+	}
+}
+
+func TestActiveCacheConfigRejectsInvalid(t *testing.T) {
+	cases := []struct {
+		name  string
+		key   string
+		value string
+	}{
+		{"capacity negative", "cache.active_capacity", "-1MiB"},
+		{"capacity invalid", "cache.active_capacity", "lots"},
+		{"capacity above total", "cache.active_capacity", "2GiB"},
+		{"capacity above max size", "cache.active_capacity", "200MiB"},
+		{"max entries negative", "cache.active_max_entries", "-4"},
+		{"max entries not a number", "cache.active_max_entries", "many"},
+		{"idle timeout zero", "cache.active_idle_timeout", "0s"},
+		{"idle timeout negative", "cache.active_idle_timeout", "-5m"},
+		{"idle timeout not a duration", "cache.active_idle_timeout", "soon"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			v := freshCacheViper()
+			v.Set("cache.dir", t.TempDir())
+			v.Set("cache.capacity", "1GiB")
+			v.Set(tc.key, tc.value)
+			if _, err := activeCacheConfigFrom(v); err == nil {
+				t.Fatalf("%s=%q must fail", tc.key, tc.value)
+			}
+		})
+	}
+}

@@ -48,6 +48,33 @@ func isJSONNull(data []byte) bool {
 	return string(bytes.TrimSpace(data)) == "null"
 }
 
+// ruleString is a rule field that can be absent or declared. Unlike a plain
+// string it keeps omission distinct from a declared value, because omission
+// inherits an earlier match's value while every declared value replaces it.
+type ruleString struct {
+	value string
+	set   bool
+}
+
+func stringRule(v string) ruleString { return ruleString{value: v, set: true} }
+
+func (s ruleString) MarshalJSON() ([]byte, error) {
+	return json.Marshal(s.value)
+}
+
+func (s *ruleString) UnmarshalJSON(data []byte) error {
+	if isJSONNull(data) {
+		return fmt.Errorf("rule string: null is not allowed")
+	}
+	var v string
+	if err := json.Unmarshal(data, &v); err != nil {
+		return err
+	}
+	s.set = true
+	s.value = v
+	return nil
+}
+
 // Policy mirrors one entry of the manifest's ordered `policies` array. Order is
 // part of the public contract: later matches overwrite earlier ones field by
 // field.
@@ -177,10 +204,16 @@ func (m *PolicyMatch) UnmarshalJSON(data []byte) error {
 // appears in policyDecision. Caching is not a policy field: whether a response
 // may be stored is decided after the upstream responds (X-MDB-Relay and
 // Cache-Control), not before the request is issued.
+//
+// `immutable` is a pre-request content-addressing fact, not a cache policy: it
+// says the mount-relative path names bytes that cannot change, and may capture
+// their digest. It merges like traffic_policy and never changes passthrough,
+// exit or the transport selection.
 type PolicyRules struct {
 	TrafficPolicy trafficPolicy `json:"traffic_policy,omitempty"`
 	Passthrough   ruleBool      `json:"passthrough,omitempty"`
 	Exit          ruleBool      `json:"exit,omitempty"`
+	Immutable     ruleString    `json:"immutable,omitempty"`
 }
 
 // MarshalJSON emits only the fields the rule actually declares. The zero
@@ -191,6 +224,7 @@ func (r PolicyRules) MarshalJSON() ([]byte, error) {
 		TrafficPolicy *string `json:"traffic_policy,omitempty"`
 		Passthrough   *bool   `json:"passthrough,omitempty"`
 		Exit          *bool   `json:"exit,omitempty"`
+		Immutable     *string `json:"immutable,omitempty"`
 	}{}
 	if r.TrafficPolicy != "" {
 		name := string(r.TrafficPolicy)
@@ -203,6 +237,10 @@ func (r PolicyRules) MarshalJSON() ([]byte, error) {
 	if r.Exit.set {
 		v := r.Exit.value
 		out.Exit = &v
+	}
+	if r.Immutable.set {
+		v := r.Immutable.value
+		out.Immutable = &v
 	}
 	return json.Marshal(out)
 }
@@ -242,6 +280,10 @@ func (r *PolicyRules) UnmarshalJSON(data []byte) error {
 			if err := json.Unmarshal(value, &out.Exit); err != nil {
 				return fmt.Errorf("rules.exit: %w", err)
 			}
+		case "immutable":
+			if err := json.Unmarshal(value, &out.Immutable); err != nil {
+				return fmt.Errorf("rules.immutable: %w", err)
+			}
 		default:
 			return fmt.Errorf("rules: unknown field %q", key)
 		}
@@ -250,10 +292,79 @@ func (r *PolicyRules) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// compiledPolicy is a validated policy with its regular expression compiled.
+// compiledPolicy is a validated policy with its regular expressions compiled.
 type compiledPolicy struct {
 	Policy
-	pattern *regexp.Regexp
+	pattern   *regexp.Regexp
+	immutable *regexp.Regexp
+}
+
+// contentDigest is a digest an immutable pattern captured from the path: the
+// algorithm named by the group plus its lowercase hex value. An empty Algorithm
+// means the pattern only declared immutability and named no digest.
+type contentDigest struct {
+	Algorithm string
+	Hex       string
+}
+
+// matchImmutable runs the merged immutable pattern against the mount-relative
+// escaped path. A pattern that does not match declares nothing; a match always
+// declares immutable bytes, with a digest only when exactly one of the named
+// groups captured a usable value.
+func matchImmutable(re *regexp.Regexp, path string) (bool, contentDigest) {
+	match := re.FindStringSubmatch(path)
+	if match == nil {
+		return false, contentDigest{}
+	}
+	return true, capturedDigest(re, match)
+}
+
+// capturedDigest extracts the optional sha256/sha1 named groups. Captures are
+// considered before hex validation: two non-empty groups at once are not a
+// digest the cache chain can use, so picking one would be arbitrary and the
+// path is reported immutable without a digest. A single capture that is not hex
+// is treated the same way.
+func capturedDigest(re *regexp.Regexp, match []string) contentDigest {
+	var captured []contentDigest
+	for i, name := range re.SubexpNames() {
+		if i == 0 || i >= len(match) || match[i] == "" {
+			continue
+		}
+		switch name {
+		case "sha256", "sha1":
+			captured = append(captured, contentDigest{Algorithm: name, Hex: match[i]})
+		}
+	}
+	if len(captured) != 1 {
+		return contentDigest{}
+	}
+	hexValue, ok := lowerHex(captured[0].Hex)
+	if !ok {
+		return contentDigest{}
+	}
+	return contentDigest{Algorithm: captured[0].Algorithm, Hex: hexValue}
+}
+
+// lowerHex reports whether s is non-empty hexadecimal and returns it lowercased.
+// Length is not checked here: an unusable length simply misses in the content
+// store, while accepting any hex keeps the extraction reusable across mounts.
+func lowerHex(s string) (string, bool) {
+	if s == "" {
+		return "", false
+	}
+	out := make([]byte, len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= '0' && c <= '9', c >= 'a' && c <= 'f':
+			out[i] = c
+		case c >= 'A' && c <= 'F':
+			out[i] = c - 'A' + 'a'
+		default:
+			return "", false
+		}
+	}
+	return string(out), true
 }
 
 // compilePolicies validates the whole list and compiles every path pattern.
@@ -292,6 +403,16 @@ func compilePolicies(in []Policy) ([]compiledPolicy, error) {
 			}
 			cp.pattern = re
 		}
+		if p.Rules.Immutable.set {
+			// The same engine validates the immutable pattern, so an invalid
+			// expression rejects the whole manifest instead of surfacing on a
+			// request. Named groups such as (?<sha256>…) are part of RE2.
+			re, err := regexp.Compile(p.Rules.Immutable.value)
+			if err != nil {
+				return nil, fmt.Errorf("policy %q: immutable: %w", p.Name, err)
+			}
+			cp.immutable = re
+		}
 		out = append(out, cp)
 	}
 
@@ -323,16 +444,22 @@ func (p *compiledPolicy) matches(m Mirror, path string) bool {
 // the request handler needs before the upstream request is issued:
 // TrafficPolicy selects the edge pool, Passthrough tells the later cache chain
 // to skip the exchange entirely because the upstream is known to stream it
-// through.
+// through, and Immutable records that the merged immutable pattern matched this
+// path — with Digest when that pattern captured one.
 type policyDecision struct {
 	TrafficPolicy trafficPolicy
 	Passthrough   bool
+	Immutable     bool
+	Digest        contentDigest
 }
 
-// defaultPolicyDecision is the value an unmatched request gets.
+// defaultPolicyDecision is the value an unmatched request gets. An unmatched
+// path is never immutable.
 var defaultPolicyDecision = policyDecision{TrafficPolicy: trafficLatency}
 
 // apply overlays the fields this rule declares onto d. Omitted fields inherit.
+// Immutable is not applied here because the merged pattern has to be evaluated
+// against the path after the last matching rule is known.
 func (p *compiledPolicy) apply(d *policyDecision) {
 	if p.Rules.TrafficPolicy != "" {
 		d.TrafficPolicy = p.Rules.TrafficPolicy
@@ -346,8 +473,14 @@ func (p *compiledPolicy) apply(d *policyDecision) {
 // fields at the top level: later matches win, omitted fields inherit. A
 // matching rule with `exit: true` stops evaluation after its own merge; `exit`
 // itself is not part of the result.
+//
+// The immutable pattern merges like the other fields, then the surviving
+// pattern is run once against the mount-relative path. A declared pattern that
+// does not match the path declares nothing — in particular it does not fall
+// back to an earlier match's pattern.
 func (m *manifestState) policyFor(mirror Mirror, path string) policyDecision {
 	d := defaultPolicyDecision
+	var immutable *regexp.Regexp
 	if m != nil {
 		for i := range m.policies {
 			p := &m.policies[i]
@@ -355,10 +488,16 @@ func (m *manifestState) policyFor(mirror Mirror, path string) policyDecision {
 				continue
 			}
 			p.apply(&d)
+			if p.immutable != nil {
+				immutable = p.immutable
+			}
 			if p.Rules.Exit.set && p.Rules.Exit.value {
 				break
 			}
 		}
+	}
+	if immutable != nil {
+		d.Immutable, d.Digest = matchImmutable(immutable, path)
 	}
 	return d
 }
@@ -470,6 +609,15 @@ func trafficPolicyFromContext(ctx context.Context) trafficPolicy {
 // issuing the upstream request, that the response must bypass the cache chain.
 func passthroughFromContext(ctx context.Context) bool {
 	return policyDecisionFromContext(ctx).Passthrough
+}
+
+// immutableFromContext reports whether the merged policy declared the request
+// path content-addressed, and the digest its pattern captured when it named
+// one. The cache chain reads this before issuing the upstream request: ok with
+// a zero digest still means the bytes under the path cannot change.
+func immutableFromContext(ctx context.Context) (bool, contentDigest) {
+	d := policyDecisionFromContext(ctx)
+	return d.Immutable, d.Digest
 }
 
 // policyTransport sends each request through the pool its policy selected.

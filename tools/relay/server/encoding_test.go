@@ -336,6 +336,37 @@ func TestIsOCIDigestPath(t *testing.T) {
 	}
 }
 
+func TestOCIDigestFromPath(t *testing.T) {
+	sha256hex := strings.Repeat("a", 64)
+	sha512hex := strings.Repeat("b", 128)
+
+	cases := []struct {
+		path   string
+		digest string
+		ok     bool
+	}{
+		{"/v2/library/nginx/blobs/sha256:" + sha256hex, sha256hex, true},
+		{"/v2/library/nginx/manifests/sha256:" + sha256hex, sha256hex, true},
+		{"/blobs/sha256:" + sha256hex, sha256hex, true},
+		{"/v2/library/nginx/manifests/nginx@sha256:" + sha256hex, sha256hex, true},
+		{"/v2/library/nginx/blobs/sha256:" + strings.ToUpper(sha256hex), sha256hex, true},
+		{"/v2/library/nginx/manifests/latest", "", false},
+		{"/v2/library/nginx/blobs/sha256:short", "", false},
+		{"/v2/library/nginx/blobs/md5:" + sha256hex, "", false},
+		{"/v2/library/nginx/manifests/sha512:" + sha512hex, "", false},
+		{"/v2/library/nginx/blobs/upload", "", false},
+		{"/v2/library/nginx@sha256:" + sha256hex, "", false},
+		{"/debian/pool/main/x/y.deb", "", false},
+		{"/", "", false},
+	}
+	for _, c := range cases {
+		got, ok := OCIDigestFromPath(c.path)
+		if ok != c.ok || got != c.digest {
+			t.Errorf("OCIDigestFromPath(%q) = %q, %v; want %q, %v", c.path, got, ok, c.digest, c.ok)
+		}
+	}
+}
+
 func TestTranscodingForbidden(t *testing.T) {
 	digestPath := "/v2/library/nginx/blobs/sha256:" + strings.Repeat("a", 64)
 

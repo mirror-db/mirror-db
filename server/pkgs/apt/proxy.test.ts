@@ -344,6 +344,60 @@ describe("createAptProxy — method forwarding", () => {
     expect(ezfetchMock.mock.calls[0]![1]).toBeUndefined();
     expect(await res.text()).toBe("data");
   });
+
+  it("forwards Range for a known by-hash GET", async () => {
+    cachedfetchMock.mockImplementation(async () =>
+      new Response("CDATA", {
+        status: 206,
+        headers: { "content-range": "bytes 2-6/8", "content-length": "5" },
+      }),
+    );
+    const proxy = makeProxy({ ready: true, hashes: [HASH] });
+    const res = await proxy.fetch(
+      new Request(
+        `https://mirs.uk/dists/trixie/main/binary-amd64/by-hash/SHA256/${HASH}`,
+        { headers: { range: "bytes=2-6" } },
+      ),
+    );
+
+    expect(res.status).toBe(206);
+    expect(res.headers.get("content-range")).toBe("bytes 2-6/8");
+    const [url, init] = cachedfetchMock.mock.calls[0]!;
+    expect(url).toBe(
+      `https://up.example/debian/dists/trixie/main/binary-amd64/by-hash/SHA256/${HASH}`,
+    );
+    expect(new Headers((init as RequestInit).headers).get("range")).toBe("bytes=2-6");
+  });
+
+  it("does not forward Range for a pool file", async () => {
+    const proxy = makeProxy({ ready: true, paths: [] });
+    const res = await proxy.fetch(
+      new Request("https://mirs.uk/pool/main/n/nginx/nginx_1.0_amd64.deb", {
+        headers: { range: "bytes=2-6" },
+      }),
+    );
+
+    expect(res.status).toBe(200);
+    // Still the known limitation: a pool Range is not forwarded, so the
+    // upstream answers the whole object.
+    expect(ezfetchMock.mock.calls[0]![1]).toBeUndefined();
+  });
+
+  it("does not forward Range for a mutable dists index", async () => {
+    const proxy = makeProxy({
+      ready: true,
+      paths: ["dists/trixie/main/binary-amd64/Packages.gz"],
+    });
+    const res = await proxy.fetch(
+      new Request(
+        "https://mirs.uk/dists/trixie/main/binary-amd64/Packages.gz",
+        { headers: { range: "bytes=0-3" } },
+      ),
+    );
+
+    expect(res.status).toBe(200);
+    expect(ezfetchMock.mock.calls[0]![1]).toBeUndefined();
+  });
 });
 
 describe("createAptProxy — snapshot facts", () => {
@@ -404,6 +458,29 @@ describe("createAptProxy — snapshot facts", () => {
       get(`dists/trixie/main/binary-amd64/by-hash/SHA256/${fresh}`),
     );
     expect(res.status).toBe(200);
+  });
+
+  it("forwards Range for a by-hash object under a snapshot generation", async () => {
+    cachedfetchMock.mockImplementation(async () =>
+      new Response("CDATA", {
+        status: 206,
+        headers: { "content-range": "bytes 0-3/8", "content-length": "4" },
+      }),
+    );
+    const proxy = createAptProxy(makeRepo({ ready: false }), {
+      known: knownSets(["dists/trixie/InRelease"], [HASH]),
+    });
+
+    const res = await proxy.fetch(
+      new Request(
+        `https://mirs.uk/dists/trixie/main/binary-amd64/by-hash/SHA256/${HASH}`,
+        { headers: { range: "bytes=0-3" } },
+      ),
+    );
+
+    expect(res.status).toBe(206);
+    const [, init] = cachedfetchMock.mock.calls[0]!;
+    expect(new Headers((init as RequestInit).headers).get("range")).toBe("bytes=0-3");
   });
 });
 

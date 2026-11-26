@@ -381,6 +381,50 @@ func IsOCIDigestPath(path string) bool {
 	return false
 }
 
+// OCIDigestFromPath returns the lowercase SHA-256 digest an OCI blob or
+// manifest path addresses. Unlike IsOCIDigestPath, which answers a broader
+// "does this mention a digest" question, this reports the digest only for the
+// two canonical content-addressed forms:
+//
+//	/…/blobs/sha256:<64 hex>
+//	/…/manifests/sha256:<64 hex>
+//
+// An optional `name@` prefix on the digest segment (the form IsOCIDigestPath
+// also tolerates) is accepted. Everything else is not a digest address: a tag,
+// another algorithm, a malformed hex value, or a digest segment anywhere but a
+// blobs/manifests location. Callers that serve content by matching this digest
+// must not treat ok as proof the request is immutable; they still compare it to
+// the stored body digest.
+func OCIDigestFromPath(path string) (digest string, ok bool) {
+	segments := strings.Split(strings.Trim(path, "/"), "/")
+	if len(segments) < 2 {
+		return "", false
+	}
+	switch segments[len(segments)-2] {
+	case "blobs", "manifests":
+	default:
+		return "", false
+	}
+
+	ref := segments[len(segments)-1]
+	i := strings.LastIndexByte(ref, ':')
+	if i <= 0 || i == len(ref)-1 {
+		return "", false
+	}
+	algorithm := ref[:i]
+	if j := strings.LastIndexByte(algorithm, '@'); j >= 0 {
+		algorithm = algorithm[j+1:]
+	}
+	if !strings.EqualFold(algorithm, "sha256") {
+		return "", false
+	}
+	digest = ref[i+1:]
+	if len(digest) != 64 || !isHex(digest) {
+		return "", false
+	}
+	return strings.ToLower(digest), true
+}
+
 func isHex(value string) bool {
 	for _, r := range value {
 		switch {

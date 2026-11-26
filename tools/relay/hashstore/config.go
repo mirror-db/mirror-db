@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/docker/go-units"
+	"github.com/mirror-db/mirror-db/tools/relay/diskspace"
 )
 
 // Algorithm names a content digest.
@@ -67,6 +68,23 @@ func ParseByteSize(raw string) (int64, error) {
 	return n, nil
 }
 
+// ParseByteSizeOrZero is ParseByteSize except that zero is accepted: a
+// watermark of 0 means "disabled", while a negative value is still an error.
+func ParseByteSizeOrZero(raw string) (int64, error) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return 0, errors.New("empty byte size")
+	}
+	n, err := units.RAMInBytes(s)
+	if err != nil {
+		return 0, err
+	}
+	if n < 0 {
+		return 0, fmt.Errorf("byte size %q must not be negative", raw)
+	}
+	return n, nil
+}
+
 // S3Config points the store at a shared, S3-compatible object store (RustFS).
 type S3Config struct {
 	Bucket   string
@@ -86,7 +104,15 @@ type Config struct {
 	// MaxSize is the LRU budget and the largest single body kept. Defaults to
 	// 10% of Capacity.
 	MaxSize int64
-	S3      *S3Config
+	// DiskWaterMark is the minimum free bytes that must remain on the local
+	// filesystem before a Put starts or continues writing. 0 disables the
+	// guard. Reads, deletes, reconcile and prune are never gated by it.
+	DiskWaterMark int64
+	S3            *S3Config
+
+	// diskOptions injects the platform probe and recheck cadence in tests.
+	// Production callers cannot set it, so the real filesystem is always probed.
+	diskOptions []diskspace.Option
 }
 
 // Normalize fills defaults and validates the configuration. It is idempotent:
@@ -108,6 +134,9 @@ func (c *Config) Normalize() error {
 	}
 	if c.MaxSize < 0 || c.MaxSize > c.Capacity {
 		return fmt.Errorf("hashstore: max size %d must be within capacity %d", c.MaxSize, c.Capacity)
+	}
+	if c.DiskWaterMark < 0 {
+		return fmt.Errorf("hashstore: disk water mark %d must not be negative", c.DiskWaterMark)
 	}
 	if c.S3 != nil {
 		c.S3.Bucket = strings.TrimSpace(c.S3.Bucket)

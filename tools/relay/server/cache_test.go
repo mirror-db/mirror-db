@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mirror-db/mirror-db/tools/relay/activecache"
 	"github.com/mirror-db/mirror-db/tools/relay/hashstore"
 )
 
@@ -88,6 +89,9 @@ type cacheServerOptions struct {
 	maxSize  int64
 	mirrors  []Mirror
 	policies []Policy
+	// activeCapacity overrides the active segment's byte budget. Zero uses
+	// maxSize, which is what production does by default.
+	activeCapacity int64
 }
 
 // newCacheServer builds a Server wired to a content store and a test upstream.
@@ -103,6 +107,9 @@ func newCacheServer(t *testing.T, upstream string, opts cacheServerOptions) (*Se
 	if opts.maxSize == 0 {
 		opts.maxSize = 8 << 20
 	}
+	if opts.activeCapacity == 0 {
+		opts.activeCapacity = opts.maxSize
+	}
 	store, err := hashstore.Open(hashstore.Config{
 		Dir:      opts.dir,
 		Capacity: 64 << 20,
@@ -113,6 +120,20 @@ func newCacheServer(t *testing.T, upstream string, opts cacheServerOptions) (*Se
 	}
 	t.Cleanup(func() { _ = store.Close() })
 
+	active, err := activecache.New(activecache.Config{
+		Dir:         opts.dir,
+		Capacity:    opts.activeCapacity,
+		MaxEntries:  64,
+		IdleTimeout: 10 * time.Minute,
+		Store:       store,
+	})
+	if err != nil {
+		t.Fatalf("open active cache: %v", err)
+	}
+	// Registered after the store, so it closes before it (LIFO): the active
+	// segment publishes through the store and must stop first.
+	t.Cleanup(func() { _ = active.Close() })
+
 	st, err := newManifestState(mirrorsResponse{Mirrors: opts.mirrors, Policies: opts.policies}, `"test"`)
 	if err != nil {
 		t.Fatalf("manifest state: %v", err)
@@ -122,6 +143,7 @@ func newCacheServer(t *testing.T, upstream string, opts cacheServerOptions) (*Se
 		client:      &http.Client{},
 		baseDomains: []string{"relay.example.com"},
 		hashStore:   store,
+		active:      active,
 		now:         opts.clock.Now,
 	}
 	s.manifest.Store(st)
@@ -451,18 +473,21 @@ func TestCacheFreshnessRules(t *testing.T) {
 		}
 	}
 
-	// A no-transform entry stays stored, but an incompatible coding must go
-	// upstream instead of being transcoded.
+	// A no-transform entry stays stored. A client that accepts the stored
+	// identity coding is served locally; transcoding it is still forbidden.
 	cacheRequest(s, http.MethodGet, "/test/no-transform", nil)
 	before := up.count()
 	rec := cacheRequest(s, http.MethodGet, "/test/no-transform", map[string]string{"Accept-Encoding": "gzip"})
 	if rec.Code != http.StatusOK || rec.Body.String() != "raw" {
 		t.Fatalf("no-transform response = %d %q", rec.Code, rec.Body.String())
 	}
-	if up.count() != before+1 {
-		t.Fatalf("no-transform entry was transcoded locally")
+	if got := rec.Header().Get("Content-Encoding"); got != "" {
+		t.Fatalf("no-transform entry was transcoded (%q)", got)
 	}
-	if rec = cacheRequest(s, http.MethodGet, "/test/no-transform", nil); rec.Body.String() != "raw" || up.count() != before+1 {
+	if up.count() != before {
+		t.Fatalf("no-transform entry went upstream although identity was acceptable")
+	}
+	if rec = cacheRequest(s, http.MethodGet, "/test/no-transform", nil); rec.Body.String() != "raw" || up.count() != before {
 		t.Fatalf("stored no-transform entry was damaged")
 	}
 }
@@ -1359,8 +1384,14 @@ func TestCacheRefusesTranscodingDigestAndOCI(t *testing.T) {
 		if rec.Code != http.StatusOK || rec.Header().Get("Docker-Content-Digest") == "" {
 			t.Fatalf("digest response = %d", rec.Code)
 		}
-		if up.count() != before+1 {
-			t.Fatalf("digest entry was transcoded locally")
+		if got := rec.Header().Get("Content-Encoding"); got != "" {
+			t.Fatalf("digest entry was transcoded (%q)", got)
+		}
+		if rec.Body.String() != payload {
+			t.Fatalf("digest entry body changed")
+		}
+		if up.count() != before {
+			t.Fatalf("digest entry went upstream although identity was acceptable")
 		}
 	})
 
@@ -1379,8 +1410,14 @@ func TestCacheRefusesTranscodingDigestAndOCI(t *testing.T) {
 		if rec.Code != http.StatusOK {
 			t.Fatalf("OCI response = %d", rec.Code)
 		}
-		if up.count() != before+1 {
-			t.Fatalf("OCI digest path was transcoded locally")
+		if got := rec.Header().Get("Content-Encoding"); got != "" {
+			t.Fatalf("OCI digest path was transcoded (%q)", got)
+		}
+		if rec.Body.String() != payload {
+			t.Fatalf("OCI digest body changed")
+		}
+		if up.count() != before {
+			t.Fatalf("OCI digest path went upstream although identity was acceptable")
 		}
 	})
 }

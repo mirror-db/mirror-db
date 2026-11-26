@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -152,6 +153,14 @@ func hashStoreConfigFrom(v *viper.Viper) (*hashstore.Config, error) {
 		cfg.MaxSize = maxSize
 	}
 
+	if markRaw := strings.TrimSpace(v.GetString("cache.disk_water_mark")); markRaw != "" {
+		mark, err := hashstore.ParseByteSizeOrZero(markRaw)
+		if err != nil {
+			return nil, fmt.Errorf("CACHE_DISK_WATER_MARK %q: %w", markRaw, err)
+		}
+		cfg.DiskWaterMark = mark
+	}
+
 	bucket := strings.TrimSpace(v.GetString("cache.s3.bucket"))
 	if bucket != "" {
 		endpoint := strings.TrimRight(strings.TrimSpace(v.GetString("cache.s3.endpoint")), "/")
@@ -175,6 +184,102 @@ func hashStoreConfigFrom(v *viper.Viper) (*hashstore.Config, error) {
 
 // DefaultManifestSyncInterval is the manifest refresh cadence when unset.
 const DefaultManifestSyncInterval = 10 * time.Minute
+
+// --- Active cache segment ---
+
+// Defaults for the local active segment. active_capacity has no constant: it
+// defaults to cache.max_size, the store's LRU budget.
+const (
+	DefaultActiveMaxEntries  = 64
+	DefaultActiveIdleTimeout = 10 * time.Minute
+)
+
+// ActiveCacheConfig describes the local active (recently used) cache segment
+// the server layers beside the passive store. It is independent of the passive
+// cache's runtime path; only the configuration surface is shared.
+type ActiveCacheConfig struct {
+	// Dir is the local cache directory (CACHE_DIR), shared with the passive
+	// store. The active segment and its diskspace guard live here.
+	Dir string
+	// Capacity is the segment's byte budget. It defaults to cache.max_size.
+	Capacity int64
+	// MaxEntries bounds the number of retained entries.
+	MaxEntries int
+	// IdleTimeout is how long an unused entry stays in the segment.
+	IdleTimeout time.Duration
+	// DiskWaterMark is the shared minimum free-bytes floor; 0 disables it.
+	DiskWaterMark int64
+}
+
+// GetActiveCacheConfig builds the active-segment configuration. A nil result
+// means the cache is disabled: CACHE_DIR is the on/off switch, the same as for
+// the passive store.
+func GetActiveCacheConfig() (*ActiveCacheConfig, error) {
+	return activeCacheConfigFrom(viper.GetViper())
+}
+
+func activeCacheConfigFrom(v *viper.Viper) (*ActiveCacheConfig, error) {
+	if strings.TrimSpace(v.GetString("cache.dir")) == "" {
+		return nil, nil
+	}
+	store, err := hashStoreConfigFrom(v)
+	if err != nil {
+		return nil, err
+	}
+
+	cfg := &ActiveCacheConfig{
+		Dir:           store.Dir,
+		Capacity:      store.MaxSize,
+		MaxEntries:    DefaultActiveMaxEntries,
+		IdleTimeout:   DefaultActiveIdleTimeout,
+		DiskWaterMark: store.DiskWaterMark,
+	}
+
+	if raw := strings.TrimSpace(v.GetString("cache.active_capacity")); raw != "" {
+		n, err := hashstore.ParseByteSizeOrZero(raw)
+		if err != nil {
+			return nil, fmt.Errorf("CACHE_ACTIVE_CAPACITY %q: %w", raw, err)
+		}
+		// An explicit zero disables the active segment. It is not a default: the
+		// segment is enabled with CACHE_DIR unless one of its limits says no.
+		if n == 0 {
+			return nil, nil
+		}
+		// One active body must be adoptable: the hash store's MaxSize is both its
+		// LRU budget and its largest single body, so a larger active capacity
+		// would admit a body that Adopt can only reject.
+		if n > store.MaxSize {
+			return nil, fmt.Errorf("CACHE_ACTIVE_CAPACITY %q exceeds CACHE_MAX_SIZE %d", raw, store.MaxSize)
+		}
+		cfg.Capacity = n
+	}
+
+	if raw := strings.TrimSpace(v.GetString("cache.active_max_entries")); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 0 {
+			return nil, fmt.Errorf("CACHE_ACTIVE_MAX_ENTRIES %q must be a non-negative integer", raw)
+		}
+		if n == 0 {
+			// Explicit disable, exactly like active_capacity: 0. It cannot be a
+			// default because the segment is on whenever CACHE_DIR is set.
+			return nil, nil
+		}
+		cfg.MaxEntries = n
+	}
+
+	if raw := strings.TrimSpace(v.GetString("cache.active_idle_timeout")); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil {
+			return nil, fmt.Errorf("CACHE_ACTIVE_IDLE_TIMEOUT %q is not a duration: %w", raw, err)
+		}
+		if d <= 0 {
+			return nil, fmt.Errorf("CACHE_ACTIVE_IDLE_TIMEOUT %q must be positive", raw)
+		}
+		cfg.IdleTimeout = d
+	}
+
+	return cfg, nil
+}
 
 // Prefetch defaults. The scheduler lives only in memory; the limits bound a
 // single relay's background work, not the store.

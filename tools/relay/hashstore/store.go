@@ -28,11 +28,13 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	lru "github.com/google/go-lru"
+	"github.com/mirror-db/mirror-db/tools/relay/diskspace"
 )
 
 var (
@@ -48,6 +50,14 @@ var (
 	ErrOversized = errors.New("hashstore: content exceeds max object size")
 	// ErrInvalidDigest means the algorithm or hex length was invalid.
 	ErrInvalidDigest = errors.New("hashstore: invalid digest")
+	// ErrDigestMismatch means an adopted body's real digest did not match the
+	// caller's expectation. Nothing was published and no existing body was
+	// touched.
+	ErrDigestMismatch = errors.New("hashstore: adopted content digest mismatch")
+	// ErrInvalidAdopt means the adopt source is not a completed regular file of
+	// the declared size inside the store's temp directory. Nothing was
+	// published.
+	ErrInvalidAdopt = errors.New("hashstore: invalid adopt source")
 	// ErrInvalidRange means a range offset is negative or past the body's end.
 	ErrInvalidRange = errors.New("hashstore: invalid range offset")
 	// ErrClosed means the store is shutting down.
@@ -84,6 +94,10 @@ type Store struct {
 	maxSize int64
 	backend backend
 	index   *index
+	// space guards local writes with the configured free-space watermark. It is
+	// disabled (watermark 0) unless CACHE_DISK_WATER_MARK is set; reads and
+	// deletions never consult it.
+	space *diskspace.Checker
 
 	// mu guards the index, the LRU and the two together: a record and its
 	// in-memory weight must never disagree.
@@ -95,6 +109,15 @@ type Store struct {
 	// pending deletions. A count, not a set: two concurrent PUTs of the same body
 	// must both finish before the protection is dropped.
 	publishing map[string]int
+
+	// testAfterPublish and testCommitError are test seams and nil in production.
+	// The first runs after a body is published and before its index commit, so a
+	// test can hold a publish inside the reconcile-protected window; it runs
+	// without s.mu, but must not call back into the store. The second can fail a
+	// commit to model an index write failure; it runs with s.mu held, so it must
+	// not call the store either.
+	testAfterPublish func()
+	testCommitError  func() error
 
 	// opMu gates public operations against Close. Operations hold a read lock
 	// and re-check closed; Close flips closed first, then takes the write lock
@@ -175,6 +198,7 @@ func openWith(cfg Config, b backend, reconcile bool) (*Store, error) {
 		maxSize:    cfg.MaxSize,
 		backend:    b,
 		index:      ix,
+		space:      diskspace.New(cfg.Dir, cfg.DiskWaterMark, cfg.diskOptions...),
 		publishing: make(map[string]int),
 		// The LRU budget is CACHE_MAX_SIZE, not the available capacity: the
 		// store may only occupy its share of the disk.
@@ -247,6 +271,12 @@ func (s *Store) Put(ctx context.Context, r io.Reader, size int64) (Content, erro
 	if err := ctx.Err(); err != nil {
 		return Content{}, err
 	}
+	// Checked before the temp file exists: a low watermark rejects the Put
+	// without leaving anything behind. The guard covers the local temp file
+	// even when bodies themselves live in a shared bucket.
+	if err := s.space.Check(); err != nil {
+		return Content{}, err
+	}
 
 	tmp, err := os.CreateTemp(s.tmpDir, "put-*")
 	if err != nil {
@@ -264,7 +294,7 @@ func (s *Store) Put(ctx context.Context, r io.Reader, size int64) (Content, erro
 	}
 	h1 := sha1.New()
 	h256 := sha256.New()
-	n, err := io.Copy(io.MultiWriter(tmp, h1, h256), io.LimitReader(r, limit))
+	n, err := io.Copy(io.MultiWriter(waterWriter{w: tmp, space: s.space}, h1, h256), io.LimitReader(r, limit))
 	if err != nil {
 		_ = tmp.Close()
 		return Content{}, err
@@ -293,19 +323,228 @@ func (s *Store) Put(ctx context.Context, r io.Reader, size int64) (Content, erro
 	if err := s.backend.put(ctx, c, tmpPath); err != nil {
 		return Content{}, err
 	}
+	if s.testAfterPublish != nil {
+		s.testAfterPublish()
+	}
 	if err := s.commit(ctx, c); err != nil {
-		// A shared bucket is never LISTed, so a body that failed to reach the
-		// index would be unreachable garbage. Local orphans are reconciled away.
-		if s.backend.shared() {
-			delCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
-			if derr := s.backend.delete(delCtx, c.SHA256, c.SHA1); derr != nil {
-				log.Printf("hashstore: roll back %s: %v", c.SHA256, derr)
-			}
-			cancel()
-		}
+		s.rollbackSharedPublish(ctx, c)
 		return Content{}, err
 	}
 	return c, nil
+}
+
+// Adopt publishes a body that was already written in full into the store's temp
+// directory, without copying it into a second temp file. size is the caller's
+// claim and must be exact; the file is read once to compute both digests, so
+// neither the claim nor the path is trusted.
+//
+// expectAlgorithm may be empty, meaning no expectation, and then expectDigest
+// must be empty too. When set (sha1 or sha256), the digest is validated and the
+// body's real digest must match it; a mismatch is ErrDigestMismatch and nothing
+// is published.
+//
+// A local backend renames the file into place, so path is gone on success; a
+// shared backend uploads it and leaves path for the caller to remove. On failure
+// the source is left untouched for the caller and nothing reaches storage, the
+// index or the LRU.
+func (s *Store) Adopt(ctx context.Context, path string, size int64, expectAlgorithm Algorithm, expectDigest string) (Content, error) {
+	if !s.enter() {
+		return Content{}, ErrClosed
+	}
+	defer s.leave()
+
+	algo, wantDigest, err := normalizeAdoptExpectation(expectAlgorithm, expectDigest)
+	if err != nil {
+		return Content{}, err
+	}
+	if size < 0 {
+		return Content{}, fmt.Errorf("%w: negative size %d", ErrInvalidAdopt, size)
+	}
+	if size > s.maxSize {
+		return Content{}, fmt.Errorf("%w: %d bytes > %d", ErrOversized, size, s.maxSize)
+	}
+	if err := ctx.Err(); err != nil {
+		return Content{}, err
+	}
+	// The bytes already exist, but the watermark still decides whether the store
+	// may take the body in. Checked before reading or publishing so a low
+	// watermark leaves no side effect. No temp file is created: the source
+	// already is one, and it must not be copied.
+	if err := s.space.Check(); err != nil {
+		return Content{}, err
+	}
+
+	src, err := s.adoptSource(path, size)
+	if err != nil {
+		return Content{}, err
+	}
+
+	f, err := os.Open(src)
+	if err != nil {
+		return Content{}, err
+	}
+	// Read one byte past the declared size, enough to notice a file that grew
+	// after the stat. The guard keeps MaxSize+1 from wrapping.
+	limit := size
+	if limit != math.MaxInt64 {
+		limit++
+	}
+	h1 := sha1.New()
+	h256 := sha256.New()
+	n, copyErr := io.Copy(io.MultiWriter(h1, h256), io.LimitReader(f, limit))
+	closeErr := f.Close()
+	if copyErr != nil {
+		return Content{}, copyErr
+	}
+	if closeErr != nil {
+		return Content{}, closeErr
+	}
+	if n != size {
+		return Content{}, fmt.Errorf("%w: %s read %d bytes, declared %d", ErrInvalidAdopt, path, n, size)
+	}
+	if err := ctx.Err(); err != nil {
+		return Content{}, err
+	}
+
+	c := Content{
+		SHA1:   hex.EncodeToString(h1.Sum(nil)),
+		SHA256: hex.EncodeToString(h256.Sum(nil)),
+		Size:   n,
+	}
+	if algo != "" {
+		got := c.SHA256
+		if algo == SHA1 {
+			got = c.SHA1
+		}
+		if got != wantDigest {
+			return Content{}, fmt.Errorf("%w: %s is %s, expected %s", ErrDigestMismatch, algo, got, wantDigest)
+		}
+	}
+
+	// Same publish window as Put: the body becomes visible before its index
+	// record exists, so a concurrent reconcile must not treat it as an orphan.
+	s.beginPublish(c.SHA256)
+	defer s.endPublish(c.SHA256)
+
+	if err := s.backend.put(ctx, c, src); err != nil {
+		return Content{}, err
+	}
+	if s.testAfterPublish != nil {
+		s.testAfterPublish()
+	}
+	if err := s.commit(ctx, c); err != nil {
+		s.rollbackSharedPublish(ctx, c)
+		return Content{}, err
+	}
+	return c, nil
+}
+
+// adoptSource validates that path is a completed regular file inside the store's
+// temp directory and that its real size matches the claim.
+func (s *Store) adoptSource(path string, size int64) (string, error) {
+	tmpAbs, err := filepath.Abs(s.tmpDir)
+	if err != nil {
+		return "", err
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("%w: %v", ErrInvalidAdopt, err)
+	}
+	rel, err := filepath.Rel(tmpAbs, abs)
+	if err != nil || rel == "." || rel == ".." ||
+		filepath.IsAbs(rel) || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("%w: %s is outside %s", ErrInvalidAdopt, path, s.tmpDir)
+	}
+	// Lstat, not Stat: a symlink is not a regular file. Renaming one into the
+	// body tree would publish a link instead of the bytes it points at.
+	info, err := os.Lstat(abs)
+	if err != nil {
+		return "", fmt.Errorf("%w: %v", ErrInvalidAdopt, err)
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("%w: %s is not a regular file", ErrInvalidAdopt, path)
+	}
+	if info.Size() != size {
+		return "", fmt.Errorf("%w: %s holds %d bytes, declared %d", ErrInvalidAdopt, path, info.Size(), size)
+	}
+	return abs, nil
+}
+
+// normalizeAdoptExpectation validates the optional expected digest. An empty
+// algorithm means no expectation and requires an empty digest.
+func normalizeAdoptExpectation(algo Algorithm, digest string) (Algorithm, string, error) {
+	if strings.TrimSpace(string(algo)) == "" {
+		if strings.TrimSpace(digest) != "" {
+			return "", "", fmt.Errorf("%w: expected digest %q without an algorithm", ErrInvalidDigest, digest)
+		}
+		return "", "", nil
+	}
+	parsed, err := ParseAlgorithm(string(algo))
+	if err != nil {
+		return "", "", err
+	}
+	normalized, err := NormalizeDigest(parsed, digest)
+	if err != nil {
+		return "", "", err
+	}
+	return parsed, normalized, nil
+}
+
+// rollbackSharedPublish removes a body that reached a shared bucket but could
+// not be indexed. A shared bucket is never LISTed, so such a body would be
+// unreachable garbage. Local orphans are reconciled away instead.
+//
+// The decision and the delete run under s.mu, because another publisher of the
+// same digest may have uploaded the same keys and be about to commit them. The
+// caller still holds its own publish guard here, so a count above one means a
+// peer publisher exists: it either committed (the record check catches that) or
+// it is still in flight (the count catches that) and owns the body now. Only the
+// last active publisher with no record may delete, and holding the mutex keeps a
+// new publisher from uploading between that decision and the delete.
+func (s *Store) rollbackSharedPublish(ctx context.Context, c Content) {
+	if !s.backend.shared() {
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, found, err := s.index.get(c.SHA256); err != nil {
+		// Cannot prove the body is unowned; leaving it is safe, and prune will
+		// find it later, whereas deleting a peer's indexed body is not.
+		log.Printf("hashstore: roll back %s: inspect index: %v", c.SHA256, err)
+		return
+	} else if found {
+		return
+	}
+	if s.publishing[c.SHA256] > 1 {
+		return
+	}
+
+	delCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+	defer cancel()
+	if err := s.backend.delete(delCtx, c.SHA256, c.SHA1); err != nil {
+		log.Printf("hashstore: roll back %s: %v", c.SHA256, err)
+	}
+}
+
+// waterWriter rechecks the disk watermark as bytes flow into the temp file.
+// The check is throttled by the Checker, so a large body does not statfs once
+// per write; a low watermark aborts the copy, and Put's deferred remove drops
+// the partial temp file.
+type waterWriter struct {
+	w     io.Writer
+	space *diskspace.Checker
+}
+
+func (w waterWriter) Write(p []byte) (int, error) {
+	n, err := w.w.Write(p)
+	if n > 0 {
+		if spaceErr := w.space.Account(int64(n)); spaceErr != nil {
+			return n, spaceErr
+		}
+	}
+	return n, err
 }
 
 func (s *Store) beginPublish(sha256Hex string) {
@@ -333,6 +572,11 @@ func (s *Store) commit(ctx context.Context, c Content) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.testCommitError != nil {
+		if err := s.testCommitError(); err != nil {
+			return err
+		}
+	}
 	// Index first: an LRU eviction is unrecoverable for this process, and a body
 	// may only be dropped once the record that replaces it is durable. A failure
 	// here must leave the LRU untouched, not half-evicted with no pending delete.
@@ -726,6 +970,18 @@ func (s *Store) removeAllLocked(ctx context.Context, metas []objectMeta) {
 	defer cancel()
 
 	for _, m := range metas {
+		if s.publishing[m.SHA256] > 0 {
+			// A publisher of this digest already has its bytes in place (a
+			// backend.put that renamed them, or an upload) but has not committed
+			// its record yet. Deleting now would strip the body its commit is
+			// about to name, leaving an index and variants pointing at nothing,
+			// and Reconcile could not repair that. Skip the whole removal: the
+			// durable record and body stay, and the publisher's own commit
+			// re-inserts the LRU entry this eviction dropped. Until then the
+			// index still describes a readable body; a Get promotes it again, so
+			// the only cost is a temporarily under-counted LRU budget.
+			continue
+		}
 		if err := s.index.removeAndQueue(m); err != nil {
 			log.Printf("hashstore: dequeue %s: %v", m.SHA256, err)
 			continue

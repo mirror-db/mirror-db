@@ -169,9 +169,15 @@ async function aptFetchHook(
   //
   // The inbound method travels with the request: a HEAD must reach upstream as
   // a HEAD (a GET would transfer the body a probe exists to avoid). Range is
-  // deliberately not forwarded here.
+  // forwarded only for by-hash objects: those are content-addressed, and
+  // `cachedfetch` then bypasses its read-through cache so a 206 can never be
+  // stored under the full-URL key. A pool file keeps the known limitation of
+  // not resuming (its Range would be answered as a 200 from byte 0); mutable
+  // `dists/` files are never ranged either.
   const isHead = request.method.toUpperCase() === "HEAD";
-  const init: RequestInit | undefined = isHead ? { method: "HEAD" } : undefined;
+  const range = isHead || hash === null ? null : request.headers.get("range");
+  let init: RequestInit | undefined = isHead ? { method: "HEAD" } : undefined;
+  if (range !== null) init = { headers: { range } };
   const upstream = hash !== null
     ? await cachedfetch(repo.url(rel), init)
     : await ezfetch(repo.url(rel), init);

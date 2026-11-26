@@ -11,6 +11,7 @@ require (
 	github.com/caddyserver/certmagic v0.25.3
 	github.com/docker/go-units v0.5.0
 	github.com/geektr-cloud/go-cloudflare-fastest-transport v0.3.0
+	github.com/geektr-cloud/go-tiered-cache v0.0.1
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/google/go-lru v1.2.0
 	github.com/gorilla/mux v1.8.1
@@ -20,6 +21,7 @@ require (
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/viper v1.21.0
 	go.etcd.io/bbolt v1.4.3
+	go.uber.org/goleak v1.3.0
 	golang.org/x/net v0.53.0
 )
 

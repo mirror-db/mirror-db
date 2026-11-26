@@ -130,13 +130,18 @@ function withinCacheLimit(response: Response, limit: number): boolean {
   return bytes !== undefined && bytes <= limit;
 }
 
-function buildUpstreamHeaders(request: Request): Headers {
+function buildUpstreamHeaders(request: Request, identity = false): Headers {
   const headers = new Headers();
   request.headers.forEach((value, key) => {
     if (!STRIP_REQUEST_HEADERS.has(key.toLowerCase())) {
       headers.set(key, value);
     }
   });
+  // A digest names one byte sequence, so the representation must not depend on
+  // what the client can decode: the Cache API entry is shared by every client
+  // of that digest. Upstream fetches for digest-addressed paths therefore ask
+  // for identity; tag manifests keep the client's negotiation.
+  if (identity) headers.set("accept-encoding", "identity");
   return headers;
 }
 
@@ -212,12 +217,17 @@ export async function proxyRegistryRequest(
   const digest = extractDigest(path);
   const cacheable = request.method === "GET" && !!opts.cache && digest !== null;
   const cacheKey = digest ? digestCacheKey(opts.upstream, digest) : upstreamUrl;
-  if (cacheable) {
+  // The Cache API holds the complete object and cannot answer a Range. Serving
+  // that stored 200 to a ranged request would deliver the whole body as a plain
+  // 200, so a ranged digest GET skips the lookup and reaches upstream for a real
+  // 206. The write path stays as it is: only a complete 200 is ever stored, and
+  // a 206 is never one.
+  if (cacheable && !request.headers.has("range")) {
     const hit = await opts.cache!.match(cacheKey);
     if (hit) return hit;
   }
 
-  const baseHeaders = buildUpstreamHeaders(request);
+  const baseHeaders = buildUpstreamHeaders(request, digest !== null);
   // Buffer the body once so the request can be retried after authentication.
   const body =
     request.method === "GET" || request.method === "HEAD"
@@ -270,7 +280,17 @@ export async function proxyRegistryRequest(
     hops += 1;
   }
 
-  const final = sanitizeResponse(response);
+  // Digest-addressed blobs and manifests never change under their digest, so
+  // advertise a long immutable freshness on the delivered response — not only
+  // on the Cache API copy. A layer above `maxCacheBytes` is streamed through
+  // uncached, and without this it would reach the relay with no freshness at
+  // all, making every variant stale on arrival. Tag manifests stay mutable;
+  // `sanitizeResponse` only rewrites `Cache-Control` on a 200 and keeps
+  // orthogonal directives such as `no-transform`.
+  const final = sanitizeResponse(
+    response,
+    digest !== null ? { cacheControl: IMMUTABLE_CACHE_CONTROL } : undefined,
+  );
 
   // Persist content-addressed 200s. Force a long immutable Cache-Control so the
   // store accepts it regardless of upstream headers. The write runs in the

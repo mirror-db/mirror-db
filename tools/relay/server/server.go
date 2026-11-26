@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/gorilla/mux"
+	"github.com/mirror-db/mirror-db/tools/relay/activecache"
 	"github.com/mirror-db/mirror-db/tools/relay/certsrv"
 	"github.com/mirror-db/mirror-db/tools/relay/config"
 	"github.com/mirror-db/mirror-db/tools/relay/guard"
@@ -52,6 +53,11 @@ type Server struct {
 	// prefetch is the in-memory lease table and background runner. It is nil
 	// when the content store is disabled: prefetch has nowhere to put a result.
 	prefetch *prefetchScheduler
+
+	// active owns the in-process assembly caches for immutable paths. It is nil
+	// when CACHE_DIR is unset or the manager could not start; an immutable
+	// request then takes the ordinary cache chain.
+	active *activecache.Manager
 
 	// aptIndexes holds the latest normalised APT metadata index per mirror.
 	// It is memory only: a restart waits for a real Release request to discover
@@ -162,6 +168,29 @@ func NewServer() (*Server, error) {
 		)
 		s.prefetch.jitter = defaultPrefetchJitter
 		s.prefetch.Start()
+
+		// The active segment is an optimisation layered on the store: a bad
+		// setting or a directory it cannot use disables it, it never fails
+		// startup. Without it an immutable request keeps the ordinary chain.
+		if activeCfg, activeErr := config.GetActiveCacheConfig(); activeErr != nil {
+			log.Printf("active cache disabled: %v", activeErr)
+		} else if activeCfg != nil {
+			manager, activeErr := activecache.New(activecache.Config{
+				Dir:           activeCfg.Dir,
+				Capacity:      activeCfg.Capacity,
+				MaxEntries:    activeCfg.MaxEntries,
+				IdleTimeout:   activeCfg.IdleTimeout,
+				DiskWaterMark: activeCfg.DiskWaterMark,
+				Store:         store,
+			})
+			if activeErr != nil {
+				log.Printf("active cache disabled: %v", activeErr)
+			} else {
+				s.active = manager
+				log.Printf("active cache: dir=%s capacity=%d max_entries=%d idle_timeout=%s",
+					activeCfg.Dir, activeCfg.Capacity, activeCfg.MaxEntries, activeCfg.IdleTimeout)
+			}
+		}
 	}
 
 	s.proxy = s.newReverseProxy()
@@ -396,6 +425,13 @@ func (s *Server) Close() {
 	}
 	if s.edge != nil {
 		s.edge.Close()
+	}
+	// The active segment must stop before the store: its entries publish
+	// through hashstore.Adopt and close local descriptors owned by the store.
+	if s.active != nil {
+		if err := s.active.Close(); err != nil {
+			log.Printf("active cache close: %v", err)
+		}
 	}
 	if s.hashStore != nil {
 		if err := s.hashStore.Close(); err != nil {

@@ -10,7 +10,8 @@ import (
 )
 
 // A: a HEAD that would need transcoding must obey the same prohibitions as
-// GET: no-transform, content digests and OCI digest paths all go upstream.
+// GET. A client that accepts the stored coding is still served locally; only a
+// client that cannot take it reaches upstream.
 func TestCacheHeadTranscodingForbidden(t *testing.T) {
 	digestPath := "/test/v2/library/nginx/blobs/sha256:" + strings.Repeat("c", 64)
 	up, upSrv := startUpstream(t, func(w http.ResponseWriter, r *http.Request) {
@@ -32,8 +33,11 @@ func TestCacheHeadTranscodingForbidden(t *testing.T) {
 		if rec.Code != http.StatusOK || rec.Body.Len() != 0 {
 			t.Fatalf("%s HEAD = %d body %d", target, rec.Code, rec.Body.Len())
 		}
-		if up.count() != before+1 {
-			t.Fatalf("%s HEAD transcoded locally despite a prohibition", target)
+		if got := rec.Header().Get("Content-Encoding"); got != "" {
+			t.Fatalf("%s HEAD delivered a forbidden coding %q", target, got)
+		}
+		if up.count() != before {
+			t.Fatalf("%s HEAD went upstream even though identity was acceptable", target)
 		}
 	}
 }

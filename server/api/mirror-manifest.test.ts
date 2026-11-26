@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
 
 import { aptMirrors } from "@server/mirrors/apt-mirrors";
-import { LARGE_ARTIFACT_PATTERN } from "@server/relay-policy";
+import {
+  APT_BY_HASH_PATTERN,
+  LARGE_ARTIFACT_PATTERN,
+  OCI_DIGEST_PATTERN,
+} from "@server/relay-policy";
 
 import { api } from "./index";
 import {
@@ -73,60 +77,167 @@ describe("mirror manifest — policy tags", () => {
 });
 
 describe("mirror manifest — policies", () => {
-  it("lists policies in evaluation order", () => {
-    expect(buildMirrorManifest().policies.map((p) => p.name)).toEqual([
+  const policies = () => buildMirrorManifest().policies;
+  const policy = (name: string) => policies().find((p) => p.name === name);
+
+  it("lists policies in evaluation order: immutable rules first", () => {
+    expect(policies().map((p) => p.name)).toEqual([
+      "oci-digests",
+      "apt-by-hash",
       "oci-blobs",
       "apt-packages",
       "large-artifacts",
     ]);
   });
 
-  it("selects speed for OCI blobs and APT pool files", () => {
-    const [oci, apt] = buildMirrorManifest().policies;
+  it("keeps the existing speed selections unchanged", () => {
+    expect(policy("oci-blobs")?.match).toEqual({
+      tag: "oci",
+      path_pattern: "^/v2/.+/blobs/",
+    });
+    expect(policy("oci-blobs")?.rules).toEqual({ traffic_policy: "speed" });
 
-    expect(oci.match).toEqual({ tag: "oci", path_pattern: "^/v2/.+/blobs/" });
-    expect(oci.rules).toEqual({ traffic_policy: "speed" });
-
-    expect(apt.match).toEqual({ tag: "apt", path_prefix: "/pool/" });
-    expect(apt.rules).toEqual({ traffic_policy: "speed" });
+    expect(policy("apt-packages")?.match).toEqual({
+      tag: "apt",
+      path_prefix: "/pool/",
+    });
+    expect(policy("apt-packages")?.rules).toEqual({ traffic_policy: "speed" });
   });
 
   it("applies the generic suffix rule by path only", () => {
-    const large = buildMirrorManifest().policies.find(
-      (p) => p.name === "large-artifacts",
-    );
+    const large = policy("large-artifacts");
 
     expect(large?.match).toEqual({ path_pattern: LARGE_ARTIFACT_PATTERN });
     expect(large?.rules).toEqual({ traffic_policy: "speed" });
   });
 
+  it("declares each immutable rule as a pattern with a named digest group", () => {
+    expect(policy("oci-digests")?.match).toEqual({
+      tag: "oci",
+      path_pattern: OCI_DIGEST_PATTERN,
+    });
+    expect(policy("oci-digests")?.rules).toEqual({
+      immutable: OCI_DIGEST_PATTERN,
+    });
+
+    expect(policy("apt-by-hash")?.match).toEqual({
+      tag: "apt",
+      path_pattern: APT_BY_HASH_PATTERN,
+    });
+    expect(policy("apt-by-hash")?.rules).toEqual({
+      immutable: APT_BY_HASH_PATTERN,
+    });
+  });
+
+  it("keeps immutable and transport decisions separate", () => {
+    for (const name of ["oci-digests", "apt-by-hash"]) {
+      expect(policy(name)?.rules).not.toHaveProperty("traffic_policy");
+      expect(policy(name)?.rules).not.toHaveProperty("passthrough");
+      expect(policy(name)?.rules).not.toHaveProperty("exit");
+    }
+    for (const name of ["oci-blobs", "apt-packages", "large-artifacts"]) {
+      expect(policy(name)?.rules).not.toHaveProperty("immutable");
+    }
+  });
+
   it("has no catch-all rule that would override an earlier speed selection", () => {
     // Last-match-win merging means a trailing `match: {}` latency rule would
     // undo every earlier speed rule. The relay's own default covers the miss.
-    const policies = buildMirrorManifest().policies;
-    expect(policies.at(-1)?.name).toBe("large-artifacts");
-    expect(policies.some((p) => Object.keys(p.match).length === 0)).toBe(false);
+    const all = policies();
+    expect(all.at(-1)?.name).toBe("large-artifacts");
+    expect(all.some((p) => Object.keys(p.match).length === 0)).toBe(false);
   });
 
-  it("uses only known traffic policies", () => {
-    for (const policy of buildMirrorManifest().policies) {
-      expect(["latency", "speed"]).toContain(policy.rules.traffic_policy);
+  it("uses only known traffic policies when a rule sets one", () => {
+    for (const p of policies()) {
+      const traffic = p.rules.traffic_policy;
+      if (traffic !== undefined) {
+        expect(["latency", "speed"]).toContain(traffic);
+      }
     }
   });
 
   it("never puts response-side or per-mirror cache decisions in policy", () => {
-    for (const policy of buildMirrorManifest().policies) {
-      expect(policy.rules).not.toHaveProperty("cache");
-      expect(policy.rules).not.toHaveProperty("cache_ttl");
-      expect(policy.rules).not.toHaveProperty("no-store");
-      expect(policy.rules).not.toHaveProperty("no-vary");
-      expect(policy.rules).not.toHaveProperty("no-transform");
+    for (const p of policies()) {
+      expect(p.rules).not.toHaveProperty("cache");
+      expect(p.rules).not.toHaveProperty("cache_ttl");
+      expect(p.rules).not.toHaveProperty("no-store");
+      expect(p.rules).not.toHaveProperty("no-vary");
+      expect(p.rules).not.toHaveProperty("no-transform");
     }
   });
 
   it("does not expose internal relay directives on a mirror entry", () => {
     for (const mirror of buildMirrorManifest().mirrors) {
       expect(mirror).not.toHaveProperty("relayDirectives");
+    }
+  });
+});
+
+describe("immutable patterns", () => {
+  const groups = (pattern: string, path: string) =>
+    new RegExp(pattern).exec(path)?.groups;
+
+  const SHA256 = "a".repeat(64);
+  const SHA1 = "b".repeat(40);
+  const SHA512 = "c".repeat(128);
+
+  it("extracts the SHA-256 from OCI blob and manifest digest paths", () => {
+    expect(groups(OCI_DIGEST_PATTERN, `/v2/library/nginx/blobs/sha256:${SHA256}`))
+      .toEqual({ sha256: SHA256 });
+    expect(
+      groups(
+        OCI_DIGEST_PATTERN,
+        `/v2/library/nginx/manifests/sha256:${SHA256}`,
+      ),
+    ).toEqual({ sha256: SHA256 });
+  });
+
+  it("does not treat tag manifests or undigested blobs as immutable", () => {
+    expect(
+      groups(OCI_DIGEST_PATTERN, "/v2/library/nginx/manifests/latest"),
+    ).toBeUndefined();
+    expect(
+      groups(OCI_DIGEST_PATTERN, "/v2/library/nginx/blobs/uploads/some-uuid"),
+    ).toBeUndefined();
+  });
+
+  it("rejects an OCI digest of the wrong length", () => {
+    expect(
+      groups(OCI_DIGEST_PATTERN, `/v2/library/nginx/blobs/sha256:${"a".repeat(63)}`),
+    ).toBeUndefined();
+    expect(
+      groups(OCI_DIGEST_PATTERN, `/v2/library/nginx/blobs/sha256:${"a".repeat(65)}`),
+    ).toBeUndefined();
+    expect(
+      groups(OCI_DIGEST_PATTERN, `/v2/library/nginx/blobs/sha256:${"A".repeat(64)}`),
+    ).toBeUndefined();
+  });
+
+  it("extracts the digest from APT by-hash SHA256 and SHA1 names", () => {
+    expect(
+      groups(
+        APT_BY_HASH_PATTERN,
+        `/dists/bookworm/main/binary-amd64/by-hash/SHA256/${SHA256}`,
+      ),
+    ).toEqual({ sha256: SHA256 });
+    expect(
+      groups(
+        APT_BY_HASH_PATTERN,
+        `/dists/bookworm/main/binary-amd64/by-hash/SHA1/${SHA1}`,
+      ),
+    ).toEqual({ sha1: SHA1 });
+  });
+
+  it("does not match APT releases or undeclared by-hash algorithms", () => {
+    for (const path of [
+      "/dists/bookworm/Release",
+      "/dists/bookworm/InRelease",
+      `/dists/bookworm/main/binary-amd64/by-hash/SHA512/${SHA512}`,
+      `/dists/bookworm/main/binary-amd64/by-hash/MD5/${"d".repeat(32)}`,
+      `/dists/bookworm/main/binary-amd64/by-hash/SHA256/${"a".repeat(63)}`,
+    ]) {
+      expect(groups(APT_BY_HASH_PATTERN, path)).toBeUndefined();
     }
   });
 });
@@ -187,6 +298,15 @@ describe("large-artifact pattern", () => {
 });
 
 describe("mirror manifest — GET/HEAD and ETag", () => {
+  it("serves immutable rules in the serialised JSON body", async () => {
+    const body = (await (
+      await api.request(MANIFEST_URL)
+    ).json()) as MirrorManifest;
+    const oci = body.policies.find((p) => p.name === "oci-digests");
+
+    expect(oci?.rules).toEqual({ immutable: OCI_DIGEST_PATTERN });
+  });
+
   it("serves GET with a quoted digest ETag", async () => {
     const res = await api.request(MANIFEST_URL);
 
@@ -260,7 +380,7 @@ describe("mirror manifest — GET/HEAD and ETag", () => {
     });
 
     expect(res.status).toBe(200);
-    expect(((await res.json()) as MirrorManifest).policies).toHaveLength(3);
+    expect(((await res.json()) as MirrorManifest).policies).toHaveLength(5);
   });
 });
 

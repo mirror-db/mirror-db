@@ -46,6 +46,14 @@ export interface PolicyRules {
    * rules are merged, stop evaluating later policies.
    */
   exit?: boolean;
+  /**
+   * RE2-compatible regular expression, matched against the mount-relative URL
+   * path, that declares the path's bytes immutable. It may carry a named group
+   * `sha256` or `sha1` (syntax shared by RE2 and JS: `(?<sha256>…)`); when
+   * present, the captured hex is the object's content digest. A match is a
+   * pre-request fact and never changes `traffic_policy`. Omitted means inherit.
+   */
+  immutable?: string;
 }
 
 export interface RelayPolicy {
@@ -54,6 +62,23 @@ export interface RelayPolicy {
   match: PolicyMatch;
   rules: PolicyRules;
 }
+
+/**
+ * OCI digest-addressed blobs and manifests. A tag manifest
+ * (`/manifests/latest`) carries no digest and is deliberately not matched, so
+ * it keeps the default latency pool; a digest blob also matches `oci-blobs`
+ * afterwards and inherits `speed`.
+ */
+export const OCI_DIGEST_PATTERN =
+  String.raw`^/v2/.+/(?:blobs|manifests)/sha256:(?<sha256>[0-9a-f]{64})$`;
+
+/**
+ * APT `by-hash` objects. This rule extracts the two digest algorithms the
+ * schema declares, SHA-256 and SHA-1; an algorithm it does not name (such as
+ * SHA512) does not match this extraction rule.
+ */
+export const APT_BY_HASH_PATTERN =
+  String.raw`^/dists/.+/by-hash/(?:SHA256/(?<sha256>[0-9a-f]{64})|SHA1/(?<sha1>[0-9a-f]{40}))$`;
 
 /**
  * Archive, image, installer, and package suffixes that benefit from sustained
@@ -68,6 +93,19 @@ export const LARGE_ARTIFACT_PATTERN =
  * because the relay already defaults to `latency`.
  */
 export const relayPolicies: RelayPolicy[] = [
+  {
+    name: "oci-digests",
+    description:
+      "Digest-addressed OCI blobs and manifests; a tag manifest keeps latency.",
+    match: { tag: "oci", path_pattern: OCI_DIGEST_PATTERN },
+    rules: { immutable: OCI_DIGEST_PATTERN },
+  },
+  {
+    name: "apt-by-hash",
+    description: "APT by-hash objects are addressed by their own content digest.",
+    match: { tag: "apt", path_pattern: APT_BY_HASH_PATTERN },
+    rules: { immutable: APT_BY_HASH_PATTERN },
+  },
   {
     name: "oci-blobs",
     description: "OCI layer blobs are large and benefit from sustained throughput.",

@@ -38,12 +38,17 @@ keywords; never part of the distributed manifest), `fetch(request)`, optional
   - `GET|HEAD /api/mirrors` — JSON manifest of all mirrors plus ordered relay
     policies. Mirrors include `keepHTTP` and opaque `policy_tags`; each policy
     carries `match` unchanged and `rules` with `traffic_policy` (`latency` or
-    `speed`), `passthrough`, and the evaluation control `exit`. Matching rules
-    merge field by field in order (later wins, omitted inherits). Both methods
-    emit the same deterministic ETag and honour `If-None-Match`. See
+    `speed`), `passthrough`, the evaluation control `exit`, and `immutable` — an
+    RE2-compatible pattern over the mount-relative path declaring those bytes
+    immutable; it may carry a named group `sha256` or `sha1` that captures the
+    content digest. Matching rules merge field by field in order (later wins,
+    omitted inherits). `immutable` records a pre-request content-addressing fact,
+    never response freshness, and does not change transport. Both methods emit the
+    same deterministic ETag and honour `If-None-Match`. See
     [ADR 0009](docs/adr/0009-policy-driven-relay-transport.md) for distribution
     and [ADR 0012](docs/adr/0012-policy-field-merge-and-passthrough.md) for the
-    current merge semantics.
+    merge semantics, plus
+    [ADR 0015](docs/adr/0015-immutable-policy-rule.md) for `immutable`.
   - `GET /api/status/:name` — per-mirror status snapshot.
 - [server/conf/apt/](server/conf/apt/) — deb822 source presets at
   `/conf/apt/<name>.sources`. Each preset returns `Stanza[]`; explicit metadata,
@@ -217,8 +222,11 @@ APT mount keeps the plain proxy path.
   cover is otherwise unjudged, so a real package body is never denied for being
   absent from a metadata-only table.
 - **Method, not Range.** A HEAD reaches upstream as a HEAD (a body read from the
-  read-through cache is dropped before delivery). `Range` is still **not**
-  forwarded for APT `pool/` files.
+  read-through cache is dropped before delivery). `Range` is forwarded **only**
+  for a known `by-hash/` object: the request then bypasses `cachedfetch`'s
+  read-through cache, upstream answers the real `206`, and nothing partial is
+  stored under the full-URL key. APT `pool/` files still do not forward `Range`,
+  and a mutable `dists/` index is never ranged either.
 
 ## Core proxy — [server/pkgs/oci/registry-proxy.ts](server/pkgs/oci/registry-proxy.ts)
 
@@ -243,11 +251,27 @@ Only **content-addressed** GETs cached: `/blobs/<digest>` and
 `/manifests/<digest>`. Tag manifests (`/manifests/latest`) are mutable → never
 cached.
 
+- **Range never hits the digest cache.** The stored copy is a complete `200` and
+  cannot answer a range, so a ranged digest GET (`Range` on the inbound request)
+  skips the lookup and reaches upstream for a real `206`. The write path is
+  unchanged: only a complete `200` is stored, and a `206` never is. The Worker
+  does not slice bodies itself.
+- **Digest upstreams are fetched as `identity`.** One digest names one byte
+  sequence, and the cache entry is shared by every client of it, so a digest
+  request replaces the client's `Accept-Encoding` with `identity` (redirect hops
+  included). Tag manifests keep the client's negotiation.
+
 - **Key = digest, not path** (`digestCacheKey`): same layer across repos
   (`library/nginx` + `library/node`) shares one entry. Scoped per upstream host
   to contain cache-poisoning blast radius (a bad upstream can't poison another
   registry's digest space; client self-verifies sha256 anyway → DoS-only).
-- Forced `Cache-Control: public, max-age=31536000, immutable` on the stored copy.
+- Forced `Cache-Control: public, max-age=31536000, immutable` on **every**
+  digest-addressed 200, delivered and stored. Delivery gets it even when the body
+  is over `maxCacheBytes` (or has no `Content-Length`) and so never enters the
+  Cache API — otherwise the relay would receive a large layer with no freshness
+  and revalidate it on every pull. `sanitizeResponse` merges this value, so an
+  orthogonal directive such as `no-transform` survives. A tag manifest and any
+  non-200 keep their upstream headers.
 - The stored copy also drops `vary` via `STRIP_STORED_HEADERS`: a digest-addressed
   blob must not vary, and the Cache API refuses to store a `Vary` response. Only
   the cached copy is affected; the client still receives upstream's `Vary`.
@@ -371,7 +395,10 @@ through these, not bare `fetch`, so user-agent + rate-limiting are uniform.
   (`{ name, host? | path?, fetch, status? }`). `server/mirrors/index.ts`
   aggregates them.
 - `tools/relay/` — Go relay server (domestic proxy that talks to the Worker via
-  `/@relay/`). See [Relay server](#relay-server) below.
+  `/@relay/`). See [Relay server](#relay-server) below. `tools/relay/activecache/`
+  — in-process assembly segment for immutable objects (one `PassiveCache` per
+  key); `tools/relay/diskspace/` — free-space watermark guard shared by every
+  local cache write.
 - Path alias: `@server/*` → `./server/*`.
 
 ## Upstream proxy builder — [server/mirrors/proxy/](server/mirrors/proxy/)
@@ -602,7 +629,8 @@ reaching upstreams directly. Mounted in [server/index.ts](server/index.ts) via
   detail.
 - [docs/adr/](docs/adr/) — decisions, including rejected ones (0001 mirror
   kinds, 0005 registry token realm scope, 0006 external probes, 0013 one
-  Worker-owned APT index, 0014 demand-driven prefetch). A rejected ADR keeps the
+  Worker-owned APT index, 0014 demand-driven prefetch, 0015 the `immutable`
+  policy field, 0016 the immutable active cache). A rejected ADR keeps the
   reasoning so it is not re-proposed from scratch.
 - [TODO.md](TODO.md) — reviewed-but-open items (dead upstreams, a passthrough
   that needs a token, the 48 MB PyPI index) with the evidence that produced
@@ -635,7 +663,8 @@ reaching upstreams directly. Mounted in [server/index.ts](server/index.ts) via
 - APT `pool/` files are proxied with `ezfetch` and **do not forward `Range`**:
   a resuming client gets `200` from byte 0 and apt restarts the download. The
   request method itself is preserved (a `HEAD` reaches upstream as `HEAD`). Not
-  fixed yet; `dists/` files and by-hash objects are unaffected.
+  fixed yet; mutable `dists/` files do not forward `Range` either, only a known
+  `by-hash/` object does.
 - A schema-1 APT index only parses gzip and plain `Packages`/`Sources`. A
   repository that publishes only xz, bz2 or zstd has no synthetic listing and no
   hash prediction, by design (ADR 0013). The same generation is also bounded to
@@ -647,8 +676,16 @@ reaching upstreams directly. Mounted in [server/index.ts](server/index.ts) via
 - Relay request-cache metadata is **local to one relay** (bbolt). A shared
   `S3_BUCKET` carries bodies and digest pointers only, so two relays never share
   variant metadata; each rebuilds it from its own upstream traffic.
-- Concurrent cache misses are deliberately not merged (no singleflight in M2), so
-  a cold popular object is fetched once per concurrent request.
+- Concurrent cache misses on the ordinary variant path are deliberately not
+  merged (no singleflight), so a cold popular mutable object is fetched once per
+  concurrent request. An immutable `GET` does coalesce: concurrent readers of one
+  digest or URL share one assembly in the active segment (ADR 0016).
+- The active segment is **per process and per relay**. Its key map and fragments
+  are memory/`CACHE_DIR` state, so a restart deletes incomplete assemblies and two
+  relays never share one. A published body's local bytes also stay reserved in the
+  segment until its last reader releases, which is why
+  `CACHE_ACTIVE_CAPACITY`/`CACHE_ACTIVE_MAX_ENTRIES` bound it separately from the
+  store's LRU.
 - Shared-storage unit tests use a fake object store. A manual one-shot Docker
   check against RustFS 1.0.6 passed Put, dual-digest Get, Range, metadata restart,
   cross-instance adoption, Delete and Prune on 2026-11-23. No deployment has been
@@ -750,6 +787,12 @@ cache:                       # content store + request cache; disabled while dir
   # capacity: 128GiB       # CACHE_CAPACITY; space the store may use, required
   # max_size: 12GiB        # CACHE_MAX_SIZE; LRU budget + per-body cap,
   #                        # default 10% of capacity
+  # disk_water_mark: 4GiB  # CACHE_DISK_WATER_MARK; min free local bytes,
+  #                        # 0/absent disables the guard
+  # active_capacity: 2GiB  # CACHE_ACTIVE_CAPACITY; in-process segment budget,
+  #                        # default cache.max_size, never above it
+  # active_max_entries: 64 # CACHE_ACTIVE_MAX_ENTRIES; live assemblies
+  # active_idle_timeout: 10m  # CACHE_ACTIVE_IDLE_TIMEOUT; idle entry lifetime
   # s3:                    # optional shared RustFS bucket; bodies leave local disk
   #   bucket: mirror-cache       # S3_BUCKET
   #   endpoint: https://rustfs.internal:9000  # S3_ENDPOINT (required with bucket)
@@ -770,14 +813,25 @@ acme:
 - URL (e.g. `https://upper.example.com`) — sync cert-pack from that origin.
 
 Cache keys have their own env names, unlike the dotted-key default:
-`CACHE_DIR`, `CACHE_CAPACITY`, `CACHE_MAX_SIZE`, `S3_BUCKET`, `S3_ENDPOINT`,
-`S3_PREFIX`, `S3_REGION`. `CACHE_DIR` enables **both** the content store and
-request caching: empty means no store and every request goes upstream; non-empty
-means an already-resolved mirror `GET`/`HEAD` tries the cache by default (ADR
-0011). There is no separate cache switch and no manifest field for it. Prefetch
-is created only when the store exists, and reads
-`prefetch.concurrency` / `prefetch.max_tasks` (`PREFETCH_CONCURRENCY`,
-`PREFETCH_MAX_TASKS`); a non-positive value falls back to the default 4 / 4096.
+`CACHE_DIR`, `CACHE_CAPACITY`, `CACHE_MAX_SIZE`, `CACHE_DISK_WATER_MARK`,
+`CACHE_ACTIVE_CAPACITY`, `CACHE_ACTIVE_MAX_ENTRIES`,
+`CACHE_ACTIVE_IDLE_TIMEOUT`, `S3_BUCKET`, `S3_ENDPOINT`, `S3_PREFIX`,
+`S3_REGION`. `CACHE_DIR` enables **both** the content store and request caching:
+empty means no store and every request goes upstream; non-empty means an
+already-resolved mirror `GET`/`HEAD` tries the cache by default (ADR 0011). There
+is no separate cache switch and no manifest field for it. The active segment
+shares that switch: its own settings are validated only when a manager is built,
+so a bad value logs `active cache disabled` and leaves the ordinary chain
+working. Its defaults are `active_capacity` = `cache.max_size` (a larger value is
+rejected, because a body above the store's per-body cap could never be adopted),
+`active_max_entries` = 64, `active_idle_timeout` = 10m, and
+`disk_water_mark` = 0 (disabled). An explicit `0` for
+`active_capacity` or `active_max_entries` disables the active segment while
+leaving the passive store enabled; those zeros are only an explicit switch, not
+a default. Prefetch is created only when the store
+exists, and reads `prefetch.concurrency` / `prefetch.max_tasks`
+(`PREFETCH_CONCURRENCY`, `PREFETCH_MAX_TASKS`); a non-positive value falls back
+to the default 4 / 4096.
 
 ### Upstream transport
 
@@ -803,6 +857,14 @@ names, invalid RE2 expressions, an unknown `traffic_policy`, a non-boolean
 `passthrough` / `exit`, `null`, and an unknown key in `match` or `rules` all
 preserve the last known good snapshot — validation is all-or-nothing.
 
+`rules.immutable` is consumed: the relay compiles the merged pattern with RE2 and
+runs it once against the mount-relative path, so an invalid expression rejects the
+whole manifest at load time. The Worker may publish the field only after a relay
+that accepts it is deployed — an older strict relay sees an unknown rule key and
+rejects the whole manifest, losing every policy until it is upgraded — so the
+deployment order is relay first, Worker second. ADR 0015 records the field and
+that order; ADR 0016 records what the relay does with a match.
+
 Evaluation is **field merge, not first-match** (ADR 0012 supersedes the
 first-match rule of ADR 0009; distribution, matching, ETag, atomic replacement
 and transport fallback stand). Every matching rule applies the fields it
@@ -817,15 +879,28 @@ exclude the query and keep their case and escaping. For a path mount,
 `/debian/pool/x.deb` is matched as `/pool/x.deb`; for a subdomain mount, the path
 is unchanged. Generic artifact suffixes only apply after mirror resolution.
 
+`rules.immutable` merges like every other rule field: a later rule can restate or
+omit it, and omission inherits. Its value is an RE2-compatible pattern matched
+against the mount-relative path. It may carry a named group `sha256` or `sha1`
+(`(?<sha256>…)`); when present, the captured hex is the object's content digest,
+and without one the match only declares that the path's bytes are immutable. A
+match is a pre-request statement; it says nothing about response freshness and
+never selects a transport pool.
+
 The relay never reads a cache field from the manifest: whether to cache is
 `CACHE_DIR` plus the response (ADR 0011). `passthrough` is the only
 policy-level cache decision, and it is knowable before the request.
 
-Initial rules send OCI `blobs/`, APT `pool/`, and common archive, disk-image,
-installer and package suffixes to `speed`; there is no explicit default rule
-because an unmatched request already falls back to `latency`. Bare `.gz` is
-deliberately absent so `Packages.gz` stays on latency.
-See [ADR 0012](docs/adr/0012-policy-field-merge-and-passthrough.md).
+Initial rules place two `immutable` patterns **before** the transport rules: OCI
+digest `blobs/` and `manifests/`, and APT `by-hash/` SHA256/SHA1 objects. Both
+carry the matching named digest group. The specific immutable rule matches first
+and the broader rules after it still merge, so a digest blob gains `speed`
+through `oci-blobs` while a digest manifest inherits the default latency.
+`oci-blobs`, `apt-packages` and the generic suffix rule are unchanged; there is
+no explicit default rule because an unmatched request already falls back to
+`latency`. Bare `.gz` is deliberately absent so `Packages.gz` stays on latency.
+See [ADR 0012](docs/adr/0012-policy-field-merge-and-passthrough.md) and
+[ADR 0015](docs/adr/0015-immutable-policy-rule.md).
 
 ### Edge selection — [tools/relay/server/edge.go](tools/relay/server/edge.go)
 
@@ -912,11 +987,30 @@ themselves. There is no separate TMP_DIR.
 
 - One body is stored once under its real SHA-256 and read through either digest;
   SHA-1 is an unweighted alias in the same index record.
+- Two ways in: `Put` copies a reader into `.tmp` and hashes while it copies;
+  `Adopt` publishes a body another component already wrote in full into `.tmp`.
+  `Adopt(path, size, algo, digest)` accepts only a completed regular file at the
+  declared size inside that directory, reads it once to recompute SHA-1 and
+  SHA-256, and treats `algo`/`digest` as an expectation — a mismatch is
+  `ErrDigestMismatch` and publishes nothing. A local backend renames the file into
+  the data tree (the source path disappears); a shared backend uploads it and
+  leaves the removal to the caller. Both paths share the publish window that keeps
+  a concurrent reconcile or LRU eviction from deleting bytes whose index record is
+  not committed yet, and a failed commit on a shared backend rolls the upload back
+  only if no peer publisher or index record owns it.
 - `CACHE_MAX_SIZE` is the LRU budget and the largest single body: a strict byte
   LRU over logical body bytes (`google/go-lru`, runtime-pressure eviction
   disabled by a constant-zero pressure func). `CACHE_CAPACITY` is the space the
   store may use and is required when the store is enabled; the budget defaults to
   10% of it, and a body above the budget is skipped without evicting anything.
+- `CACHE_DISK_WATER_MARK` is the minimum free space on the filesystem holding
+  `CACHE_DIR`; `0` disables the guard. It gates `Put`, `Adopt` and active
+  admission before a temp file exists, and a large `Put` re-probes mid-write
+  (16 MiB or 1 s). Reads, deletes, reconcile and prune never consult it. It
+  applies to local `.tmp` staging even when `S3_BUCKET` holds the bodies. A failed
+  filesystem probe degrades to no watermark with one warning: explicit capacity
+  limits still bound the store, so a measurement problem must not become an
+  outage.
 - `S3_BUCKET` moves bodies to RustFS (AWS SDK for Go v2, path-style, checksums
   only when required); the local disk then keeps only `.tmp` and `.index.db`.
   The bucket holds `blobs/sha256/<ab>/<cd>/<sha256>` plus two tiny pointer
@@ -933,7 +1027,9 @@ themselves. There is no separate TMP_DIR.
   on read (local: open, S3: the GET/HEAD itself).
 - Local startup reconciles in the background: an index entry without a file is
   dropped, a file without an index entry is removed. A failed eviction delete is
-  written to the index as pending and retried by the same pass.
+  written to the index as pending and retried by the same pass. Startup also
+  empties `.tmp` (`cleanTempDir`), so an interrupted active assembly is deleted
+  rather than resumed — a fragment is not an upstream fact.
 - Public read-only endpoints, registered only when the store is enabled and
   independent of the manifest snapshot: `GET|HEAD /hash-content/sha1/<40 hex>`
   and `GET|HEAD /hash-content/sha256/<64 hex>`. Bad address → 400, absent → 404,
@@ -950,10 +1046,10 @@ themselves. There is no separate TMP_DIR.
   16 variants per URL, 65536 rows globally, 32 KiB per encoded row; an
   over-limit write returns `ErrVariantLimit` and is ignored, never truncating.
 - `relay prune` is the offline cleanup (see below), not part of serving.
-  Request caching is M2 and prefetch M3, both beside this store; telemetry is
-  still a later milestone. `CACHE_DIR` must be writable by the service user; the
-  unit's `ReadWritePaths` covers `/var/cache/mirror-relay`, so a custom directory
-  needs a unit change.
+  Request caching, prefetch and the immutable active segment all sit beside this
+  store; telemetry is still a later milestone. `CACHE_DIR` must be writable by the
+  service user; the unit's `ReadWritePaths` covers `/var/cache/mirror-relay`, so a
+  custom directory needs a unit change.
 
 ### Relay request cache — [tools/relay/server/cache.go](tools/relay/server/cache.go)
 
@@ -983,7 +1079,9 @@ Decision order (`serveCache`):
    stored variant whose body contradicts the fresh index is dropped before
    matching. One remaining match → fresh local hit, or stale revalidation; more
    than one (records with different `Vary` sets all match) → ambiguous,
-   re-fetch and afterwards delete the identities that no longer apply.
+   re-fetch and afterwards delete the identities that no longer apply. On an
+   immutable path the zero-variant branch first tries a digest hit in the store,
+   then the active segment for a GET (below), before the ordinary MISS.
 3. A fresh hit writes the stored status/headers/body locally, rebuilds
    `Content-Length` from the body size and `Age` from `StoredAt`; conditional
    requests are evaluated first (`If-None-Match` uses weak comparison, `If-Match`
@@ -993,11 +1091,94 @@ Decision order (`serveCache`):
    `Content-Encoding` or `Content-Length`) and leaves the body; a `304` that
    newly declares `no-store`/`private`/`Vary: *` drops the entry. `200` replaces
    the variant, `404`/`410` delete it. A stale ranged request is forwarded
-   instead of revalidated.
+   instead of revalidated. Before that, an OCI digest address — or, while the
+   active segment is enabled, any path matched by the merged immutable pattern —
+   is served locally when the store still holds the recorded body at the recorded
+   size and any captured digest names it (ADR 0016); a client-requested
+   revalidation still reaches upstream.
 5. MISS streams the upstream response into `<CACHE_DIR>/.tmp` via an
    `io.Pipe` while writing the client, computes SHA-1 and SHA-256, and commits
    metadata under a timeout independent of the client connection. Only a
    complete `200` GET whose body reached the client becomes an entry.
+
+**Content-addressed digests ignore stale metadata.** Before rule 4, a request
+whose path addresses an OCI object by digest (`…/blobs/sha256:<64 hex>` or
+`…/manifests/sha256:<64 hex>`) is served locally when the path digest equals the
+variant's recorded body SHA-256 (case-insensitive hex) and the store still has
+that body at the recorded size. Freshness cannot change the bytes under such a
+URL, so GET, HEAD, Range, conditionals and coding negotiation reuse the ordinary
+hit path; the metadata and its expiry are left untouched. A tag, another
+algorithm, a digest mismatch, a missing or resized body or a store error falls
+back to the rules above. `no-cache` / `max-age=0` still forces revalidation, and
+a client `no-store` still bypasses the cache entirely. The same rescue also
+applies to any path the merged `immutable` pattern matched, where a captured
+digest additionally has to name the stored body.
+
+**Immutable active path** ([cache_active.go](tools/relay/server/cache_active.go),
+[ADR 0016](docs/adr/0016-tiered-active-cache-for-immutable-objects.md)). Only
+this path diverges from the ordinary chain; a request that does not match
+`immutable` keeps `streamAndStore` unchanged.
+
+- **Eligibility.** Active manager present, merged policy matched `immutable`, no
+  client-forced revalidation, client accepts `identity`, and the method is `GET`.
+  A `HEAD` may reuse a digest-addressed body but never creates an entry. A
+  request with its own `If-*` validators never seeds, because the upstream's
+  answer, not a shared body, decides it.
+- **Key and coalescing.** `activecache.Manager` maps `sha256:<hex>` /
+  `sha1:<hex>` (captured digest) or the URL key to one entry. OCI manifests are
+  always URL-keyed: their media type and headers belong to the repository, so
+  they never take a cross-URL synthetic digest hit and a joiner on another URL
+  never commits the creator's headers as its own variant. Blobs and APT by-hash
+  paths stay digest-keyed. The first `Acquire` becomes the creator and is the
+  only one that contacts upstream; later acquirers wait for `Init` and fall back
+  to the ordinary chain if it fails. This is the singleflight for immutable
+  objects; the ordinary variant path still has none.
+- **Seed.** The seed request sends `Accept-Encoding: identity` and, for a
+  multipart `Range`, only its first interval. A `206` with a concrete total size
+  may start an assembly; a `200` answering a ranged seed, a `206` without a total
+  size, an unknown or zero length, a body above `CACHE_MAX_SIZE`, or any write
+  prohibition (the ordinary rules plus `Content-Range`/`Vary`/non-identity
+  coding) delivers the already-fetched response through the ordinary path. The
+  seed detaches the client's cancellation: the body belongs to the shared entry.
+- **Cold Range.** Missing intervals are fetched on demand by the tiered cache, so
+  a cold `Range` read does not download the whole object first. Delivery covers a
+  complete body, single and multipart ranges (the 32-range cap), `416`,
+  `If-Range` and conditional evaluation from the shared fragment; a partial
+  entry is never presented as complete.
+- **Hole fill without byte ranges.** When a missing interval cannot be fetched by
+  a range request — the origin ignores `Range` and answers `200`, or the range
+  request fails before it yields a reader (for example `500`) — the active source
+  repeats the object as one complete `GET`, streams past the prefix and hands the
+  tiered cache exactly the requested section. The prefix is discarded, never
+  buffered and never stored; a body that ends before the section is complete is
+  `io.ErrUnexpectedEOF`. Only a failed complete `GET` fails the entry, so a
+  range-refusing origin still completes a partial assembly. A failure after bytes
+  were already delivered to the section (including a continuation fragment
+  answered `200`) keeps the ordinary terminal semantics: it is not replayed from
+  byte zero.
+- **Publication.** A complete fragment is published through
+  `hashstore.Adopt`, which validates that the source is a completed regular file
+  inside `<CACHE_DIR>/.tmp` at the declared size and recomputes **both** digests;
+  a captured digest is an expectation, and a mismatch publishes nothing and
+  leaves an existing body untouched. `entryStore` implements both finalize paths:
+  `FinalizeFromCache` adopts the scratch file in place (normal), `Finalize`
+  adopts a copy (fallback when handoff is refused). After publication the entry
+  leaves the active map immediately, the scratch name is reclaimed, and readers
+  that already hold a local descriptor drain on it; the bytes stay accounted
+  until the last reference retires. LRU, capacity and eviction remain the hash
+  store's, unchanged: the active segment only limits how many assemblies run.
+- **Variant.** After a delivery that completed the object the handler waits
+  (bounded at 60 s) for `Adopt` and writes the ordinary URL variant, so a later
+  request without a digest capture is still local. Nothing is written when
+  publication failed or the size disagrees.
+- **Limits.** `CACHE_ACTIVE_MAX_ENTRIES`, `CACHE_ACTIVE_CAPACITY` (known sizes
+  reserved at `Init`, one unknown-size entry admitted alone) and
+  `CACHE_ACTIVE_IDLE_TIMEOUT` (reaper on `StalledTime`) refuse new entries; an
+  admitted entry is never truncated. All three, plus the disk watermark, turn
+  into the ordinary upstream path.
+- **Close order.** `Server.Close` stops the active manager before the hash store:
+  entries publish through `Adopt` and own descriptors the store manages, so the
+  reverse order could adopt into a closed store.
 
 Freshness (`freshnessExpiry`): `no-cache` stores but is immediately stale;
 otherwise shared-cache preference `s-maxage` → `max-age` → `Expires` → the
@@ -1030,23 +1211,27 @@ to-be-transcoded hit falls back upstream. zstd decoding caps the frame window at
 8 MiB (`encoding_stream.go`), so one request cannot allocate an arbitrary
 decoder window.
 
-Range: answered locally only for a fresh complete entry whose negotiated coding
-equals the stored coding. Single and multipart ranges, `416`, and `If-Range`
-(strong `ETag` or exact date; weak never matches) are built from the local body
-via `Store.Range`. Multipart responses are capped at 32 ranges; a larger list is
-ignored in favour of a complete `200`, preventing read/bandwidth amplification.
-A Range MISS is forwarded and `206` is never stored; if upstream ignores Range
-and returns a complete `200`, the entry may be stored and one warning line
-records the full-body transfer.
+Range: on the ordinary path, answered locally only for a fresh complete entry
+whose negotiated coding equals the stored coding. Single and multipart ranges,
+`416`, and `If-Range` (strong `ETag` or exact date; weak never matches) are built
+from the local body via `Store.Range`. Multipart responses are capped at 32
+ranges; a larger list is ignored in favour of a complete `200`, preventing
+read/bandwidth amplification. A Range MISS is forwarded and its `206` never
+becomes a stored variant; if upstream ignores Range and returns a complete `200`,
+the entry may be stored and one warning line records the full-body transfer. The
+active path is the exception: a cold ranged `GET` may seed an assembly, and a
+range whose union covers the whole object lets the resulting complete body be
+published.
 
 Failure and concurrency: a pre-response cache failure logs and falls back to the
 ordinary proxy; a transient body error does not delete metadata, a definite
 absence drops it and becomes a MISS. Write failures only disable the tee — the
 client still gets the complete response. Nothing retries after response headers
-are sent. **No singleflight**: concurrent misses on one variant each go upstream
-and stream independently; `Put` is idempotent by real hash and metadata is
-committed by atomic replacement, so the final state is one body and one
-self-consistent variant.
+are sent. **No singleflight on the ordinary path**: concurrent misses on one
+variant each go upstream and stream independently, while an immutable `GET`
+coalesces in the active segment above; `Put` is idempotent by real hash and
+metadata is committed by atomic replacement, so the final state is one body and
+one self-consistent variant.
 
 ### Metadata prefetch — [tools/relay/server/prefetch.go](tools/relay/server/prefetch.go)
 
@@ -1145,15 +1330,29 @@ content is still fetchable upstream.
 - `tools/relay/server/server.go` — Server, routers, `httputil.ReverseProxy`
   rewrites, `X-MDB-Relay-Host` handling (`RelayHostHeader`), manifest watcher,
   and the `handleRequest` order: policy decision → inbound directive sanitising →
-  cache chain (unless passthrough) → proxy. Internal endpoints:
+  cache chain (unless passthrough) → proxy. It also owns the cache component
+  lifecycle: hash store and prefetch first, then the active manager, and `Close`
+  stops the active manager before the store. Internal endpoints:
   `/.mirror-relay/cert-pack`, `/.mirror-relay/mirrors`, `/.mirror-relay/pool`
   (all JWT-guarded).
 - `tools/relay/server/cache.go` — request-cache chain: lookup, hits,
   revalidation, MISS tee-and-store, metadata commit, ambiguity cleanup, index
-  hash-prediction delivery, and prefetch observation.
+  hash-prediction delivery, stale digest hits, and prefetch observation.
   `cache_headers.go` — stored-header selection, freshness, conditional
   evaluation, request cache directives. `cache_range.go` — single/multipart
-  ranges and `416`.
+  ranges and `416`. `cache_active.go` — the immutable active path: eligibility,
+  seeding (fetch/first range/metadata), delivery from the shared fragment, the
+  bounded wait for publication and the URL-variant commit, plus digest-hit and
+  immutable stale-hit delivery.
+- `tools/relay/activecache/` — the in-process segment behind that path:
+  `manager.go` (key map, acquire/init/fail, entry and byte accounting, idle
+  reaper, close/retire), `entry.go` (one assembly, metadata, readers, publish
+  settlement), `store.go` (scratch file cache and the `tiered.Store` +
+  `CacheHandoff` that publishes through `hashstore.Adopt`).
+- `tools/relay/diskspace/` — `Checker` for one directory: watermark probe,
+  throttled mid-write recheck, `ErrLowDiskSpace`; platform probe in
+  `probe_linux.go` / `probe_other.go`, degrading to "no watermark" when the probe
+  is unavailable.
 - `tools/relay/server/encoding.go` — `Accept-Encoding` negotiation and coding
   parsing; `encoding_stream.go` — decode-to-identity/re-encode streams and the
   8 MiB zstd window cap.
@@ -1183,8 +1382,9 @@ content is still fetchable upstream.
   read-only handler (400/404/405 matrix), registered before the proxy catch-all.
 - `tools/relay/prune.go` — `relay prune` cobra command: offline cache cleanup,
   prints counts to stdout, non-zero on any failure.
-- `tools/relay/hashstore/` — content store: `store.go` (Put/Get/Range/Stat/
-  Resolve/Delete, capacity + LRU + reconcile), `index.go` + `index_variant.go` (bbolt:
+- `tools/relay/hashstore/` — content store: `store.go` (Put/Adopt/Get/Range/Stat/
+  Resolve/Delete, capacity + LRU + reconcile + publish windows + disk watermark),
+  `index.go` + `index_variant.go` (bbolt:
   sizes, aliases, LRU order, pending deletes, variant rows and their reverse
   body references, the global variant counter), `variant.go` (variant identity,
   header normalisation, per-URL/global/row limits), `backend.go` (local bodies
@@ -1223,16 +1423,33 @@ invalid-manifest rejection, variant identity and limits, local hits,
 revalidation (`304` / `200` / `404` / `410`), HEAD sharing, conditional requests,
 single/multipart ranges and `416`/`If-Range`, the four transcodings plus
 `no-transform`/digest protection, `X-MDB-Relay` parsing and stripping, ambiguity
-re-fetch, and cache failure fallback; and M3: lease creation/renewal/expiry,
+re-fetch, stale OCI digest hits (URL/body/size agreement, uppercase hex, tag /
+sha512 / mismatch / missing-body / size / force-revalidate fallbacks), and cache
+failure fallback; and M3: lease creation/renewal/expiry,
 freshness-driven scheduling, backoff and task limit, concurrency bound, clean
 shutdown, `no-store`/`prefetch` conflict, variant-header replay, HEAD renewing
 but never refreshing, escaped-path replay, schema-1 index parsing (unknown
 fields, bad digests, unsafe paths, conflicting entries), per-mirror aggregate
 task and retargeting, 304 deadline extension, hash-predicted GET/HEAD/Range and
 `If-Range`, SHA-1 fallback, mismatched-variant drop, metadata-kind refusal, and
-skipping prediction for a client revalidation. Shared-storage unit cases use a
-fake object store; the separate manual Docker RustFS 1.0.6 check is not part of
-CI. CI runs vet + test before building.
+skipping prediction for a client revalidation. The immutable round adds
+`rules.immutable` compilation, merge and digest extraction (one named group only;
+two captures or non-hex declare immutability without a digest), the Worker's two
+published patterns, mount-relative matching, the active segment (coalescing
+concurrent readers, single and multipart assembly, cold Range fill, late readers
+sharing one upstream, publication and old-reader drain, both finalize paths,
+digest mismatch publishes nothing, digest-keyed sharing across mounts, URL-key
+entries, capacity/unknown-size/low-disk refusals, idle reaping, close while a body
+is in flight), `Adopt` (both digests, expectation mismatch, invalid source,
+LRU participation, restart survival, shared bucket, concurrent Put/Adopt and
+no-delete-of-in-flight-publish), the disk watermark (refusal before temp creation
+and mid-write, reads/deletes still working, disabled by default), and the HTTP
+path (cold and cached immutable GET, digest and immutable stale hits, response
+prohibitions, passthrough staying on the proxy, HEAD never creating an entry,
+forced revalidation reaching upstream, unknown size / over-budget fallbacks, and
+`Close` stopping the active manager before the store). Shared-storage unit cases
+use a fake object store; the separate manual Docker RustFS 1.0.6 check is not part
+of CI. CI runs vet + test before building.
 
 Worker side (`pnpm test`, both vitest projects): `/relaytest` returns all eight
 cases with matching HEAD status/headers, relay-control merges without overriding
@@ -1253,7 +1470,10 @@ deployment has been verified.
 
 ### Build
 
-Go 1.26+ (`google/go-lru` requires it).
+Go 1.26+ (`google/go-lru` requires it). The immutable active segment uses
+`github.com/geektr-cloud/go-tiered-cache v0.0.1` — its core plus the `adapters/fs`
+and `adapters/http` subpackages — as the only additional runtime module;
+`go.uber.org/goleak` is test-only.
 
 ```bash
 cd tools/relay && go build -o relay

@@ -73,6 +73,21 @@ func (s *Server) serveCache(w http.ResponseWriter, r *http.Request) bool {
 		return true
 	}
 
+	// An immutable policy declares the bytes under the path cannot change. Only
+	// a GET that the client allows to be cached may assemble them in the active
+	// segment; a HEAD may only reuse a body that is already addressable, since
+	// it must never create an entry.
+	immutable, digest := immutableFromContext(r.Context())
+	identityAcceptable := AcceptEncodingFromRequest(r).Accepts(CodingIdentity)
+	digestEligible := s.active != nil && immutable && !requestPolicy.forceRevalidate &&
+		identityAcceptable && (r.Method == http.MethodGet || r.Method == http.MethodHead)
+	activeEligible := digestEligible && r.Method == http.MethodGet
+	// A manifest's media type and headers are repository metadata, not a
+	// property of its digest. A synthetic digest-only hit would serve another
+	// repository's manifest as application/octet-stream, so manifests stay on
+	// their own URL variant (and the active path keys them by URL).
+	digestHitEligible := digestEligible && !isOCIManifestPath(path)
+
 	variants, err := s.hashStore.Variants(r.Context(), key)
 	if err != nil {
 		log.Printf("relay cache: list %q: %v", key, err)
@@ -97,6 +112,19 @@ func (s *Server) serveCache(w http.ResponseWriter, r *http.Request) bool {
 		if expectedOK && !requestPolicy.forceRevalidate && s.servePredicted(w, r, key, path, expected, expectedGen) {
 			return true
 		}
+		if digestHitEligible {
+			// A body already published under the path's digest is the same bytes
+			// no matter which mount or repository names it, so it is served
+			// without an upstream request.
+			if s.serveImmutableDigestHit(w, r, key, path, digest) {
+				return true
+			}
+		}
+		if activeEligible {
+			if s.serveImmutableActive(w, r, key, path, digest) {
+				return true
+			}
+		}
 		s.serveMiss(w, r, key, path, nil, true, false)
 		return true
 	case 1:
@@ -107,6 +135,19 @@ func (s *Server) serveCache(w http.ResponseWriter, r *http.Request) bool {
 				s.prefetch.TouchNormalVariant(key, v, s.currentTime())
 			}
 			return s.serveHit(w, r, key, path, v)
+		}
+		// An OCI digest address may still be servable locally even though the
+		// metadata is stale: the body cannot change under that URL, so freshness
+		// says nothing about the bytes. A client that asked for revalidation
+		// (no-cache, max-age=0) still reaches the upstream.
+		if !requestPolicy.forceRevalidate && s.serveStaleDigestHit(w, r, key, path, v) {
+			return true
+		}
+		// The same reasoning applies to every path the merged immutable pattern
+		// matched: the policy itself states the bytes cannot change. A captured
+		// digest additionally has to name the stored body.
+		if s.active != nil && !requestPolicy.forceRevalidate && immutable && s.serveImmutableStaleHit(w, r, key, path, v, digest) {
+			return true
 		}
 		// A ranged request is answered by forwarding it: turning a 206 into a
 		// full revalidation would lose the range semantics. A 304 from a
@@ -203,6 +244,16 @@ func (s *Server) serveHit(w http.ResponseWriter, r *http.Request, key, path stri
 	if !acceptable {
 		return false
 	}
+	// A digest-addressed or no-transform response may not be re-encoded. When
+	// the client accepts the stored coding, deliver it unchanged instead of
+	// punishing the hit with an upstream fetch; only a client that cannot take
+	// the stored coding falls through.
+	if transcode && TranscodingForbidden(v.ResponseHeaders, path) {
+		if !AcceptEncodingFromRequest(r).Accepts(storedCoding) {
+			return false
+		}
+		target, transcode = storedCoding, false
+	}
 
 	// Conditional evaluation uses the representation that would actually be
 	// delivered. A transcoded delivery has a weak validator, so a strong
@@ -292,6 +343,37 @@ func (s *Server) serveHit(w http.ResponseWriter, r *http.Request, key, path stri
 		log.Printf("relay cache: stream %q: %v", key, err)
 	}
 	return true
+}
+
+// serveStaleDigestHit answers a stale entry from the local store when the
+// request addresses an OCI object by digest and the stored body is provably
+// that object: the path digest names the same SHA-256 the variant recorded, and
+// the body is present at the recorded size. A digest address cannot be
+// re-pointed, so the metadata's freshness has no bearing on the bytes.
+//
+// It reuses serveHit, so conditional evaluation, Range, HEAD, coding
+// negotiation and the digest transcoding prohibition all behave exactly as on a
+// fresh hit; nothing here rewrites the variant or its expiry. Any doubt — a tag,
+// another algorithm, a digest mismatch, a missing or resized body, a store
+// error — reports false, and the caller keeps its ordinary stale path.
+func (s *Server) serveStaleDigestHit(w http.ResponseWriter, r *http.Request, key, path string, v hashstore.Variant) bool {
+	digest, ok := OCIDigestFromPath(path)
+	if !ok {
+		return false
+	}
+	bodyDigest, err := hashstore.NormalizeDigest(hashstore.SHA256, v.BodySHA256)
+	if err != nil || digest != bodyDigest {
+		return false
+	}
+	size, exists, err := s.hashStore.Stat(r.Context(), hashstore.SHA256, bodyDigest)
+	if err != nil {
+		log.Printf("relay cache: stat %q for digest hit: %v", key, err)
+		return false
+	}
+	if !exists || size != v.BodySize {
+		return false
+	}
+	return s.serveHit(w, r, key, path, v)
 }
 
 // ensureBody verifies the body behind a variant. A definite loss becomes a
