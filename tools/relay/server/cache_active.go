@@ -112,15 +112,7 @@ func (s *Server) serveImmutableActive(w http.ResponseWriter, r *http.Request, ke
 		// A policy digest is the pre-request fact and wins over anything the
 		// response declares; only a pattern without a digest lets the response
 		// supply the Adopt expectation.
-		meta, outcome := s.seedImmutableActive(w, r, key, entry, digestHex == "")
-		switch outcome {
-		case activeSeedUseEntry:
-			return s.deliverImmutableActive(w, r, key, path, entry, meta)
-		case activeSeedServed:
-			return true
-		default:
-			return false
-		}
+		return s.seedImmutableActive(w, r, key, path, entry, digestHex == "")
 	}
 
 	meta, ok := entry.Metadata().(activeMetadata)
@@ -136,19 +128,18 @@ type activeSeedOutcome int
 const (
 	// activeSeedUseEntry: Init succeeded; serve from the shared cache.
 	activeSeedUseEntry activeSeedOutcome = iota
-	// activeSeedServed: the response was already delivered; the handler is done.
-	activeSeedServed
-	// activeSeedOrdinary: nothing was consumed; the caller delivers this same
-	// response through the ordinary chain instead of fetching again.
+	// activeSeedOrdinary: nothing was consumed; the same response must be
+	// delivered through the ordinary chain instead of fetching again.
 	activeSeedOrdinary
 	// activeSeedFallback: the response is no longer deliverable here; the caller
 	// must fetch again or answer with an error.
 	activeSeedFallback
 )
 
-// seedImmutableActive fetches the first response, validates it, hands it to the
-// entry and returns the metadata later readers share.
-func (s *Server) seedImmutableActive(w http.ResponseWriter, r *http.Request, key string, entry *activecache.Entry, useResponseDigest bool) (activeMetadata, activeSeedOutcome) {
+// seedImmutableActive fetches the first response for a policy-seeded entry and
+// hands it to the disposition module. It reports whether the request is
+// finished; false tells the caller to start a fresh upstream exchange.
+func (s *Server) seedImmutableActive(w http.ResponseWriter, r *http.Request, key, path string, entry *activecache.Entry, useResponseDigest bool) bool {
 	// The body's lifetime is the shared cache's, not the creator's: a client
 	// that disconnects must not take away bytes other readers are waiting for.
 	// Detaching removes the client's cancellation; the transport still bounds
@@ -161,7 +152,7 @@ func (s *Server) seedImmutableActive(w http.ResponseWriter, r *http.Request, key
 		entry.Fail(err)
 		log.Printf("relay active: request %q: %v", key, err)
 		s.writeUpstreamError(w, r, err)
-		return activeMetadata{}, activeSeedServed
+		return true
 	}
 	// Byte offsets address the encoded representation. The adapter enforces
 	// this for later requests; the seed request has to do it itself.
@@ -181,23 +172,19 @@ func (s *Server) seedImmutableActive(w http.ResponseWriter, r *http.Request, key
 	if err != nil {
 		entry.Fail(err)
 		s.writeUpstreamError(w, r, err)
-		return activeMetadata{}, activeSeedServed
+		return true
 	}
-	s.notePrefetchResponse(r, resp.Header)
-
-	meta, outcome := s.startActiveFromResponse(w, r, key, entry, resp, seedRange, useResponseDigest)
-	switch outcome {
-	case activeSeedUseEntry:
-		return meta, activeSeedUseEntry
-	case activeSeedOrdinary:
-		// The response is still untouched: deliver it exactly as the ordinary
-		// chain would, including a tee when it is storable, instead of asking
-		// upstream twice.
-		s.deliverActiveFallback(w, r, resp, key)
-		return activeMetadata{}, activeSeedServed
-	default:
-		return activeMetadata{}, activeSeedFallback
-	}
+	return s.disposition().settle(w, r, dispositionRequest{
+		key:      key,
+		path:     path,
+		resp:     resp,
+		writable: true,
+		policySeed: &policySeed{
+			entry:             entry,
+			seedRange:         seedRange,
+			useResponseDigest: useResponseDigest,
+		},
+	}) == settleDone
 }
 
 // startActiveFromResponse validates an already-fetched response and hands it to
@@ -207,7 +194,7 @@ func (s *Server) seedImmutableActive(w http.ResponseWriter, r *http.Request, key
 // range this response answers when the caller narrowed a multipart Range itself.
 // useResponseDigest lets a response supply the Adopt expectation when no policy
 // pattern captured one.
-func (s *Server) startActiveFromResponse(w http.ResponseWriter, r *http.Request, key string, entry *activecache.Entry, resp *http.Response, seedRange string, useResponseDigest bool) (activeMetadata, activeSeedOutcome) {
+func (s *Server) startActiveFromResponse(r *http.Request, key string, entry *activecache.Entry, resp *http.Response, seedRange string, useResponseDigest bool) (activeMetadata, activeSeedOutcome) {
 	directives := RelayDirectivesFromHeader(resp.Header)
 
 	if err := immutableActiveStorable(resp, directives); err != nil {
@@ -390,60 +377,58 @@ func (s *Server) responseImmutableEligible(r *http.Request, resp *http.Response,
 	return immutableActiveStorable(resp, directives) == nil
 }
 
-// serveResponseImmutableActive seeds the active segment from a first MISS whose
-// response declared immutability. It reports whether the response was consumed;
-// false means it is still untouched and the caller must deliver it ordinarily.
-func (s *Server) serveResponseImmutableActive(w http.ResponseWriter, r *http.Request, key string, resp *http.Response, directives RelayDirectives) bool {
+// responseSeedOutcome reports whether a response-declared seed consumed the
+// response or left it for the ordinary chain.
+type responseSeedOutcome int
+
+const (
+	// responseSeedOrdinary: the response is untouched and must be delivered by
+	// the ordinary chain.
+	responseSeedOrdinary responseSeedOutcome = iota
+	// responseSeedConsumed: the response was assembled or the client was answered
+	// with an error; nothing is left to deliver.
+	responseSeedConsumed
+)
+
+// seedResponseActive seeds the active segment from a first MISS whose response
+// declared immutability. bodyTaken reports whether the entry (or a failed
+// adapter) now owns the body; the caller must not deliver it again. A refusal
+// before the handoff returns responseSeedOrdinary with bodyTaken false, so the
+// same response can still take the ordinary path.
+func (s *Server) seedResponseActive(w http.ResponseWriter, r *http.Request, key string, resp *http.Response, directives RelayDirectives) (responseSeedOutcome, bool) {
 	// The response digest is an expectation only: the entry keeps the URL key
 	// the response arrived under, so a response can never re-point a cache key.
 	entry, created, err := s.active.Acquire(r.Context(), key)
 	if err != nil {
 		logActiveFallback("response-acquire", key, err)
-		return false
+		return responseSeedOrdinary, false
 	}
 	defer entry.Release()
 	if !created {
 		// Another request already owns this URL key. This body is in hand, so it
 		// goes to the ordinary chain rather than into someone else's assembly;
 		// the existing entry is left untouched.
-		return false
+		return responseSeedOrdinary, false
 	}
 
-	meta, outcome := s.startActiveFromResponse(w, r, key, entry, resp, "", true)
+	meta, outcome := s.startActiveFromResponse(r, key, entry, resp, "", true)
 	switch outcome {
 	case activeSeedUseEntry:
 		if s.deliverImmutableActive(w, r, key, "", entry, meta) {
-			return true
+			return responseSeedConsumed, true
 		}
 		log.Printf("relay active: response seed %q could not be delivered", key)
 		http.Error(w, "upstream error", http.StatusBadGateway)
-		return true
-	case activeSeedServed:
-		return true
+		return responseSeedConsumed, true
 	case activeSeedOrdinary:
-		return false
+		return responseSeedOrdinary, false
 	default:
 		// The body was handed to an adapter that could not start, so it cannot be
 		// delivered here. Nothing has been written to the client yet.
 		log.Printf("relay active: response seed %q left no deliverable body", key)
 		http.Error(w, "upstream error", http.StatusBadGateway)
-		return true
+		return responseSeedConsumed, true
 	}
-}
-
-// deliverActiveFallback hands an already-fetched response to the ordinary chain
-// and closes its body. deliverUpstream may store it (a full 200) or pass it
-// through (404/416/no-store); writable stays true because a response the passive
-// store accepts must not be made uncacheable merely because the active segment
-// could not take it.
-func (s *Server) deliverActiveFallback(w http.ResponseWriter, r *http.Request, resp *http.Response, key string) {
-	if resp == nil {
-		return
-	}
-	defer resp.Body.Close()
-	// The response was already fetched for an active attempt, so this delivery
-	// must not start another one: fallback never re-enters response-active.
-	s.deliverUpstream(w, r, resp, key, nil, true, false, false)
 }
 
 // logActiveSeedFallback downgrades the statuses that are simply the upstream's

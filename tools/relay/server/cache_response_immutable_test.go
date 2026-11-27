@@ -671,8 +671,9 @@ func TestResponseImmutableAmbiguousVariant(t *testing.T) {
 	}
 }
 
-// TestResponseImmutablePrefetchObservedOnce checks the response is still
-// observed for prefetch when it seeds the active segment.
+// TestResponseImmutablePrefetchObservedOnce checks the response is observed
+// exactly once for prefetch when it seeds the active segment, and that the
+// observation still reaches the lease table.
 func TestResponseImmutablePrefetchObservedOnce(t *testing.T) {
 	body := activeBody()
 	digest := bodyDigestHex(string(body))
@@ -682,10 +683,18 @@ func TestResponseImmutablePrefetchObservedOnce(t *testing.T) {
 	}))
 	s, _ := responseImmutableServer(t, upSrv.URL, 0, nil)
 	disablePrefetchJitter(s)
+	obs := &countingObservation{next: prefetchObservation{s}}
+	s.observer = obs
 
 	rec := cacheRequest(s, http.MethodGet, "/files/blob", nil)
 	if rec.Code != http.StatusOK || !bytes.Equal(rec.Body.Bytes(), body) {
 		t.Fatalf("GET = %d, %d bytes", rec.Code, rec.Body.Len())
+	}
+	if got := obs.headerETags(); len(got) != 1 {
+		t.Fatalf("observations = %d, want exactly 1", len(got))
+	}
+	if headers, revalidated := obs.counts(); headers != 1 || revalidated != 0 {
+		t.Fatalf("observations = %d headers / %d revalidated, want 1/0", headers, revalidated)
 	}
 	task := onlyPrefetchTask(t, s)
 	if task.cacheKey != "mirror://files/blob" {

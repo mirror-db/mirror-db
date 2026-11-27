@@ -78,6 +78,11 @@ type Server struct {
 	// it; production leaves it nil and gets time.Now.
 	now func() time.Time
 
+	// observer receives exactly one observation per settled upstream response.
+	// Nil means the prefetch lease table reads the response itself; tests inject
+	// a counting sink to measure the count directly.
+	observer responseObservation
+
 	// logImmutableMiss enables the diagnostic that reports a resolved request
 	// whose merged policy did not declare immutability although its path carries
 	// a digest-shaped run. Off unless CACHE_LOG_IMMUTABLE_MISS is explicitly true;

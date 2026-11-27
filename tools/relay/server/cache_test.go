@@ -92,6 +92,10 @@ type cacheServerOptions struct {
 	// activeCapacity overrides the active segment's byte budget. Zero uses
 	// maxSize, which is what production does by default.
 	activeCapacity int64
+	// activeDiskWaterMark sets the active segment's free-space floor. It is
+	// separate from the store's watermark so a test can refuse active admission
+	// while the ordinary store still writes.
+	activeDiskWaterMark int64
 }
 
 // newCacheServer builds a Server wired to a content store and a test upstream.
@@ -121,11 +125,12 @@ func newCacheServer(t *testing.T, upstream string, opts cacheServerOptions) (*Se
 	t.Cleanup(func() { _ = store.Close() })
 
 	active, err := activecache.New(activecache.Config{
-		Dir:         opts.dir,
-		Capacity:    opts.activeCapacity,
-		MaxEntries:  64,
-		IdleTimeout: 10 * time.Minute,
-		Store:       store,
+		Dir:           opts.dir,
+		Capacity:      opts.activeCapacity,
+		MaxEntries:    64,
+		IdleTimeout:   10 * time.Minute,
+		DiskWaterMark: opts.activeDiskWaterMark,
+		Store:         store,
 	})
 	if err != nil {
 		t.Fatalf("open active cache: %v", err)

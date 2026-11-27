@@ -69,7 +69,7 @@ func (s *Server) serveCache(w http.ResponseWriter, r *http.Request) bool {
 	if requestPolicy.noStore {
 		// The client asked that this exchange never touch the cache: no
 		// lookup, and no write even if the response would otherwise qualify.
-		s.serveMiss(w, r, key, path, nil, false, false, false)
+		s.serveMiss(w, r, dispositionRequest{key: key, path: path})
 		return true
 	}
 
@@ -125,7 +125,9 @@ func (s *Server) serveCache(w http.ResponseWriter, r *http.Request) bool {
 				return true
 			}
 		}
-		s.serveMiss(w, r, key, path, nil, true, false, true)
+		s.serveMiss(w, r, dispositionRequest{
+			key: key, path: path, writable: true, allowResponseActive: true,
+		})
 		return true
 	case 1:
 		v := matches[0]
@@ -153,7 +155,9 @@ func (s *Server) serveCache(w http.ResponseWriter, r *http.Request) bool {
 		// full revalidation would lose the range semantics. A 304 from a
 		// client's own If-Range validator is still handled upstream.
 		if strings.TrimSpace(r.Header.Get("Range")) != "" {
-			s.serveMiss(w, r, key, path, &v, true, false, true)
+			s.serveMiss(w, r, dispositionRequest{
+				key: key, path: path, old: &v, writable: true, allowResponseActive: true,
+			})
 			return true
 		}
 		s.serveRevalidation(w, r, key, path, v)
@@ -162,7 +166,9 @@ func (s *Server) serveCache(w http.ResponseWriter, r *http.Request) bool {
 		// Several records with different Vary sets all match. Picking one would
 		// invent an identity the upstream never stated, so re-fetch instead.
 		log.Printf("relay cache: %q is ambiguous (%d matching variants), re-fetching", key, len(matches))
-		s.serveMiss(w, r, key, path, nil, true, true, true)
+		s.serveMiss(w, r, dispositionRequest{
+			key: key, path: path, writable: true, cleanupAmbiguous: true, allowResponseActive: true,
+		})
 		return true
 	}
 }
@@ -398,7 +404,7 @@ func (s *Server) ensureBody(w http.ResponseWriter, r *http.Request, key, path st
 // gone. It drops the stale metadata and answers the request as a fresh miss.
 func (s *Server) repairMissingVariant(w http.ResponseWriter, r *http.Request, key, path string, v hashstore.Variant) {
 	s.dropVariant(v)
-	s.serveMiss(w, r, key, path, nil, true, false, true)
+	s.serveMiss(w, r, dispositionRequest{key: key, path: path, writable: true, allowResponseActive: true})
 }
 
 func (s *Server) serveTranscoded(w http.ResponseWriter, r *http.Request, v hashstore.Variant, from, to ContentCoding) bool {
@@ -460,55 +466,19 @@ func (s *Server) serveRevalidation(w http.ResponseWriter, r *http.Request, key, 
 		s.writeUpstreamError(w, r, err)
 		return
 	}
-	defer resp.Body.Close()
 
-	switch resp.StatusCode {
-	case http.StatusNotModified:
-		next := s.revalidatedVariant(v, resp)
-		directives := RelayDirectivesFromHeader(resp.Header)
-		if storableMetadata(next.ResponseHeaders, directives, next.NoVary) {
-			if next.Persistent {
-				withPersistentLifetime(next.ResponseHeaders)
-			}
-			_ = s.commitVariant(r.Context(), next, nil)
-		} else {
-			// The 304 verified this body but also declared it must no longer be
-			// stored. Serve from the verified copy, drop the old record, and let
-			// the next request start over as a MISS.
-			s.dropVariant(v)
-		}
-		if s.prefetch != nil {
-			noStore := directives.NoStore ||
-				cacheControlHas(resp.Header.Values("Cache-Control"), "no-store") ||
-				cacheControlHas(resp.Header.Values("Cache-Control"), "private")
-			if mirror, _, ok := s.resolveMirror(s.manifest.Load(), r); ok {
-				s.prefetch.ObserveNormalVariant(mirror, key, path, r.URL.Path, r.URL.EscapedPath(), r.URL.RawQuery,
-					next, s.currentTime(), directives.Prefetch, noStore)
-			}
-		}
-		if !s.serveHit(w, r, key, path, next) {
-			s.proxy.ServeHTTP(w, r)
-		}
-	case http.StatusNotFound, http.StatusGone:
-		s.dropVariant(v)
-		s.deliverUpstream(w, r, resp, key, nil, true, false, true)
-	case http.StatusOK:
-		// The upstream answered the revalidation with a full representation.
-		// The client's own conditions were removed from the conditional
-		// request, so evaluate them now against the new response before any
-		// body is delivered.
-		switch evaluatePreconditions(r, resp.Header) {
-		case preconditionNotModified:
-			writeNotModifiedFromHeaders(w, resp.Header)
-			return
-		case preconditionFailed:
-			w.WriteHeader(http.StatusPreconditionFailed)
-			return
-		}
-		s.deliverUpstream(w, r, resp, key, &v, true, false, true)
-	default:
-		s.deliverUpstream(w, r, resp, key, &v, true, false, true)
-	}
+	// Every revalidation response is one disposition. A 304 folds metadata, a
+	// 200 answers the client's own conditions before storage, and a definite
+	// absence invalidates the stale entry.
+	s.disposition().settle(w, r, dispositionRequest{
+		key:             key,
+		path:            path,
+		resp:            resp,
+		old:             &v,
+		writable:        true,
+		revalidated:     true,
+		revalidatedFrom: &v,
+	})
 }
 
 // revalidatedVariant folds a 304's metadata into the stored variant. Vary and
@@ -542,16 +512,13 @@ func (s *Server) revalidatedVariant(v hashstore.Variant, resp *http.Response) ha
 	return v
 }
 
-// serveMiss fetches the upstream response and delivers it. old is set only when
-// a stale variant's ranged request bypassed revalidation: a full 200 then
-// replaces that variant, while a 206 leaves it alone. writable is false for a
-// request that must not populate the cache (client Cache-Control: no-store).
-// responseActive lets a response that declares X-MDB-Relay: immutable seed the
-// active segment.
-func (s *Server) serveMiss(w http.ResponseWriter, r *http.Request, key, path string, old *hashstore.Variant, writable, cleanupAmbiguous, responseActive bool) {
+// serveMiss fetches the upstream response and hands it to the disposition
+// module. The pre-response facts travel in the same request value, so callers
+// never pass a row of adjacent booleans.
+func (s *Server) serveMiss(w http.ResponseWriter, r *http.Request, req dispositionRequest) {
 	out, err := s.buildUpstreamRequest(r.Context(), r)
 	if err != nil {
-		log.Printf("relay cache: request %q: %v", key, err)
+		log.Printf("relay cache: request %q: %v", req.key, err)
 		http.Error(w, "upstream error", http.StatusBadGateway)
 		return
 	}
@@ -560,47 +527,8 @@ func (s *Server) serveMiss(w http.ResponseWriter, r *http.Request, key, path str
 		s.writeUpstreamError(w, r, err)
 		return
 	}
-	defer resp.Body.Close()
-	s.deliverUpstream(w, r, resp, key, old, writable, cleanupAmbiguous, responseActive)
-}
-
-// deliverUpstream decides whether an upstream response can enter the store and
-// either streams it with a tee or passes it through.
-func (s *Server) deliverUpstream(w http.ResponseWriter, r *http.Request, resp *http.Response, key string, old *hashstore.Variant, writable, cleanupAmbiguous, responseActive bool) {
-	directives := RelayDirectivesFromHeader(resp.Header)
-	s.notePrefetchResponse(r, resp.Header)
-
-	// A ranged request that received a full 200 means upstream ignored Range.
-	// The full response may be cached, but the operator should be able to see
-	// that a Range MISS turned into a full-body transfer.
-	if r.Method == http.MethodGet && resp.StatusCode == http.StatusOK && strings.TrimSpace(r.Header.Get("Range")) != "" {
-		log.Printf("relay cache warning: %s %s ignored Range and returned a full 200", r.Method, r.URL.Path)
-	}
-
-	// A response may declare its own immutability. That fact arrives with the
-	// headers, so it can only seed the active segment on a MISS; every refusal
-	// leaves the response deliverable through the ordinary chain below.
-	if responseActive && s.responseImmutableEligible(r, resp, directives, old, writable, cleanupAmbiguous) {
-		if s.serveResponseImmutableActive(w, r, key, resp, directives) {
-			return
-		}
-	}
-
-	storable := writable && s.storable(resp, r, directives)
-	if storable {
-		s.streamAndStore(w, r, resp, key, directives, old, cleanupAmbiguous)
-		return
-	}
-
-	if old != nil {
-		switch resp.StatusCode {
-		case http.StatusOK, http.StatusNotFound, http.StatusGone:
-			// The stored copy is known stale and the upstream no longer agrees
-			// with it. Nothing new may be written, so drop the old record.
-			s.dropVariant(*old)
-		}
-	}
-	deliverRaw(w, resp)
+	req.resp = resp
+	s.disposition().settle(w, r, req)
 }
 
 // storable reports whether this response may become a cache entry. All the
@@ -741,7 +669,8 @@ func (s *Server) streamAndStore(w http.ResponseWriter, r *http.Request, resp *ht
 		// to finish. A ResponseWriter that cannot flush is fine.
 		_ = http.NewResponseController(w).Flush()
 	}
-	_ = resp.Body.Close()
+	// The body is closed by the disposition module, which owns it across the
+	// store wait; closing here would be the second close.
 	if !storeBody {
 		return
 	}

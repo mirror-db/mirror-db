@@ -130,6 +130,14 @@ revalidation cannot shorten it, while the first response still advertises what
 the origin sent. It is distinct from a policy's immutability fact, which is
 known before the request and may name the digest in the path.
 
+### Response disposition
+
+The relay's decision about one upstream response once its headers are known:
+deliver it without storage, file it as a stored variant, or assemble it into a
+hash object. One response has one disposition and one body, so a fallback — an
+assembly that cannot proceed, a store that refuses the response — delivers that
+same response instead of asking the upstream again.
+
 ### Immutable-miss diagnostic
 
 An opt-in relay log line reporting a request that resolved to a mirror, whose

@@ -620,6 +620,22 @@ func (p *prefetchScheduler) NoteAPTResponse(m Mirror, now time.Time, noStore boo
 	}
 }
 
+// noteRevalidatedResponse feeds a 304 revalidation into the lease table. It is a
+// separate shape from notePrefetchResponse because a 304 has no body: the folded
+// variant carries the metadata. An APT Release still forms an ordinary lease
+// here; the per-mirror index task is learned from a full Release response.
+func (s *Server) noteRevalidatedResponse(r *http.Request, key string, v hashstore.Variant, directives RelayDirectives, noStore bool) {
+	if s.prefetch == nil {
+		return
+	}
+	mirror, path, ok := s.resolveMirror(s.manifest.Load(), r)
+	if !ok || isRelaytestPath(path) {
+		return
+	}
+	s.prefetch.ObserveNormalVariant(mirror, key, path, r.URL.Path, r.URL.EscapedPath(), r.URL.RawQuery,
+		v, s.currentTime(), directives.Prefetch, noStore)
+}
+
 // notePrefetchResponse feeds one real upstream response into the lease table.
 // A response without the directive only renews an existing lease; it never
 // creates one. Passthrough never reaches this path.

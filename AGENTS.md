@@ -1141,7 +1141,11 @@ Decision order (`serveCache`):
    only. `304` folds new freshness/headers into metadata (never `Vary`,
    `Content-Encoding` or `Content-Length`) and leaves the body; a `304` that
    newly declares `no-store`/`private`/`Vary: *` drops the entry. `200` replaces
-   the variant, `404`/`410` delete it. A stale ranged request is forwarded
+   the variant, `404`/`410` delete it. A `200` that the client's own condition
+   short-circuits to `304`/`412` is still observed once, but stores no new body;
+   if it carried `X-MDB-Relay: prefetch`, that observation creates or renews the
+   lease, so a later background refresh can populate the cache. A stale ranged
+   request is forwarded
    instead of revalidated. Before that, an OCI digest address — or, while the
    active segment is enabled, any path matched by the merged immutable pattern —
    is served locally when the store still holds the recorded body at the recorded
@@ -1179,9 +1183,10 @@ this path diverges from the ordinary chain; a request that does not match
   request with its own `If-*` validators never seeds, because the upstream's
   answer, not a shared body, decides it.
 - **Response-declared seed.** A response that carries `X-MDB-Relay: immutable`
-  may seed the same path on its first MISS, before the client is written:
-  `deliverUpstream` calls `responseImmutableEligible` and then
-  `serveResponseImmutableActive`. Admission requires `GET`, a `200`/`206` with a
+  may seed the same path on its first MISS, before the client is written: the
+  response disposition module ([disposition.go](tools/relay/server/disposition.go))
+  calls `responseImmutableEligible` and then `seedResponseActive`. Admission
+  requires `GET`, a `200`/`206` with a
   concrete size in `(0, CACHE_MAX_SIZE]`, an `identity` coding, no dangerous
   `Vary`, no `no-store`/`private`, a writable request that is neither
   client-forced-revalidated nor conditional, no multipart `Range`, no bypassed
@@ -1194,11 +1199,13 @@ this path diverges from the ordinary chain; a request that does not match
   committed variant stores the persistent header set and `Persistent: true`
   while the client response keeps the upstream `Cache-Control`. Every
   refusal before the adapter takes the body delivers that same response through
-  the ordinary chain (no second upstream request, and fallback delivery passes
-  `responseActive=false`, so it cannot recurse); a request that finds an entry
+  the ordinary chain (no second upstream request, and the fallback sits below the
+  active decision, so it cannot recurse); a request that finds an entry
   already assembling the URL delivers its own response ordinarily instead of
   joining it, so a partial `206` seed publishes only when its range covers the
-  whole object.
+  whole object. A response whose body reached an adapter that could not start is
+  never replayed: a policy seed starts a fresh exchange, a response seed answers
+  `502`.
 - **Key and coalescing.** `activecache.Manager` maps `sha256:<hex>` /
   `sha1:<hex>` (captured digest) or the URL key to one entry. OCI manifests are
   always URL-keyed: their media type and headers belong to the repository, so
@@ -1432,7 +1439,10 @@ content is still fetchable upstream.
   (all JWT-guarded).
 - `tools/relay/server/cache.go` — request-cache chain: lookup, hits,
   revalidation, MISS tee-and-store, metadata commit, ambiguity cleanup, index
-  hash-prediction delivery, stale digest hits, and prefetch observation.
+  hash-prediction delivery, and stale digest hits.
+  `disposition.go` — the response disposition module: one already-fetched
+  response, one disposition (raw / stored / assembled), the pure decision table,
+  exactly-once observation, body ownership and the pre-handoff fallback.
   `cache_headers.go` — stored-header selection, freshness, conditional
   evaluation, request cache directives. `cache_range.go` — single/multipart
   ranges and `416`. `cache_active.go` — the immutable active path: eligibility,
