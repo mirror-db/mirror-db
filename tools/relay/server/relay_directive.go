@@ -5,6 +5,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/mirror-db/mirror-db/tools/relay/hashstore"
 )
 
 // RelayDirectiveHeader is the response control header an upstream uses to tell
@@ -27,6 +29,63 @@ type RelayDirectives struct {
 	// Prefetch marks the resource eligible for relay-driven background refresh.
 	// It never changes how the current response is stored or delivered.
 	Prefetch bool
+	// Immutable declares that the response's bytes cannot change. It alone
+	// selects the active assembly path; a digest does not imply it.
+	Immutable bool
+	// SHA256 and SHA1 are the content digests this response declared for its own
+	// body, lowercase and valid for their algorithm, or "" when they were absent,
+	// invalid, or contradicted by an identically named keyword. They are only an
+	// Adopt expectation: they never change a cache key.
+	SHA256 string
+	SHA1   string
+}
+
+// Expectation returns the digest this response declared for its body, preferring
+// sha256 when both algorithms are present.
+func (d RelayDirectives) Expectation() (hashstore.Algorithm, string) {
+	if d.SHA256 != "" {
+		return hashstore.SHA256, d.SHA256
+	}
+	if d.SHA1 != "" {
+		return hashstore.SHA1, d.SHA1
+	}
+	return "", ""
+}
+
+// digestValue accumulates one algorithm's declared digest across repeated
+// keywords. The first valid value wins, an identical repeat is harmless, and two
+// different valid values cancel the field: guessing which one describes the body
+// would be worse than having no expectation. An invalid value is ignored without
+// cancelling anything.
+type digestValue struct {
+	algo     hashstore.Algorithm
+	value    string
+	conflict bool
+}
+
+func (d *digestValue) add(raw string) {
+	if d.conflict {
+		return
+	}
+	normalized, err := hashstore.NormalizeDigest(d.algo, strings.TrimSpace(raw))
+	if err != nil {
+		return
+	}
+	if d.value == "" {
+		d.value = normalized
+		return
+	}
+	if d.value != normalized {
+		d.value = ""
+		d.conflict = true
+	}
+}
+
+func (d *digestValue) result() string {
+	if d.conflict {
+		return ""
+	}
+	return d.value
 }
 
 // ParseRelayDirectives parses one or more X-MDB-Relay field values.
@@ -37,7 +96,11 @@ type RelayDirectives struct {
 // value — the safe choice when a response declares more than one fallback
 // lifetime.
 func ParseRelayDirectives(values []string) RelayDirectives {
-	var d RelayDirectives
+	var (
+		d      RelayDirectives
+		sha256 = digestValue{algo: hashstore.SHA256}
+		sha1   = digestValue{algo: hashstore.SHA1}
+	)
 	for _, value := range values {
 		for _, token := range strings.Split(value, ",") {
 			token = strings.TrimSpace(token)
@@ -55,6 +118,12 @@ func ParseRelayDirectives(values []string) RelayDirectives {
 				d.NoVary = true
 			case "prefetch":
 				d.Prefetch = true
+			case "immutable":
+				d.Immutable = true
+			case "sha256":
+				sha256.add(arg)
+			case "sha1":
+				sha1.add(arg)
 			case "ttl":
 				seconds, ok := parseNonNegativeSeconds(strings.TrimSpace(arg))
 				if !ok {
@@ -68,6 +137,8 @@ func ParseRelayDirectives(values []string) RelayDirectives {
 			}
 		}
 	}
+	d.SHA256 = sha256.result()
+	d.SHA1 = sha1.result()
 	return d
 }
 

@@ -64,6 +64,60 @@ describe("relay directives — merge", () => {
   });
 });
 
+describe("relay directives — immutability keywords", () => {
+  const SHA256 = "a".repeat(64);
+  const SHA1 = "b".repeat(40);
+  const OTHER_SHA256 = "c".repeat(64);
+
+  it("appends immutable and digests in declaration order", () => {
+    expect(
+      mergeRelayDirectives(null, [
+        "immutable",
+        `sha256=${SHA256}`,
+        `sha1=${SHA1}`,
+      ]),
+    ).toBe(`immutable, sha256=${SHA256}, sha1=${SHA1}`);
+    expect(mergeRelayDirectives("no-store", ["immutable"])).toBe(
+      "no-store, immutable",
+    );
+  });
+
+  it("keeps an existing directive's value", () => {
+    expect(mergeRelayDirectives("immutable", ["immutable"])).toBe("immutable");
+    expect(
+      mergeRelayDirectives(`sha256=${SHA256}`, [`sha256=${OTHER_SHA256}`]),
+    ).toBe(`sha256=${SHA256}`);
+    expect(mergeRelayDirectives(`sha1=${SHA1}`, [`sha1=${SHA1}`])).toBe(
+      `sha1=${SHA1}`,
+    );
+  });
+
+  it("keeps immutable and a digest as independent keywords", () => {
+    expect(mergeRelayDirectives(null, ["immutable", "sha1=abc"])).toBe(
+      "immutable, sha1=abc",
+    );
+    expect(mergeRelayDirectives("sha1=abc", ["immutable"])).toBe(
+      "sha1=abc, immutable",
+    );
+    // one algorithm's digest never stands in for another
+    expect(mergeRelayDirectives(`sha1=${SHA1}`, [`sha256=${SHA256}`])).toBe(
+      `sha1=${SHA1}, sha256=${SHA256}`,
+    );
+  });
+
+  it("does not turn a digest into immutability or drop legacy directives", () => {
+    expect(mergeRelayDirectives(`sha256=${SHA256}`, [])).toBe(
+      `sha256=${SHA256}`,
+    );
+    expect(
+      mergeRelayDirectives("no-store, ttl=60, prefetch", [
+        "no-vary",
+        "immutable",
+      ]),
+    ).toBe("no-store, ttl=60, prefetch, no-vary, immutable");
+  });
+});
+
 describe("relay directives — response middleware", () => {
   it("merges into a response without touching status, body or other headers", async () => {
     const response = new Response("body", {
@@ -93,6 +147,34 @@ describe("relay directives — response middleware", () => {
     const response = new Response("x");
     expect(withRelayDirectives(response, undefined)).toBe(response);
     expect(withRelayDirectives(response, [])).toBe(response);
+  });
+
+  it("merges immutable and a digest without overriding existing directives", async () => {
+    const sha256 = "d".repeat(64);
+    const response = new Response("body", {
+      headers: { [RELAY_CONTROL_HEADER]: "no-store" },
+    });
+
+    const wrapped = withRelayDirectives(response, [
+      "immutable",
+      `sha256=${sha256}`,
+    ]);
+
+    expect(wrapped.headers.get(RELAY_CONTROL_HEADER)).toBe(
+      `no-store, immutable, sha256=${sha256}`,
+    );
+    expect(await wrapped.text()).toBe("body");
+
+    const existingImmutable = new Response("x", {
+      headers: {
+        [RELAY_CONTROL_HEADER]: `immutable, sha1=${"e".repeat(40)}`,
+      },
+    });
+    expect(
+      withRelayDirectives(existingImmutable, ["immutable"]).headers.get(
+        RELAY_CONTROL_HEADER,
+      ),
+    ).toBe(`immutable, sha1=${"e".repeat(40)}`);
   });
 });
 

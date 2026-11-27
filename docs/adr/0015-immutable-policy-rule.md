@@ -81,7 +81,10 @@ running — upgrade the relay before publishing a manifest that uses a newer key
   the response (ADR 0011); the field only says the bytes cannot change. What the
   relay does with a match — a local digest hit, a stale-variant rescue, or an
   in-process assembly — is described in
-  [ADR 0016](0016-tiered-active-cache-for-immutable-objects.md).
+  [ADR 0016](0016-tiered-active-cache-for-immutable-objects.md). A path whose
+  immutability only the upstream knows is expressed by the `immutable` relay
+  directive instead, which never changes this field or the manifest
+  ([ADR 0017](0017-response-declared-immutability.md)).
 - The Worker owns the initial patterns, so adding a mount with a new digest path
   shape needs a manifest change, not a relay release.
 
@@ -94,7 +97,10 @@ running — upgrade the relay before publishing a manifest that uses a newer key
   schema does not express; a dedicated field keeps matching and extraction
   separate.
 - *Response-side detection only.* Rejected: the first request still misses, and a
-  relay holding the body by digest cannot use it.
+  relay holding the body by digest cannot use it. Response-side detection was
+  later added as a complement, not a replacement: the `immutable` relay directive
+  seeds a first MISS but cannot deduplicate before the headers arrive
+  ([ADR 0017](0017-response-declared-immutability.md)).
 - *A separate policy kind or a new transport policy value.* Rejected:
   `immutable` is orthogonal to transport; a digest manifest should stay on
   latency while a digest blob uses speed.

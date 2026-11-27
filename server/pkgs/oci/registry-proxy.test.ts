@@ -558,6 +558,148 @@ describe("proxyRegistryRequest caching", () => {
   });
 });
 
+describe("proxyRegistryRequest — relay directives", () => {
+  const SHA256 = "a".repeat(64);
+  const SHA1 = "b".repeat(40);
+  const SHA512 = "c".repeat(128);
+  const relay = (res: Response) => res.headers.get("x-mdb-relay");
+
+  it("declares immutable and the path digest on a digest blob 200", async () => {
+    const { fetchImpl } = mockFetch(
+      () =>
+        new Response("BLOB", {
+          status: 200,
+          headers: {
+            "content-length": "4",
+            etag: '"blob"',
+            "docker-content-digest": DIGEST,
+          },
+        }),
+    );
+
+    const res = await proxyRegistryRequest(req(`/v2/library/nginx/blobs/${DIGEST}`), {
+      upstream: "registry-1.docker.io",
+      fetchImpl,
+    });
+
+    // The declaration comes from the request path, not from the response's
+    // Docker-Content-Digest, and it does not displace any existing header.
+    expect(relay(res)).toBe(`immutable, sha256=${SHA256}`);
+    expect(res.headers.get("etag")).toBe('"blob"');
+    expect(res.headers.get("docker-content-digest")).toBe(DIGEST);
+  });
+
+  it("declares immutable and the path digest on a 206", async () => {
+    const { fetchImpl } = mockFetch(
+      () =>
+        new Response("CDATA", {
+          status: 206,
+          headers: { "content-range": "bytes 2-6/8", "content-length": "5" },
+        }),
+    );
+
+    const res = await proxyRegistryRequest(
+      req(`/v2/library/nginx/blobs/${DIGEST}`, { headers: { range: "bytes=2-6" } }),
+      { upstream: "registry-1.docker.io", fetchImpl },
+    );
+
+    expect(res.status).toBe(206);
+    expect(relay(res)).toBe(`immutable, sha256=${SHA256}`);
+  });
+
+  it("declares immutable and the path digest on a 304", async () => {
+    const { fetchImpl } = mockFetch(
+      () => new Response(null, { status: 304, headers: { etag: '"blob"' } }),
+    );
+
+    const res = await proxyRegistryRequest(
+      req(`/v2/library/nginx/blobs/${DIGEST}`, {
+        headers: { "if-none-match": '"blob"' },
+      }),
+      { upstream: "registry-1.docker.io", fetchImpl },
+    );
+
+    expect(res.status).toBe(304);
+    // A revalidation still describes the same immutable bytes, so the relay's
+    // own revalidation state keeps the declaration.
+    expect(relay(res)).toBe(`immutable, sha256=${SHA256}`);
+  });
+
+  it("declares sha1 only when the path names a full sha1 digest", async () => {
+    const { fetchImpl } = mockFetch(() => new Response("ok", { status: 200 }));
+
+    const res = await proxyRegistryRequest(
+      req(`/v2/library/nginx/blobs/sha1:${SHA1}`),
+      { upstream: "registry-1.docker.io", fetchImpl },
+    );
+
+    expect(relay(res)).toBe(`immutable, sha1=${SHA1}`);
+  });
+
+  it("declares only immutable for an algorithm the relay cannot address", async () => {
+    const { fetchImpl } = mockFetch(() => new Response("ok", { status: 200 }));
+
+    const res = await proxyRegistryRequest(
+      req(`/v2/library/nginx/blobs/sha512:${SHA512}`),
+      { upstream: "registry-1.docker.io", fetchImpl },
+    );
+
+    expect(relay(res)).toBe("immutable");
+  });
+
+  it("never declares anything on a tag manifest, even with a response digest", async () => {
+    const { fetchImpl } = mockFetch(
+      () =>
+        new Response("manifest", {
+          status: 200,
+          headers: { "docker-content-digest": DIGEST, "content-length": "8" },
+        }),
+    );
+
+    const res = await proxyRegistryRequest(req("/v2/library/nginx/manifests/latest"), {
+      upstream: "registry-1.docker.io",
+      fetchImpl,
+    });
+
+    // A tag is mutable: a digest header on the response is not a path fact.
+    expect(relay(res)).toBeNull();
+  });
+
+  it("declares nothing on a digest-addressed error", async () => {
+    const { fetchImpl } = mockFetch(() => new Response("missing", { status: 404 }));
+
+    const res = await proxyRegistryRequest(req(`/v2/library/nginx/blobs/${DIGEST}`), {
+      upstream: "registry-1.docker.io",
+      fetchImpl,
+    });
+
+    expect(relay(res)).toBeNull();
+  });
+
+  it("declares on a cache hit without storing the header", async () => {
+    const { cache, store } = mockCache();
+    const { fetchImpl, calls } = mockFetch(
+      () =>
+        new Response("BLOB", {
+          status: 200,
+          headers: { "content-length": "4" },
+        }),
+    );
+    const opts = { upstream: "registry-1.docker.io", fetchImpl, cache };
+
+    const first = await proxyRegistryRequest(req(`/v2/library/nginx/blobs/${DIGEST}`), opts);
+    expect(relay(first)).toBe(`immutable, sha256=${SHA256}`);
+
+    const second = await proxyRegistryRequest(req(`/v2/library/nginx/blobs/${DIGEST}`), opts);
+    expect(calls).toHaveLength(1);
+    expect(relay(second)).toBe(`immutable, sha256=${SHA256}`);
+
+    // Relay control is per delivery; the Worker's cached copy stays clean.
+    const entry = [...store.values()][0]!;
+    expect(entry.headers.get("x-mdb-relay")).toBeNull();
+  });
+});
+
 describe("getToken", () => {
   it("returns the token and sends Basic auth for credentials", async () => {
     const { fetchImpl, calls } = mockFetch(

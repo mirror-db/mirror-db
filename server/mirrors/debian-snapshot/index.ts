@@ -31,6 +31,7 @@ import {
   sanitizeResponse,
   STRIP_RESPONSE_HEADERS,
 } from "@server/pkgs/fetch";
+import { withRelayDirectives } from "@server/relay-control";
 import type { Mirror } from "@server/types";
 
 export const UPSTREAM = "https://snapshot.debian.org/";
@@ -62,6 +63,13 @@ const IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable";
  * upstream's own five-minute lifetime rather than inventing one.
  */
 const SHORT_CACHE_CONTROL = "public, max-age=600";
+
+/**
+ * Statuses that can carry an immutable declaration for a pinned snapshot object.
+ * A `206` is still the same object's bytes, and a `304` confirms the stored
+ * copy; only a pinned archive+timestamp path qualifies at all.
+ */
+const DECLARABLE_STATUSES = new Set([200, 206, 304]);
 
 export interface SnapshotCache {
   match(request: Request): Promise<Response | undefined>;
@@ -173,12 +181,23 @@ export function createDebianSnapshot(opts: DebianSnapshotOptions = {}): Mirror {
       const cacheable =
         stable && !hasRange && request.method === "GET";
 
+      // A pinned archive+timestamp path names its bytes, so the relay may keep
+      // them without a revalidation. This is a path fact, declared on delivery
+      // only (the Worker's own stored copy stays directive-free): a future
+      // timestamp resolves to "newest snapshot", `mr/` is a changing JSON API and
+      // an error names nothing. No digest is declared — the mirror never derives
+      // one from a redirect or a header.
+      const declare = (response: Response): Response =>
+        stable && DECLARABLE_STATUSES.has(response.status)
+          ? withRelayDirectives(response, ["immutable"])
+          : response;
+
       const store = cacheable ? await cache() : undefined;
       const key = new Request(target.toString());
 
       if (store) {
         const hit = await store.match(key);
-        if (hit) return hit;
+        if (hit) return declare(hit);
       }
 
       let upstream: Response;
@@ -197,8 +216,10 @@ export function createDebianSnapshot(opts: DebianSnapshotOptions = {}): Mirror {
       }
 
       // A `302` that survived `follow` (upstream refused to follow) means the
-      // path leads somewhere this mirror does not serve.
-      if (upstream.status >= 300 && upstream.status < 400) {
+      // path leads somewhere this mirror does not serve. `304` is not a
+      // redirect: it confirms stored bytes and must reach the client with its
+      // relay declaration intact.
+      if (upstream.status >= 300 && upstream.status < 400 && upstream.status !== 304) {
         return new Response("Not Found", { status: 404 });
       }
 
@@ -228,7 +249,7 @@ export function createDebianSnapshot(opts: DebianSnapshotOptions = {}): Mirror {
         waitUntil(write);
       }
 
-      return final;
+      return declare(final);
     },
   };
 }

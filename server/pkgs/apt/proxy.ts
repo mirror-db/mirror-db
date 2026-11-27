@@ -15,7 +15,11 @@
  */
 
 import { cachedfetch, ezfetch, sanitizeResponse } from "@server/pkgs/fetch";
-import { mergeRelayDirectives, RELAY_CONTROL_HEADER } from "@server/relay-control";
+import {
+  mergeRelayDirectives,
+  RELAY_CONTROL_HEADER,
+  type RelayDirective,
+} from "@server/relay-control";
 import {
   WebListProxy,
   defaultRender,
@@ -24,8 +28,8 @@ import {
 
 import type { AptRepo } from "./repo";
 
-/** Matches a content-addressed `by-hash/<algo>/<hash>` path; group 1 is the hash. */
-const BY_HASH = /\/by-hash\/(?:MD5Sum|SHA1|SHA256|SHA512)\/([0-9a-f]{32,128})$/i;
+/** Matches a content-addressed `by-hash/<algo>/<hash>` path; group 1 is the algorithm, group 2 the hash. */
+const BY_HASH = /\/by-hash\/(MD5Sum|SHA1|SHA256|SHA512)\/([0-9a-f]{32,128})$/i;
 
 /**
  * `dists/<suite>/InRelease|Release|Release.gpg` — the three signed names of one
@@ -45,6 +49,29 @@ const IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable";
 const RELAY_NO_STORE = "no-store";
 /** Asks the relay to refresh this resource while it sees demand for it. */
 const RELAY_PREFETCH = "prefetch";
+
+/**
+ * Relay directives a verified `by-hash` object declares about itself: the path
+ * names its bytes, so `immutable` holds, and a `SHA256`/`SHA1` directory adds
+ * the digest the relay may turn into an Adopt expectation. `MD5Sum`/`SHA512`
+ * declare immutability alone — the relay addresses neither.
+ *
+ * This is a **path** fact verified against the release index, never derived from
+ * a response header, and it is what lets the relay's immutable active cache
+ * serve these objects locally.
+ */
+function byHashRelayDirectives(
+  algorithm: string,
+  hash: string,
+): RelayDirective[] {
+  const directives: RelayDirective[] = ["immutable"];
+  if (algorithm === "SHA256" && hash.length === 64) directives.push(`sha256=${hash}`);
+  else if (algorithm === "SHA1" && hash.length === 40) directives.push(`sha1=${hash}`);
+  return directives;
+}
+
+/** Statuses that can describe a content-addressed object. */
+const DECLARABLE_STATUSES = new Set([200, 206, 304]);
 
 /** `dists/<suite>/InRelease` or `dists/<suite>/Release` — the signed index. */
 const RELEASE_PATH_RE = /^dists\/[^/]+\/(?:InRelease|Release)$/;
@@ -111,7 +138,9 @@ async function aptFetchHook(
   // Directories are handled by WebListProxy's readdir → render / JSON / WebDAV.
   if (rel === "" || rel.endsWith("/")) return null;
 
-  const hash = rel.match(BY_HASH)?.[1]?.toLowerCase() ?? null;
+  const byHash = rel.match(BY_HASH);
+  const hash = byHash?.[2]?.toLowerCase() ?? null;
+  const hashAlgorithm = byHash?.[1]?.toUpperCase() ?? null;
 
   // Whose facts govern existence: a snapshot mirror's current generation, or
   // the mirror's own resolved index. Nothing authoritative → unjudged passthrough.
@@ -176,8 +205,20 @@ async function aptFetchHook(
   // `dists/` files are never ranged either.
   const isHead = request.method.toUpperCase() === "HEAD";
   const range = isHead || hash === null ? null : request.headers.get("range");
-  let init: RequestInit | undefined = isHead ? { method: "HEAD" } : undefined;
-  if (range !== null) init = { headers: { range } };
+  // A by-hash name pins one byte sequence, and the relay's immutable active
+  // cache only admits an identity coding, so a content-addressed fetch asks for
+  // one — for a HEAD as well as a GET. `cachedfetch` keeps bypassing its own
+  // read-through cache for a Range request, so a 206 can never be stored under
+  // the full-URL key.
+  const upstreamHeaders: Record<string, string> = {};
+  if (hash !== null) upstreamHeaders["accept-encoding"] = "identity";
+  if (range !== null) upstreamHeaders.range = range;
+  const hasUpstreamHeaders = Object.keys(upstreamHeaders).length > 0;
+  const init: RequestInit | undefined = isHead
+    ? { method: "HEAD", ...(hasUpstreamHeaders ? { headers: upstreamHeaders } : {}) }
+    : hasUpstreamHeaders
+      ? { headers: upstreamHeaders }
+      : undefined;
   const upstream = hash !== null
     ? await cachedfetch(repo.url(rel), init)
     : await ezfetch(repo.url(rel), init);
@@ -192,6 +233,20 @@ async function aptFetchHook(
   // tell it not to store a mutable dists index. by-hash objects are
   // content-addressed and pool payloads are not indexes, so neither gets this.
   const directives: string[] = [];
+  // A by-hash object the generation proved exists is content-addressed: the
+  // relay may keep it and answer from local bytes. Only a *verified* hash
+  // qualifies — an unjudged pass-through (no index, or a snapshot generation
+  // that has not loaded yet) declares nothing, and mutable `dists/` indexes and
+  // `pool/` payloads are never called immutable.
+  if (
+    hash !== null &&
+    hashAlgorithm !== null &&
+    known !== null &&
+    known.hashes.has(hash) &&
+    DECLARABLE_STATUSES.has(sanitized.status)
+  ) {
+    directives.push(...byHashRelayDirectives(hashAlgorithm, hash));
+  }
   if (hash === null && rel.startsWith("dists/")) directives.push(RELAY_NO_STORE);
   // Release/InRelease is the entry point a relay can refresh by itself; the
   // Worker's own metadata snapshot is rebuilt from it.

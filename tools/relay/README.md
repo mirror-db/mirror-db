@@ -314,6 +314,7 @@ Config (env names in parentheses):
 | `cache.s3.endpoint` (`S3_ENDPOINT`) | RustFS endpoint; required with a bucket |
 | `cache.s3.prefix` (`S3_PREFIX`) | key prefix inside the bucket |
 | `cache.s3.region` (`S3_REGION`) | default `us-east-1` |
+| `cache.log_immutable_miss` (`CACHE_LOG_IMMUTABLE_MISS`) | opt-in diagnostic: log resolved requests whose policy missed `immutable` but whose path looks digest-shaped; default `false` |
 
 Byte sizes accept binary units (`256MiB`, `128GiB`, plain bytes). Credentials
 come from the standard AWS environment variables / SDK credential chain; nothing
@@ -416,6 +417,12 @@ runs first for every request.
   [Immutable active cache](#immutable-active-cache)). A stale variant on such a
   path, or an OCI digest address, can also be served locally without
   revalidation. Nothing else changes for a non-immutable request.
+- **Response-declared immutability** — a response may carry
+  `X-MDB-Relay: immutable` (with optional `sha256=` / `sha1=`) without any policy
+  rule. Its first MISS can still seed the active segment, so such a path gets the
+  same assembly instead of paying a plain MISS first (see
+  [Immutable active cache](#immutable-active-cache)). The key stays the request
+  URL; the digest is only an Adopt expectation.
 - **MISS** — the upstream body is streamed to the client while a tee writes
   `<CACHE_DIR>/.tmp` and computes SHA-1 + SHA-256; metadata is committed after a
   complete `200` GET whose bytes reached the client. Only a complete `200` GET
@@ -426,7 +433,17 @@ runs first for every request.
 - **Freshness** — `no-cache` stores but is immediately stale; otherwise a shared
   cache prefers `s-maxage`, then `max-age`, then `Expires`. `X-MDB-Relay:
   ttl=<seconds>` is a fallback only when none of those is present and defaults to
-  none; it never overrides upstream freshness.
+  none; it never overrides upstream freshness. A response that declares
+  `X-MDB-Relay: immutable` keeps its stored variant for a persistent lifetime
+  (365 days) instead: the directive says its bytes cannot change, so a short
+  upstream lifetime or none at all must not make it stale on the next request.
+  Only the stored record is rewritten (`no-transform` survives, `Expires` is
+  dropped); the first response still delivers the upstream `Cache-Control`, on
+  the active path and the ordinary tee alike. Persistence is variant metadata: a
+  later `304` — even one stating `max-age=0` and omitting the directive — keeps
+  the persistent lifetime, while a `304` that newly declares `no-store`/`private`
+  still invalidates the entry. `no-store`/`private` never become storable, and a
+  client `no-cache` still revalidates.
 - **Not stored** — `X-MDB-Relay: no-store`, `Cache-Control: no-store` or
   `private`, any non-`200`, a `Vary: *` unless `no-vary` was declared, a
   `206`/`Content-Range`, or a `Content-Encoding` the relay cannot decode.
@@ -440,7 +457,9 @@ segment (ADR 0016), built on `go-tiered-cache`:
 - **Eligibility** — active manager present, merged policy matched `immutable`, no
   client-forced revalidation, client accepts `identity`, method `GET`. A `HEAD`
   may reuse a body already addressable by digest but never creates an entry, and
-  a request carrying its own `If-*` validators is answered by upstream.
+  a request carrying its own `If-*` validators is answered by upstream. A
+  response-declared `immutable` seeds the same way on a MISS; see
+  [Response-declared immutability](#response-declared-immutability).
 - **One assembly per key** — the key is `sha256:<hex>` / `sha1:<hex>` when the
   pattern captured a digest (so different mounts and URLs share it), otherwise
   the URL. The first requester fetches; later ones wait and, if it fails, take the
@@ -464,6 +483,72 @@ segment (ADR 0016), built on `go-tiered-cache`:
   `active_max_entries` or `active_capacity` disables the active segment while
   the passive store keeps running.
 
+#### Response-declared immutability
+
+An upstream that knows its response is content-addressed can say so without a
+manifest change: `X-MDB-Relay: immutable, sha256=<64 hex>`. The first MISS then
+seeds the same assembly, before the response is written to the client.
+
+- **Admission** — `GET`; a `200` without `Content-Range` or a `206` with a
+  concrete total size whose `Content-Length` matches the interval; concrete size
+  in `(0, cache.max_size]`; `identity` coding; no `Vary` beyond `Accept-Encoding`;
+  not `no-store`/`private`; the request writable, not client-forced-revalidated,
+  without `If-*`, not a multipart `Range`, no bypassed stale variant, no
+  ambiguity cleanup, and `identity` acceptable to the client. A `Range` answered
+  with a full `200` takes the ordinary writable path. A merged policy that
+  already matched `immutable` wins and is never re-decided by a response.
+- **Key** — the ordinary URL cache key. The declared digest is never a key; it is
+  passed to `Adopt` as an expectation, and a mismatch publishes nothing and
+  writes no variant while the client still receives its body. SHA-256 is used
+  when both digests are declared; a `206` digest is not an expectation.
+- **Persistence** — the committed variant is marked persistent and stores the
+  365-day lifetime, while the first response keeps the upstream `Cache-Control`.
+  A later `304` keeps the persistent lifetime even when it states `max-age=0` and
+  omits the directive; a `304` that newly declares `no-store`/`private` still
+  drops the entry. Prefetch schedules the same response at the persistent
+  lifetime instead of its stated `max-age=0`, and `no-store` still disables
+  background writes.
+- **Failure** — capacity, the disk watermark, an unknown size, an
+  over-budget body, an unusable coding or `Vary`, a `206` whose length disagrees
+  with its `Content-Range`, or another refusal before the adapter takes the body
+  delivers that same response through the ordinary chain: one upstream request,
+  no recursion. The length check must run before the adapter, because constructing
+  it closes a body it rejects. A request that finds an assembly already running
+  for the URL delivers its own response ordinarily instead of joining it.
+- **No coalescing before headers** — the fact arrives with the response, so two
+  concurrent cold requests may both fetch once. A `206` seed publishes only when
+  its range covers the whole object; a partial seed serves its own reader and a
+  later full request is stored ordinarily.
+
+### Immutable-miss diagnostic
+
+`CACHE_LOG_IMMUTABLE_MISS=true` (default off, restart to change) logs a request
+that resolved to a mirror, whose merged policy did **not** match `immutable`, and
+whose mount-relative path contains a digest-shaped run. It finds missing policy
+rules; it is not a cache or fallback log.
+
+The default line names the mirror, method, mount-relative path and the extracted
+`sha1:`/`sha256:` candidates. The query string, headers and client address are
+never logged; nothing is sampled or deduplicated, and while the switch is off no
+path is scanned. `passthrough` requests are covered; control endpoints never
+reach the proxy handler and an unresolved mirror is silent.
+
+The expression is used exactly as configured, so it has documented blind spots:
+
+```
+[^0-9a-zA-Z][0-9a-fA-F]{40}([0-9a-fA-F]{24})?[^0-9a-zA-Z]
+```
+
+- a digest at the very start or end of the path is not reported (no surrounding
+  non-alphanumeric character);
+- a 41..63 character hex run fits neither 40 nor 64, and a run longer than 64
+  characters yields no candidate: the expression must start on a non-alphanumeric
+  character, so it cannot begin inside the run;
+- an escaped delimiter (`%2F`) ends in a hexadecimal letter, so it hides the
+  following run;
+- two digests sharing one delimiter produce one non-overlapping match, so only
+  the first is reported.
+
 ### `X-MDB-Relay`
 
 A response-control header the upstream sends to the relay, shaped like
@@ -475,6 +560,15 @@ A response-control header the upstream sends to the relay, shaped like
 | `no-vary` | the URL path alone identifies the resource; `Vary` does not split variants, `Vary: *` included |
 | `prefetch` | the resource is eligible for background refresh while the relay keeps seeing demand for it; storage and delivery of this response are unchanged |
 | `ttl=<seconds>` | fallback lifetime when the response states none; `0` means none |
+| `immutable` | this response's bytes cannot change: its first MISS may assemble it, and its stored variant is persistent |
+| `sha256=<64 hex>` / `sha1=<40 hex>` | the response body's digest, used only as an `Adopt` expectation — never a cache key, and never a reason to treat the response as immutable |
+
+A digest is accepted only at its exact hex length and is normalised to lowercase;
+anything else is ignored as if absent. Two different valid values for the same
+algorithm cancel that algorithm (the body cannot be named honestly under either);
+a repeat of the same value is harmless. When both survive, SHA-256 is the
+expectation and SHA-1 is unused. `immutable` is a separate keyword: `sha256=…`
+alone leaves the response on the ordinary path.
 
 The relay reads it and removes it before delivery, except on a `passthrough`
 response. Unknown keywords are ignored; `no-transform` is honoured from the
@@ -549,7 +643,10 @@ and waits for real traffic.
   sends a conditional `GET` (`If-None-Match` / `If-Modified-Since`). `304`
   folds new freshness and headers into metadata, `200` replaces the stored
   variant, `404`/`410` deletes it. A resource that states no freshness is not
-  refreshed automatically — a live request still revalidates it.
+  refreshed automatically — a live request still revalidates it. A response that
+  declared `X-MDB-Relay: immutable` is scheduled at its persistent lifetime, so a
+  stated `max-age=0` neither disables the refresh nor turns it into a short
+  cycle; `no-store` still disables background writes.
 - **`no-store` wins.** A prefetch lease never makes a `no-store` response
   storable; the conflict is logged once per state change.
 - **APT is one index task per mirror.** Every `Release`/`InRelease` on an

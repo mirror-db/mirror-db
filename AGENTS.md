@@ -138,8 +138,14 @@ a 404) — `cuda` is `…/compute/cuda/repos/` and only that path lists,
 `X-MDB-Relay` is the response-side control header, Cache-Control-shaped:
 comma-separated `keyword` or `keyword=value`. The Worker parses/merges it, and
 the relay consumes it (see the Relay server section below).
-Keywords: `no-store`, `no-vary`, `prefetch`, `ttl=<seconds>`; unknown keywords
-are ignored.
+Keywords: `no-store`, `no-vary`, `prefetch`, `ttl=<seconds>`, `immutable`,
+`sha256=<64 hex>`, `sha1=<40 hex>`; unknown keywords are ignored.
+
+- **Response-declared immutability.** `immutable` states that this response's
+  bytes cannot change; `sha256`/`sha1` name its body digest. A digest never
+  implies `immutable`, is only an Adopt expectation (never a cache key), and is
+  accepted only at its exact hex length; two valid values for one algorithm
+  cancel it. See [ADR 0017](docs/adr/0017-response-declared-immutability.md).
 
 - **Injection is per mirror.** `serveMirror` merges `mirror.relayDirectives`
   into whatever the upstream already sent; an existing directive always wins and
@@ -152,6 +158,30 @@ are ignored.
   keep ordinary `Vary` handling. The APT proxy also adds `no-store` to mutable
   `dists/` indexes (excluding `by-hash/`), so independently cached Release and
   Packages generations cannot cause a hash/size mismatch.
+- **Content-addressed paths declare themselves.** Only a request path can
+  establish immutability; a response header (`ETag`,
+  `Docker-Content-Digest`, `Content-Digest`, `Cache-Control`) never can. Three
+  mirrors act on that fact, and only on a `200`, `206` or `304`:
+  - the OCI proxy adds `immutable` to a `blobs/`/`manifests/` path that carries
+    a digest, plus `sha256=`/`sha1=` when the path names that algorithm at its
+    full (64/40 hex) length; another algorithm declares `immutable` alone, and a
+    tag manifest declares nothing even when the response carries a digest;
+  - the APT proxy adds the same pair, but only for a `by-hash/SHA256|SHA1/<hex>`
+    path whose hash the resolved index or snapshot generation verified
+    (`MD5Sum`/`SHA512` declare `immutable` alone). Mutable `dists/` indexes and
+    `pool/` payloads never qualify, and an unjudged pass-through (no index yet)
+    declares nothing. By-hash upstream requests send
+    `Accept-Encoding: identity` for `GET` and `HEAD`, so the relay's active cache
+    can admit them; a Range request keeps bypassing the Worker's read-through
+    cache;
+  - `debian-snapshot` adds `immutable` to a pinned
+    `archive/<known>/<timestamp ≤ now>/…` object. A future timestamp (newest,
+    still moving), `mr/` and a `404` declare nothing, and no digest is derived
+    from a redirect.
+
+  The directive is added to the delivered response, never to the Worker's own
+  cached copy, and is merged through `mergeRelayDirectives`, so an existing
+  `no-store`/`prefetch`/`ttl` is kept.
 - **`prefetch` is opt-in per response.** The five snapshot APT mounts add it to
   `Release`/`InRelease` only (status `200` or `304`), and PyPI adds it to the
   `/pypi/simple/` root index only (status `200` or `304`). A `Packages` index,
@@ -275,6 +305,13 @@ cached.
 - The stored copy also drops `vary` via `STRIP_STORED_HEADERS`: a digest-addressed
   blob must not vary, and the Cache API refuses to store a `Vary` response. Only
   the cached copy is affected; the client still receives upstream's `Vary`.
+- **Relay declaration from the path.** A digest-addressed path adds
+  `X-MDB-Relay: immutable` — plus `sha256=`/`sha1=` when the path names that
+  algorithm at full length — to the delivered `200`/`206`/`304`, never to the
+  Worker's stored copy. This is also the only delivery path that carries no
+  cache: an object over `maxCacheBytes` and a cache hit both still declare. A tag
+  manifest declares nothing even when the response carries a
+  `Docker-Content-Digest` (see the relay-directive section).
 - **Size guard** `maxCacheBytes` (default 512MB = CF Free/Pro per-object limit).
   Skip when `Content-Length` unknown or over limit (avoids mid-stream
   `cache.put` reject). Override on Business/Enterprise.
@@ -503,12 +540,18 @@ Upstream shape, and what the mirror does with it:
 
 Policy:
 
-| path | cached | advertised |
-|------|--------|------------|
-| `archive/<known>/<timestamp ≤ now>/…` (GET, no Range) | yes, keyed by the request URL | `immutable, max-age=31536000` |
-| the same with a future timestamp | no | `max-age=600` |
-| `mr/…` | no | `max-age=600` |
-| `Range` requests | no (206 would poison the key) | upstream |
+| path | cached | advertised | relay |
+|------|--------|------------|-------|
+| `archive/<known>/<timestamp ≤ now>/…` (GET, no Range) | yes, keyed by the request URL | `immutable, max-age=31536000` | `immutable` |
+| the same with a future timestamp | no | `max-age=600` | — |
+| `mr/…` | no | `max-age=600` | — |
+| `Range` requests | no (206 would poison the key) | upstream | `immutable` on a pinned path |
+
+Every delivered `200`/`206`/`304` for a pinned object also carries
+`X-MDB-Relay: immutable` (never the stored copy), so the relay may keep it
+without a revalidation; the `206` leaves the active-cache decision to the relay.
+The declaration is a path fact only: no digest is derived from the `302` or from
+a response header, and the Worker's own cache is neither cleared nor bypassed.
 
 Everything else — the calendar, `/package/`, `/binary/` — is **404**: those are
 browsing UI for the upstream site, and proxying them would turn this into a
@@ -680,6 +723,11 @@ reaching upstreams directly. Mounted in [server/index.ts](server/index.ts) via
   merged (no singleflight), so a cold popular mutable object is fetched once per
   concurrent request. An immutable `GET` does coalesce: concurrent readers of one
   digest or URL share one assembly in the active segment (ADR 0016).
+- Response-declared immutability can only act after the headers arrive: a
+  request that finds an assembly already running for the URL is delivered
+  ordinarily rather than joined, a partial `206` seed caches only its range and
+  publishes nothing, and the entry is URL-keyed so it never deduplicates the same
+  bytes across two URLs (ADR 0017).
 - The active segment is **per process and per relay**. Its key map and fragments
   are memory/`CACHE_DIR` state, so a restart deletes incomplete assemblies and two
   relays never share one. A published body's local bytes also stay reserved in the
@@ -816,7 +864,10 @@ Cache keys have their own env names, unlike the dotted-key default:
 `CACHE_DIR`, `CACHE_CAPACITY`, `CACHE_MAX_SIZE`, `CACHE_DISK_WATER_MARK`,
 `CACHE_ACTIVE_CAPACITY`, `CACHE_ACTIVE_MAX_ENTRIES`,
 `CACHE_ACTIVE_IDLE_TIMEOUT`, `S3_BUCKET`, `S3_ENDPOINT`, `S3_PREFIX`,
-`S3_REGION`. `CACHE_DIR` enables **both** the content store and request caching:
+`S3_REGION`. `CACHE_LOG_IMMUTABLE_MISS` (`cache.log_immutable_miss`, default
+`false`) is the opt-in diagnostic described under the relay request cache; it is
+read at startup, so it needs a restart, and no path is scanned while it is off.
+`CACHE_DIR` enables **both** the content store and request caching:
 empty means no store and every request goes upstream; non-empty means an
 already-resolved mirror `GET`/`HEAD` tries the cache by default (ADR 0011). There
 is no separate cache switch and no manifest field for it. The active segment
@@ -1099,7 +1150,10 @@ Decision order (`serveCache`):
 5. MISS streams the upstream response into `<CACHE_DIR>/.tmp` via an
    `io.Pipe` while writing the client, computes SHA-1 and SHA-256, and commits
    metadata under a timeout independent of the client connection. Only a
-   complete `200` GET whose body reached the client becomes an entry.
+   complete `200` GET whose body reached the client becomes an entry. A MISS
+   whose response carries `X-MDB-Relay: immutable` may instead seed the active
+   segment before the client is written (see the response-declared seed below);
+   every refusal delivers that same response through this ordinary tee.
 
 **Content-addressed digests ignore stale metadata.** Before rule 4, a request
 whose path addresses an OCI object by digest (`…/blobs/sha256:<64 hex>` or
@@ -1124,6 +1178,27 @@ this path diverges from the ordinary chain; a request that does not match
   A `HEAD` may reuse a digest-addressed body but never creates an entry. A
   request with its own `If-*` validators never seeds, because the upstream's
   answer, not a shared body, decides it.
+- **Response-declared seed.** A response that carries `X-MDB-Relay: immutable`
+  may seed the same path on its first MISS, before the client is written:
+  `deliverUpstream` calls `responseImmutableEligible` and then
+  `serveResponseImmutableActive`. Admission requires `GET`, a `200`/`206` with a
+  concrete size in `(0, CACHE_MAX_SIZE]`, an `identity` coding, no dangerous
+  `Vary`, no `no-store`/`private`, a writable request that is neither
+  client-forced-revalidated nor conditional, no multipart `Range`, no bypassed
+  old variant, no ambiguity cleanup, client-accepted `identity`, a `206` whose
+  `Content-Length` matches its `Content-Range` (the adapter closes the body when
+  it rejects that mismatch, so the check must precede the handoff), and a merged
+  policy that did **not** match `immutable`. The key is the ordinary URL cache
+  key; a response digest is only an `Adopt` expectation via
+  `activecache.Entry.SetExpectation`, never a key. A policy digest wins. The
+  committed variant stores the persistent header set and `Persistent: true`
+  while the client response keeps the upstream `Cache-Control`. Every
+  refusal before the adapter takes the body delivers that same response through
+  the ordinary chain (no second upstream request, and fallback delivery passes
+  `responseActive=false`, so it cannot recurse); a request that finds an entry
+  already assembling the URL delivers its own response ordinarily instead of
+  joining it, so a partial `206` seed publishes only when its range covers the
+  whole object.
 - **Key and coalescing.** `activecache.Manager` maps `sha256:<hex>` /
   `sha1:<hex>` (captured digest) or the URL key to one entry. OCI manifests are
   always URL-keyed: their media type and headers belong to the repository, so
@@ -1170,7 +1245,10 @@ this path diverges from the ordinary chain; a request that does not match
 - **Variant.** After a delivery that completed the object the handler waits
   (bounded at 60 s) for `Adopt` and writes the ordinary URL variant, so a later
   request without a digest capture is still local. Nothing is written when
-  publication failed or the size disagrees.
+  publication failed or the size disagrees. The committed variant uses the
+  stored header set, not the delivered one: a response that declared
+  `immutable` persists the 365-day lifetime and is marked `Persistent`, while the
+  first client already received the upstream `Cache-Control`.
 - **Limits.** `CACHE_ACTIVE_MAX_ENTRIES`, `CACHE_ACTIVE_CAPACITY` (known sizes
   reserved at `Init`, one unknown-size entry admitted alone) and
   `CACHE_ACTIVE_IDLE_TIMEOUT` (reaper on `StalledTime`) refuse new entries; an
@@ -1183,7 +1261,22 @@ this path diverges from the ordinary chain; a request that does not match
 Freshness (`freshnessExpiry`): `no-cache` stores but is immediately stale;
 otherwise shared-cache preference `s-maxage` → `max-age` → `Expires` → the
 `X-MDB-Relay: ttl` fallback (absent by default, `0` is not "forever"). `ttl`
-never overrides upstream freshness.
+never overrides upstream freshness. A response that declares
+`X-MDB-Relay: immutable` is the exception: its **stored** header set is rewritten
+to `max-age=31536000` (`responseVariantHeaders` →
+`withPersistentLifetime`, orthogonal directives such as `no-transform` kept,
+`Expires` dropped) and the variant carries `Persistent: true`, so it does not
+come back stale on the next request even when the active segment was unavailable.
+The delivered header set is untouched: the first client sees the upstream
+`Cache-Control`, on the active and ordinary paths alike. Persistence is variant
+metadata: a `304` keeps the 365-day lifetime even when it states `max-age=0` and
+omits the directive, while a `304` that newly declares `no-store`/`private`
+still invalidates the entry; non-persistent variants keep the old `304` rule.
+`Persistent` is a spare bit in the existing variant flag byte, so pre-existing
+bbolt records decode with it clear. Prefetch uses `prefetchExpiry`, the same
+persistent lifetime, to schedule such a response; storage prohibitions are
+unchanged. This is a response-declared fact, never derived from
+`Cache-Control: immutable`.
 
 Store rules (`storable` / `storableMetadata`): refused by `X-MDB-Relay:
 no-store`, `Cache-Control: no-store` or `private`, non-`200`, `Vary: *` unless
@@ -1193,11 +1286,13 @@ A stale HEAD is revalidated like GET: `304` updates metadata, `200`/`404`/`410`
 invalidates the variant, other statuses write nothing.
 
 `X-MDB-Relay` keywords consumed: `no-store`, `no-vary`, `prefetch`,
-`ttl=<seconds>`. `prefetch` only feeds the lease table below; it never changes
-how the current response is stored, transcoded or delivered. The header is
-stripped before delivery on the cache and normal proxy paths; a `passthrough`
-response is delivered with it intact. `no-transform` is honoured from standard
-`Cache-Control`.
+`ttl=<seconds>`, `immutable`, `sha256=<64 hex>`, `sha1=<40 hex>`. `prefetch` only
+feeds the lease table below; it never changes how the current response is stored,
+transcoded or delivered. `immutable` plus its optional digest is the only
+response-side way to enter the active segment (ADR 0017); the digest is an Adopt
+expectation and never a cache key. The header is stripped before delivery on the
+cache and normal proxy paths; a `passthrough` response is delivered with it
+intact. `no-transform` is honoured from standard `Cache-Control`.
 
 Encoding: stored codings are `identity`, `gzip`, `deflate`, `br`, `zstd`;
 negotiation follows full `Accept-Encoding` qvalues/`*`/`identity` with
@@ -1341,13 +1436,17 @@ content is still fetchable upstream.
   `cache_headers.go` — stored-header selection, freshness, conditional
   evaluation, request cache directives. `cache_range.go` — single/multipart
   ranges and `416`. `cache_active.go` — the immutable active path: eligibility,
-  seeding (fetch/first range/metadata), delivery from the shared fragment, the
-  bounded wait for publication and the URL-variant commit, plus digest-hit and
-  immutable stale-hit delivery.
+  seeding (fetch/first range/metadata), the response-declared first-MISS seed
+  (eligibility, URL-keyed `SetExpectation`, no-recursion fallback), delivery from
+  the shared fragment, the bounded wait for publication and the URL-variant
+  commit, plus digest-hit and immutable stale-hit delivery.
+  `immutable_miss.go` — the `CACHE_LOG_IMMUTABLE_MISS` diagnostic: the operator's
+  unmodified expression, candidate extraction and the switch-first log gate.
 - `tools/relay/activecache/` — the in-process segment behind that path:
   `manager.go` (key map, acquire/init/fail, entry and byte accounting, idle
   reaper, close/retire), `entry.go` (one assembly, metadata, readers, publish
-  settlement), `store.go` (scratch file cache and the `tiered.Store` +
+  settlement, `SetExpectation` for a URL-keyed entry with a response-declared
+  digest), `store.go` (scratch file cache and the `tiered.Store` +
   `CacheHandoff` that publishes through `hashstore.Adopt`).
 - `tools/relay/diskspace/` — `Checker` for one directory: watermark probe,
   throttled mid-write recheck, `ErrLowDiskSpace`; platform probe in
@@ -1387,7 +1486,8 @@ content is still fetchable upstream.
   `index.go` + `index_variant.go` (bbolt:
   sizes, aliases, LRU order, pending deletes, variant rows and their reverse
   body references, the global variant counter), `variant.go` (variant identity,
-  header normalisation, per-URL/global/row limits), `backend.go` (local bodies
+  header normalisation, per-URL/global/row limits, and the `Persistent` flag bit
+  that survives a 304), `backend.go` (local bodies
   and offsets), `s3.go` (RustFS bodies + digest pointers), `prune.go` (dangling
   variant repair).
 - `tools/relay/certclient/` — read-only `certmagic.Storage` that snapshots the
@@ -1447,7 +1547,30 @@ and mid-write, reads/deletes still working, disabled by default), and the HTTP
 path (cold and cached immutable GET, digest and immutable stale hits, response
 prohibitions, passthrough staying on the proxy, HEAD never creating an entry,
 forced revalidation reaching upstream, unknown size / over-budget fallbacks, and
-`Close` stopping the active manager before the store). Shared-storage unit cases
+`Close` stopping the active manager before the store). The response-declared
+round adds directive parsing (`immutable`, `sha256`/`sha1` exact-length, lowercase,
+same-algorithm conflict cancels, digest does not imply immutable, sha256 wins),
+`activecache.SetExpectation` (URL key kept, late/invalid/conflicting values
+refused, only SHA-1/SHA-256 algorithms, digest-keyed entries never overridden),
+and the first-MISS seed: a `200` seed and a whole-object `206` seed, a partial
+`206` seed that publishes nothing, sha1/sha256 expectation match and mismatch
+(body delivered, nothing published, no variant), policy digest precedence, and
+the refusal matrix (`no-store`, `private`, gzip, dangerous `Vary`, unknown
+length, a `Range` answered `200`, `HEAD`, conditional request, client
+`no-store`/`no-cache`, a stale variant, ambiguity cleanup, a `206` whose
+`Content-Length` disagrees with its `Content-Range` staying on the ordinary
+path, capacity fallback delivering the same response from one upstream request,
+and a digest without `immutable` staying ordinary). It also pins delivery versus
+storage headers (the first response keeps the upstream `Cache-Control` on both
+the active and the ordinary path), the persistent stored lifetime (a year,
+orthogonal directives kept, `Expires` dropped), its survival across a forced
+revalidation answered by a `304` with `max-age=0`, prefetch scheduling at that
+lifetime (and `no-store` still disabling it), the two-concurrent-miss contract
+(both fetch, neither joins, one variant), and the `CACHE_LOG_IMMUTABLE_MISS`
+switch (default off, policy miss versus hit, passthrough, no query in the line,
+unresolved mirror silent) plus the candidate scanner's documented boundaries
+(path start/end, 41..63 and runs longer than 64, escaped delimiters, shared
+delimiter, non-ASCII delimiter). Shared-storage unit cases
 use a fake object store; the separate manual Docker RustFS 1.0.6 check is not part
 of CI. CI runs vet + test before building.
 
@@ -1461,7 +1584,16 @@ tests, snapshot build (index choice, by-hash verification, content dedupe,
 atomic rejection, releases and transient-vs-absent), the five snapshot mounts
 end to end (HTML/JSON/WebDAV, redirects, index ETag/304/502, `prefetch`
 injection), HEAD-method forwarding through the real fetch helpers, PyPI
-conditional passthrough, and HTML/JSON escaping of hostile listing names.
+conditional passthrough, and HTML/JSON escaping of hostile listing names. The
+path-declared directive round adds: OCI digest `200`/`206`/`304` carrying
+`immutable` plus the path `sha256`/`sha1`, `immutable` alone for another
+algorithm, nothing for a tag manifest even with a `Docker-Content-Digest`, and a
+clean Worker cache copy; APT SHA256/SHA1 by-hash declarations (nothing for
+`MD5Sum`/`SHA512` beyond `immutable`, nothing for `dists`/`pool`/an unverified
+hash), `Accept-Encoding: identity` on by-hash `GET` and `HEAD`, and directive
+merging that keeps an existing `no-store`; and `debian-snapshot` pinned
+`200`/`206`/`304` declaring `immutable` with future timestamps, `mr/` and `404`
+declaring nothing.
 
 A one-off manual check on 2026-11-23 built snapshots for all five real upstreams
 and confirmed the content ETag stays stable across rebuilds (`hashicorp`

@@ -69,7 +69,7 @@ func (s *Server) serveCache(w http.ResponseWriter, r *http.Request) bool {
 	if requestPolicy.noStore {
 		// The client asked that this exchange never touch the cache: no
 		// lookup, and no write even if the response would otherwise qualify.
-		s.serveMiss(w, r, key, path, nil, false, false)
+		s.serveMiss(w, r, key, path, nil, false, false, false)
 		return true
 	}
 
@@ -125,7 +125,7 @@ func (s *Server) serveCache(w http.ResponseWriter, r *http.Request) bool {
 				return true
 			}
 		}
-		s.serveMiss(w, r, key, path, nil, true, false)
+		s.serveMiss(w, r, key, path, nil, true, false, true)
 		return true
 	case 1:
 		v := matches[0]
@@ -153,7 +153,7 @@ func (s *Server) serveCache(w http.ResponseWriter, r *http.Request) bool {
 		// full revalidation would lose the range semantics. A 304 from a
 		// client's own If-Range validator is still handled upstream.
 		if strings.TrimSpace(r.Header.Get("Range")) != "" {
-			s.serveMiss(w, r, key, path, &v, true, false)
+			s.serveMiss(w, r, key, path, &v, true, false, true)
 			return true
 		}
 		s.serveRevalidation(w, r, key, path, v)
@@ -162,7 +162,7 @@ func (s *Server) serveCache(w http.ResponseWriter, r *http.Request) bool {
 		// Several records with different Vary sets all match. Picking one would
 		// invent an identity the upstream never stated, so re-fetch instead.
 		log.Printf("relay cache: %q is ambiguous (%d matching variants), re-fetching", key, len(matches))
-		s.serveMiss(w, r, key, path, nil, true, true)
+		s.serveMiss(w, r, key, path, nil, true, true, true)
 		return true
 	}
 }
@@ -398,7 +398,7 @@ func (s *Server) ensureBody(w http.ResponseWriter, r *http.Request, key, path st
 // gone. It drops the stale metadata and answers the request as a fresh miss.
 func (s *Server) repairMissingVariant(w http.ResponseWriter, r *http.Request, key, path string, v hashstore.Variant) {
 	s.dropVariant(v)
-	s.serveMiss(w, r, key, path, nil, true, false)
+	s.serveMiss(w, r, key, path, nil, true, false, true)
 }
 
 func (s *Server) serveTranscoded(w http.ResponseWriter, r *http.Request, v hashstore.Variant, from, to ContentCoding) bool {
@@ -467,6 +467,9 @@ func (s *Server) serveRevalidation(w http.ResponseWriter, r *http.Request, key, 
 		next := s.revalidatedVariant(v, resp)
 		directives := RelayDirectivesFromHeader(resp.Header)
 		if storableMetadata(next.ResponseHeaders, directives, next.NoVary) {
+			if next.Persistent {
+				withPersistentLifetime(next.ResponseHeaders)
+			}
 			_ = s.commitVariant(r.Context(), next, nil)
 		} else {
 			// The 304 verified this body but also declared it must no longer be
@@ -488,7 +491,7 @@ func (s *Server) serveRevalidation(w http.ResponseWriter, r *http.Request, key, 
 		}
 	case http.StatusNotFound, http.StatusGone:
 		s.dropVariant(v)
-		s.deliverUpstream(w, r, resp, key, nil, true, false)
+		s.deliverUpstream(w, r, resp, key, nil, true, false, true)
 	case http.StatusOK:
 		// The upstream answered the revalidation with a full representation.
 		// The client's own conditions were removed from the conditional
@@ -502,9 +505,9 @@ func (s *Server) serveRevalidation(w http.ResponseWriter, r *http.Request, key, 
 			w.WriteHeader(http.StatusPreconditionFailed)
 			return
 		}
-		s.deliverUpstream(w, r, resp, key, &v, true, false)
+		s.deliverUpstream(w, r, resp, key, &v, true, false, true)
 	default:
-		s.deliverUpstream(w, r, resp, key, &v, true, false)
+		s.deliverUpstream(w, r, resp, key, &v, true, false, true)
 	}
 }
 
@@ -512,6 +515,12 @@ func (s *Server) serveRevalidation(w http.ResponseWriter, r *http.Request, key, 
 // Content-Encoding stay untouched: they describe the identity and the stored
 // bytes, neither of which a 304 can change. The destination is the same key, so
 // the variant's identity is preserved.
+//
+// A persistent variant (one whose response declared its own immutability) keeps
+// the persistent lifetime even when the 304 states a short one and does not
+// repeat the declaration: the bytes still cannot change. Callers rewrite the
+// stored headers with withPersistentLifetime after the store rules accept the
+// 304, so a 304 that newly declares no-store/private still invalidates it.
 func (s *Server) revalidatedVariant(v hashstore.Variant, resp *http.Response) hashstore.Variant {
 	folded := storageHeaders(resp.Header)
 	merged := v.ResponseHeaders.Clone()
@@ -525,7 +534,11 @@ func (s *Server) revalidatedVariant(v hashstore.Variant, resp *http.Response) ha
 	now := s.currentTime()
 	v.ResponseHeaders = merged
 	v.StoredAt = now
-	v.ExpiresAt = freshnessExpiry(merged, RelayDirectivesFromHeader(resp.Header), now)
+	if v.Persistent {
+		v.ExpiresAt = now.Add(persistentVariantLifetime)
+	} else {
+		v.ExpiresAt = freshnessExpiry(merged, RelayDirectivesFromHeader(resp.Header), now)
+	}
 	return v
 }
 
@@ -533,7 +546,9 @@ func (s *Server) revalidatedVariant(v hashstore.Variant, resp *http.Response) ha
 // a stale variant's ranged request bypassed revalidation: a full 200 then
 // replaces that variant, while a 206 leaves it alone. writable is false for a
 // request that must not populate the cache (client Cache-Control: no-store).
-func (s *Server) serveMiss(w http.ResponseWriter, r *http.Request, key, path string, old *hashstore.Variant, writable, cleanupAmbiguous bool) {
+// responseActive lets a response that declares X-MDB-Relay: immutable seed the
+// active segment.
+func (s *Server) serveMiss(w http.ResponseWriter, r *http.Request, key, path string, old *hashstore.Variant, writable, cleanupAmbiguous, responseActive bool) {
 	out, err := s.buildUpstreamRequest(r.Context(), r)
 	if err != nil {
 		log.Printf("relay cache: request %q: %v", key, err)
@@ -546,12 +561,12 @@ func (s *Server) serveMiss(w http.ResponseWriter, r *http.Request, key, path str
 		return
 	}
 	defer resp.Body.Close()
-	s.deliverUpstream(w, r, resp, key, old, writable, cleanupAmbiguous)
+	s.deliverUpstream(w, r, resp, key, old, writable, cleanupAmbiguous, responseActive)
 }
 
 // deliverUpstream decides whether an upstream response can enter the store and
 // either streams it with a tee or passes it through.
-func (s *Server) deliverUpstream(w http.ResponseWriter, r *http.Request, resp *http.Response, key string, old *hashstore.Variant, writable, cleanupAmbiguous bool) {
+func (s *Server) deliverUpstream(w http.ResponseWriter, r *http.Request, resp *http.Response, key string, old *hashstore.Variant, writable, cleanupAmbiguous, responseActive bool) {
 	directives := RelayDirectivesFromHeader(resp.Header)
 	s.notePrefetchResponse(r, resp.Header)
 
@@ -560,6 +575,15 @@ func (s *Server) deliverUpstream(w http.ResponseWriter, r *http.Request, resp *h
 	// that a Range MISS turned into a full-body transfer.
 	if r.Method == http.MethodGet && resp.StatusCode == http.StatusOK && strings.TrimSpace(r.Header.Get("Range")) != "" {
 		log.Printf("relay cache warning: %s %s ignored Range and returned a full 200", r.Method, r.URL.Path)
+	}
+
+	// A response may declare its own immutability. That fact arrives with the
+	// headers, so it can only seed the active segment on a MISS; every refusal
+	// leaves the response deliverable through the ordinary chain below.
+	if responseActive && s.responseImmutableEligible(r, resp, directives, old, writable, cleanupAmbiguous) {
+		if s.serveResponseImmutableActive(w, r, key, resp, directives) {
+			return
+		}
 	}
 
 	storable := writable && s.storable(resp, r, directives)
@@ -630,9 +654,9 @@ func storableMetadata(h http.Header, directives RelayDirectives, noVary bool) bo
 // client still receives the complete upstream response. A body whose declared
 // length already exceeds the store's per-object budget is not teed at all.
 func (s *Server) streamAndStore(w http.ResponseWriter, r *http.Request, resp *http.Response, key string, directives RelayDirectives, old *hashstore.Variant, cleanupAmbiguous bool) {
-	stored := storageHeaders(resp.Header)
+	stored, persistent := responseVariantHeaders(resp.Header, directives)
 	storedAt := s.currentTime()
-	expiresAt := freshnessExpiry(resp.Header, directives, storedAt)
+	expiresAt := freshnessExpiry(stored, directives, storedAt)
 
 	delivery := resp.Header.Clone()
 	stripHopByHop(delivery)
@@ -733,12 +757,28 @@ func (s *Server) streamAndStore(w http.ResponseWriter, r *http.Request, resp *ht
 	}
 
 	next := buildVariant(key, stored, directives, r.Header, storedAt, expiresAt, result.content)
+	next.Persistent = persistent
 	if err := s.commitVariant(r.Context(), next, old); err != nil {
 		return
 	}
 	if cleanupAmbiguous {
 		s.removeOtherVariants(key, next)
 	}
+}
+
+// responseVariantHeaders returns the header set a stored variant keeps. A
+// response that declared X-MDB-Relay: immutable carries the persistent lifetime
+// instead of whatever the upstream stated; its bytes cannot change. The
+// delivered header set is never rewritten: the first client sees the upstream
+// Cache-Control. Orthogonal directives such as no-transform survive, and a
+// declaration never makes a response storable (the store rules already ran).
+func responseVariantHeaders(h http.Header, directives RelayDirectives) (http.Header, bool) {
+	stored := storageHeaders(h)
+	if !directives.Immutable {
+		return stored, false
+	}
+	withPersistentLifetime(stored)
+	return stored, true
 }
 
 func buildVariant(key string, stored http.Header, directives RelayDirectives, requestHeaders http.Header, storedAt, expiresAt time.Time, content hashstore.Content) hashstore.Variant {

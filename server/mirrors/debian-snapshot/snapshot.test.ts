@@ -133,6 +133,41 @@ describe("debian-snapshot mirror", () => {
     expect(await res.text()).toBe("payload");
   });
 
+  it("declares immutable on a pinned snapshot object, and only on delivery", async () => {
+    const { get, cache } = harness(async () => ok("payload"));
+    const path = "archive/debian/20240101T000000Z/dists/bookworm/Release";
+
+    const res = await get(path);
+
+    expect(res.headers.get("x-mdb-relay")).toBe("immutable");
+    // The stored copy is a Worker-side object, not relay control.
+    const entry = [...cache.entries.values()][0]!;
+    expect(entry.headers.get("x-mdb-relay")).toBeNull();
+  });
+
+  it("declares immutable on a cached snapshot object too", async () => {
+    const { get } = harness(async () => ok("payload"));
+    const path = "archive/debian/20240101T000000Z/dists/bookworm/Release";
+
+    await get(path);
+    const second = await get(path);
+
+    expect(second.headers.get("x-mdb-relay")).toBe("immutable");
+  });
+
+  it("declares immutable on a 304 revalidation of a pinned object", async () => {
+    const { get } = harness(
+      async () => new Response(null, { status: 304, headers: { etag: '"release"' } }),
+    );
+
+    const res = await get(
+      "archive/debian/20240101T000000Z/dists/bookworm/Release",
+    );
+
+    expect(res.status).toBe(304);
+    expect(res.headers.get("x-mdb-relay")).toBe("immutable");
+  });
+
   it("does not cache a timestamp in the future", async () => {
     // The upstream resolves a future timestamp to the newest snapshot, which
     // keeps moving — caching it for a year would freeze that answer.
@@ -143,12 +178,15 @@ describe("debian-snapshot mirror", () => {
     expect(cache.puts).toBe(0);
     // Advertised with a short lifetime: the answer will differ tomorrow.
     expect(res.headers.get("cache-control")).toBe("public, max-age=600");
+    // And the relay must not keep it either: the path does not name fixed bytes.
+    expect(res.headers.get("x-mdb-relay")).toBeNull();
   });
 
-  it("never caches the mr API", async () => {
+  it("never caches or declares the mr API immutable", async () => {
     const { get, cache } = harness(async () => ok("{}", { "content-type": "application/json" }));
-    await get("mr/package/bash/");
+    const res = await get("mr/package/bash/");
     expect(cache.puts).toBe(0);
+    expect(res.headers.get("x-mdb-relay")).toBeNull();
   });
 
   it("forwards Range and keeps the partial response out of the cache", async () => {
@@ -168,13 +206,17 @@ describe("debian-snapshot mirror", () => {
     expect(res.status).toBe(206);
     expect(res.headers.get("content-range")).toBe("bytes 0-3/100");
     expect(cache.puts).toBe(0);
+    // A range of a pinned object is still the same object's bytes; the relay
+    // decides for itself whether a 206 may enter its active cache.
+    expect(res.headers.get("x-mdb-relay")).toBe("immutable");
   });
 
-  it("passes an upstream 404 through", async () => {
+  it("passes an upstream 404 through without declaring it immutable", async () => {
     const { get, cache } = harness(async () => new Response("nope", { status: 404 }));
     const res = await get("archive/debian/20150102T030303Z/dists/bookworm/InRelease");
     expect(res.status).toBe(404);
     expect(cache.puts).toBe(0);
+    expect(res.headers.get("x-mdb-relay")).toBeNull();
   });
 
   it("answers 404 for paths outside the mount's contract", async () => {

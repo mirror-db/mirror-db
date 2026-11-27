@@ -516,8 +516,21 @@ func (p *prefetchScheduler) NoteNormalResponse(m Mirror, cacheKey, relPath, clie
 	if !directives.Prefetch {
 		return
 	}
-	v := hashstore.Variant{NoVary: noVary, Vary: vary, RequestHeaders: matched, ExpiresAt: freshnessExpiry(respHeaders, directives, now)}
+	v := hashstore.Variant{NoVary: noVary, Vary: vary, RequestHeaders: matched, ExpiresAt: prefetchExpiry(respHeaders, directives, now)}
 	p.applyNormalSchedule(t, v, now, noStore)
+}
+
+// prefetchExpiry is the moment a response becomes eligible for background
+// refresh. A response that declared its own immutability keeps the persistent
+// lifetime even when the upstream stated a zero or short max-age: the bytes
+// cannot change, so that must neither disable refresh silently nor turn it into
+// a short cycle. It only chooses the schedule; a no-store response is still
+// refused by the caller's noStore argument.
+func prefetchExpiry(headers http.Header, directives RelayDirectives, now time.Time) time.Time {
+	if directives.Immutable {
+		return now.Add(persistentVariantLifetime)
+	}
+	return freshnessExpiry(headers, directives, now)
 }
 
 // NoteAPTResponse registers or renews the one index task for an apt-tagged
@@ -713,6 +726,9 @@ func (s *Server) runNormalPrefetch(ctx context.Context, task prefetchTask) prefe
 		next := s.revalidatedVariant(*old, resp)
 		directives := RelayDirectivesFromHeader(resp.Header)
 		if storableMetadata(next.ResponseHeaders, directives, next.NoVary) {
+			if next.Persistent {
+				withPersistentLifetime(next.ResponseHeaders)
+			}
 			if err := s.commitVariant(ctx, next, old); err != nil {
 				return prefetchOutcome{err: err}
 			}
@@ -737,9 +753,9 @@ func (s *Server) runNormalPrefetch(ctx context.Context, task prefetchTask) prefe
 			_, _ = io.Copy(io.Discard, resp.Body)
 			return prefetchOutcome{noNext: true}
 		}
-		stored := storageHeaders(resp.Header)
+		stored, persistent := responseVariantHeaders(resp.Header, directives)
 		storedAt := s.currentTime()
-		expiresAt := freshnessExpiry(resp.Header, directives, storedAt)
+		expiresAt := freshnessExpiry(stored, directives, storedAt)
 		putSize := resp.ContentLength
 		budget := s.hashStore.Stats().Capacity
 		if putSize > budget {
@@ -758,6 +774,7 @@ func (s *Server) runNormalPrefetch(ctx context.Context, task prefetchTask) prefe
 			return prefetchOutcome{err: err}
 		}
 		next := buildVariant(task.cacheKey, stored, directives, task.requestHeaders, storedAt, expiresAt, content)
+		next.Persistent = persistent
 		if err := s.commitVariant(ctx, next, old); err != nil {
 			return prefetchOutcome{err: err}
 		}

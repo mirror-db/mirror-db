@@ -120,7 +120,10 @@ The active path is entered from `serveCache` only when all of these hold: an
 active manager exists, the merged policy matched `immutable`, the client did not
 force revalidation (`no-cache` / `max-age=0`), the client accepts `identity`, and
 the method is `GET`. A `HEAD` may reuse a body already addressable by digest
-(`serveImmutableDigestHit`) but never creates an entry.
+(`serveImmutableDigestHit`) but never creates an entry. [ADR 0017](0017-response-declared-immutability.md)
+adds a second door with narrower admission: a response that carries
+`X-MDB-Relay: immutable` may seed the same assembly on its first MISS, keyed by
+its URL rather than by a declared digest.
 
 - **Full GET (zero matching variants):** the first response seeds the entry; the
   body streams from the tiered cache and publishes when complete.

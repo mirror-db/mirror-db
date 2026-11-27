@@ -77,6 +77,12 @@ type Server struct {
 	// now is the clock the cache chain uses for Age and freshness. Tests inject
 	// it; production leaves it nil and gets time.Now.
 	now func() time.Time
+
+	// logImmutableMiss enables the diagnostic that reports a resolved request
+	// whose merged policy did not declare immutability although its path carries
+	// a digest-shaped run. Off unless CACHE_LOG_IMMUTABLE_MISS is explicitly true;
+	// the path is not scanned while it is off.
+	logImmutableMiss bool
 }
 
 // mirrorsResponse matches the JSON shape from GET /api/mirrors.
@@ -137,6 +143,8 @@ func NewServer() (*Server, error) {
 		client:      httpClient,
 		edge:        edge,
 		baseDomains: config.AllDomainNames(),
+
+		logImmutableMiss: config.GetCacheLogImmutableMiss(),
 	}
 	if len(s.baseDomains) == 0 {
 		return nil, fmt.Errorf("no relay.base_domains configured")
@@ -260,6 +268,16 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 	// snapshot.
 	decision := s.matchPolicy(r)
 	r = r.WithContext(withPolicyDecision(r.Context(), decision))
+
+	// Diagnostic for a path that looks content-addressed while no policy says so:
+	// a missing rule, not a cache event. It runs before passthrough/cache so both
+	// paths are covered, and only for a request that resolved to a mirror. The
+	// switch is checked first so a disabled relay does no extra work.
+	if !decision.Immutable && s.logImmutableMiss {
+		if mirror, path, ok := s.resolveMirror(s.manifest.Load(), r); ok {
+			s.noteImmutableMiss(r, mirror, path)
+		}
+	}
 
 	// A request that did not come through a relay may not smuggle response
 	// control inward. This runs before the relay fills in X-MDB-Relay-Host, so

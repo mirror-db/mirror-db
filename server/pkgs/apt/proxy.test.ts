@@ -124,6 +124,20 @@ describe("createAptProxy — file enforcement", () => {
 
     expect(res.status).toBe(200);
     expect(cachedfetchMock).toHaveBeenCalledTimes(1);
+    // Content-addressed, but the relay addresses only sha1/sha256: immutability
+    // is declared without a digest.
+    expect(res.headers.get("x-mdb-relay")).toBe("immutable");
+  });
+
+  it("matches a known by-hash file (SHA1)", async () => {
+    const sha1 = "d".repeat(40);
+    const proxy = makeProxy({ ready: true, hashes: [sha1] });
+    const res = await proxy.fetch(
+      get(`dists/trixie/main/binary-amd64/by-hash/SHA1/${sha1}`),
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get("x-mdb-relay")).toBe(`immutable, sha1=${sha1}`);
   });
 
   it("404s an unknown dists file once ready", async () => {
@@ -154,7 +168,7 @@ describe("createAptProxy — file enforcement", () => {
 });
 
 describe("createAptProxy — cache-control", () => {
-  it("caches a known by-hash file as immutable without no-store", async () => {
+  it("caches a known by-hash file as immutable and declares the by-hash digest", async () => {
     const proxy = makeProxy({ ready: true, hashes: [HASH] });
     const res = await proxy.fetch(
       get(`dists/trixie/main/binary-amd64/by-hash/SHA256/${HASH}`),
@@ -163,7 +177,51 @@ describe("createAptProxy — cache-control", () => {
     expect(res.headers.get("cache-control")).toBe(
       "public, max-age=31536000, immutable",
     );
+    // The path names the bytes and the hash, so no revalidation is needed.
+    expect(res.headers.get("x-mdb-relay")).toBe(`immutable, sha256=${HASH}`);
+  });
+
+  it("declares a by-hash digest on a 304 revalidation too", async () => {
+    cachedfetchMock.mockImplementation(
+      async () => new Response(null, { status: 304, headers: { etag: '"packages"' } }),
+    );
+    const proxy = makeProxy({ ready: true, hashes: [HASH] });
+
+    const res = await proxy.fetch(
+      get(`dists/trixie/main/binary-amd64/by-hash/SHA256/${HASH}`),
+    );
+
+    expect(res.status).toBe(304);
+    expect(res.headers.get("x-mdb-relay")).toBe(`immutable, sha256=${HASH}`);
+  });
+
+  it("declares nothing on an unverified by-hash path (no index yet)", async () => {
+    // Nothing authoritative has loaded: the proxy passes the request through
+    // unjudged, so it must not call the object immutable.
+    const proxy = makeProxy({ ready: false });
+    const res = await proxy.fetch(
+      get(`dists/trixie/main/binary-amd64/by-hash/SHA256/${HASH}`),
+    );
+
+    expect(cachedfetchMock).toHaveBeenCalled();
     expect(res.headers.get("x-mdb-relay")).toBeNull();
+  });
+
+  it("merges a by-hash declaration with the front middleware's no-vary", async () => {
+    const proxy = makeProxy({ ready: true, hashes: [HASH] });
+    const res = await proxy.fetch(
+      get(`dists/trixie/main/binary-amd64/by-hash/SHA256/${HASH}`),
+    );
+
+    const merged = withRelayDirectives(res, ["no-vary"]);
+    expect(merged.headers.get("x-mdb-relay")).toBe(
+      `immutable, sha256=${HASH}, no-vary`,
+    );
+    // A by-hash object is content-addressed: no-store is never among its
+    // directives, and the cache-control written by the proxy is untouched.
+    expect(merged.headers.get("cache-control")).toBe(
+      "public, max-age=31536000, immutable",
+    );
   });
 
   it.each([
@@ -319,7 +377,7 @@ describe("createAptProxy — method forwarding", () => {
     expect(await res.text()).toBe("");
   });
 
-  it("forwards HEAD for a by-hash file and answers without a body", async () => {
+  it("forwards HEAD for a by-hash file, asking for identity, without a body", async () => {
     const proxy = makeProxy({ ready: true, hashes: [HASH] });
     const res = await proxy.fetch(
       head(`dists/trixie/main/binary-amd64/by-hash/SHA256/${HASH}`),
@@ -330,11 +388,27 @@ describe("createAptProxy — method forwarding", () => {
     expect(url).toBe(
       `https://up.example/debian/dists/trixie/main/binary-amd64/by-hash/SHA256/${HASH}`,
     );
-    expect(init).toEqual({ method: "HEAD" });
+    // The relay's immutable active cache admits only an identity coding.
+    expect(init).toEqual({
+      method: "HEAD",
+      headers: { "accept-encoding": "identity" },
+    });
     expect(res.headers.get("cache-control")).toBe(
       "public, max-age=31536000, immutable",
     );
     expect(await res.text()).toBe("");
+  });
+
+  it("asks for identity on a by-hash GET", async () => {
+    const proxy = makeProxy({ ready: true, hashes: [HASH] });
+    await proxy.fetch(
+      get(`dists/trixie/main/binary-amd64/by-hash/SHA256/${HASH}`),
+    );
+
+    const [, init] = cachedfetchMock.mock.calls[0]!;
+    expect(new Headers((init as RequestInit).headers).get("accept-encoding")).toBe(
+      "identity",
+    );
   });
 
   it("leaves a GET without a method override", async () => {
@@ -362,11 +436,16 @@ describe("createAptProxy — method forwarding", () => {
 
     expect(res.status).toBe(206);
     expect(res.headers.get("content-range")).toBe("bytes 2-6/8");
+    // A partial body still names the same content-addressed object.
+    expect(res.headers.get("x-mdb-relay")).toBe(`immutable, sha256=${HASH}`);
     const [url, init] = cachedfetchMock.mock.calls[0]!;
     expect(url).toBe(
       `https://up.example/debian/dists/trixie/main/binary-amd64/by-hash/SHA256/${HASH}`,
     );
     expect(new Headers((init as RequestInit).headers).get("range")).toBe("bytes=2-6");
+    expect(new Headers((init as RequestInit).headers).get("accept-encoding")).toBe(
+      "identity",
+    );
   });
 
   it("does not forward Range for a pool file", async () => {

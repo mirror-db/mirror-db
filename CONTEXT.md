@@ -92,13 +92,16 @@ returned to the client, never grant access.
 
 A response header (`X-MDB-Relay`) by which an upstream tells the relay how to
 treat that response. Its value has the shape of `Cache-Control`: comma-separated
-`keyword` or `keyword=value`. Four keywords are defined: `no-store` — do not
+`keyword` or `keyword=value`. Seven keywords are defined: `no-store` — do not
 keep this response at all; `no-vary` — the URL path alone identifies the
 resource, so `Vary` must not split it into variants, `Vary: *` included;
 `ttl=<seconds>` — the lifetime to fall back on when the response states no
-freshness, zero meaning none; and `prefetch` — the mirror declares this resource
+freshness, zero meaning none; `prefetch` — the mirror declares this resource
 eligible for relay-driven refresh while the relay continues to see demand for
-it. Unknown keywords are ignored.
+it; `immutable` — this response's bytes cannot change; and `sha256=<64 hex>` /
+`sha1=<40 hex>` — the body's content digest. A digest without `immutable`
+declares no immutability, and a digest names bytes, never a cache key. Unknown
+keywords are ignored.
 
 The header only describes a response. A relay consumes it and never forwards it
 to the client, except on a passthrough path, where no response control is
@@ -112,6 +115,28 @@ refresh. It never selects transport or passthrough: those remain policy fields
 because the relay must know them before it makes the request. Where an upstream
 forbids transformation with the standard `Cache-Control: no-transform`, the
 relay honours that header as well.
+
+### Response-declared immutability
+
+A statement, carried by the `immutable` relay directive, that the bytes of one
+response cannot change. It is a response fact, so it can only be acted on after
+the headers arrive: the first request for such a path may already be assembled
+and published, but no later request can be deduplicated before its response
+headers exist. The address stays the cache key — a declared digest is an
+expectation about the body, not an identity for the URL — and a stored variant of
+such a response is kept for a persistent lifetime rather than the upstream's
+stated freshness. That persistence is part of the stored metadata, so a later
+revalidation cannot shorten it, while the first response still advertises what
+the origin sent. It is distinct from a policy's immutability fact, which is
+known before the request and may name the digest in the path.
+
+### Immutable-miss diagnostic
+
+An opt-in relay log line reporting a request that resolved to a mirror, whose
+merged policy did not declare immutability, and whose mount-relative path
+contains a digest-shaped run. It is a hint that a policy rule is missing, not a
+cache event: it names no client, query or header, and it runs only while its
+switch is on.
 
 ### Policy tag
 
@@ -139,6 +164,17 @@ the relay's own content store, not to a rule. Policy fields sit beside each othe
 at the top level of a rule and merge the same way; `match` is unchanged. The
 manifest carries one current semantics: it is unversioned and older readers are
 not accommodated.
+
+### Immutable path coverage
+
+The set of mount-relative paths whose bytes a policy declares immutable, and the
+evidence for each. A path qualifies only from the request itself: either it names
+a content digest, or the upstream's publication contract fixes its bytes. A
+response header or a checksum inside a body can prove integrity of one transfer,
+but never establishes that the address is immutable, so it is recorded as
+research evidence and not turned into coverage. The audit of all mirrors and
+their external-versus-mount-relative paths is maintained in
+[relay-immutable-coverage.md](brainstorm/features/relay-immutable-coverage.md).
 
 ### Traffic policy
 
@@ -220,9 +256,9 @@ object, which continues to follow the content store's own capacity policy.
 
 A process-local association between an object identity and the fragment cache
 currently filling that object. The identity is the content hash when one is
-known, otherwise the immutable path being assembled. It is not durable: a restart
-abandons incomplete work, while completed hash objects remain discoverable through
-the content store.
+known, otherwise the request URL whose bytes are being assembled. It is not
+durable: a restart abandons incomplete work, while completed hash objects remain
+discoverable through the content store.
 
 ### Disk watermark
 
@@ -280,7 +316,9 @@ upstream. It comes from the upstream's own lifetime (`s-maxage`, `max-age`,
 lifetime only where the upstream states none, and defaults to none. A variant
 marked `no-cache` is stored but must be revalidated before every delivery; a
 request that says `no-cache` or `max-age=0` asks for the same, and a request
-marked `no-store` must neither read nor write the cache.
+marked `no-store` must neither read nor write the cache. A response that declared
+its own immutability keeps its stored variant for a persistent lifetime instead
+of the upstream's stated one, because its bytes cannot change.
 
 ### Cache key
 

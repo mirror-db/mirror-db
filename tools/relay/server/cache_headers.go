@@ -183,6 +183,53 @@ func varyContainsStar(values []string) bool {
 	return false
 }
 
+// persistentVariantLifetime is how long a stored variant of a response that
+// declared X-MDB-Relay: immutable is served without revalidation. The directive
+// is the response's own statement that its bytes cannot change, so the relay
+// keeps them instead of re-checking a lifetime the upstream happened to state.
+// It is deliberately not derived from the standard Cache-Control: immutable,
+// which the relay never interprets.
+const persistentVariantLifetime = 365 * 24 * time.Hour
+
+// withPersistentLifetime rewrites the lifetime directives of a stored header set
+// to the persistent lifetime. Orthogonal directives such as no-transform survive;
+// storage prohibitions (no-store, private) were already refused before this runs,
+// and no-cache is superseded because the response declared its bytes immutable.
+// Expires is dropped: it would contradict the rewritten max-age.
+func withPersistentLifetime(h http.Header) {
+	h.Del("Expires")
+	h.Set("Cache-Control", persistentCacheControl(h.Values("Cache-Control")))
+}
+
+func persistentCacheControl(values []string) string {
+	kept := make([]string, 0, len(values)+1)
+	seen := make(map[string]bool)
+	for _, value := range values {
+		for _, token := range strings.Split(value, ",") {
+			token = strings.TrimSpace(token)
+			if token == "" {
+				continue
+			}
+			name, _, _ := strings.Cut(token, "=")
+			switch strings.ToLower(strings.TrimSpace(name)) {
+			case "max-age", "s-maxage", "no-cache", "no-store", "private",
+				"must-revalidate", "proxy-revalidate", "immutable",
+				"stale-while-revalidate", "stale-if-error":
+				continue
+			}
+			key := strings.ToLower(token)
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			kept = append(kept, token)
+		}
+	}
+	seconds := strconv.FormatInt(int64(persistentVariantLifetime/time.Second), 10)
+	kept = append(kept, "max-age="+seconds)
+	return strings.Join(kept, ", ")
+}
+
 func ageSeconds(storedAt, now time.Time) int64 {
 	if storedAt.IsZero() {
 		return 0

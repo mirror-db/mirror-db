@@ -35,6 +35,7 @@ M1 复用 `google/go-lru`、bbolt、AWS SDK for Go v2 与 `docker/go-units`；�
 - [Relay 请求缓存](features/relay-request-cache.md)：新鲜度与重验、变体匹配与流式转码、条件请求与 Range、命中/MISS、并发与故障降级、Worker 通用 middleware。
 - [不可变对象分段缓存](features/relay-active-cache.md)：immutable 路径的进程内装配、singleflight、发布与回收、容量与磁盘水位边界。
 - [Relay 策略下发](features/relay-policy.md)：policy 边界（只下发回源前信息）、`traffic_policy` / `passthrough` / `exit` 字段与默认值、合并语义、破坏式下发。
+- [静态 immutable 覆盖](features/relay-immutable-coverage.md)：40 个 mirror 的 immutable 分类、mount-relative RE2、外部路径对照、响应头/body hash 研究结论与未知项。
 - [APT 元数据索引](features/apt-metadata-index.md)：CF 目录合成与 relay 哈希预判。
 - [元数据 Prefetch](features/metadata-prefetch.md)：按响应 `X-MDB-Relay: prefetch` 指令、由真实请求驱动的元数据自动更新。
 - [Relay 遥测](features/relay-telemetry.md)：遥测接口的待定义边界。

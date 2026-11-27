@@ -47,12 +47,19 @@ const (
 var errActivePartialFirst = errors.New("relay active: partial section before full body")
 
 // activeMetadata is what the creator shares with later readers through
-// Entry.Metadata. It is the immutable part of the upstream response: headers
-// that may be replayed, the object size (-1 when unknown), and the freshness the
-// resulting URL variant should carry.
+// Entry.Metadata. It records the immutable part of the upstream response: the
+// headers a delivery may replay, the headers the committed variant persists (the
+// two differ when the response declared a persistent lifetime), the object size
+// (-1 when unknown), and the freshness the resulting URL variant should carry.
 type activeMetadata struct {
 	headers http.Header
-	size    int64
+	// stored is the header set a committed URL variant uses. A response that
+	// declared X-MDB-Relay: immutable keeps the persistent lifetime here while
+	// headers keeps the upstream value for delivery, so the first client sees
+	// what the origin sent.
+	stored     http.Header
+	persistent bool
+	size       int64
 	// urlKey is the cache key of the request that seeded the entry. A joiner on
 	// another URL may read the shared bytes, but its response headers came from
 	// the creator's response, so it must not write them as a variant for its own
@@ -86,7 +93,7 @@ func (s *Server) serveImmutableActive(w http.ResponseWriter, r *http.Request, ke
 		return false
 	}
 
-	activeKey, algo, digestHex := activeKeyFor(key, path, digest)
+	activeKey, _, digestHex := activeKeyFor(key, path, digest)
 	entry, created, err := s.active.Acquire(r.Context(), activeKey)
 	if err != nil {
 		logActiveFallback("acquire", activeKey, err)
@@ -102,7 +109,10 @@ func (s *Server) serveImmutableActive(w http.ResponseWriter, r *http.Request, ke
 			entry.Fail(nil)
 			return false
 		}
-		meta, outcome := s.seedImmutableActive(w, r, key, entry, algo, digestHex)
+		// A policy digest is the pre-request fact and wins over anything the
+		// response declares; only a pattern without a digest lets the response
+		// supply the Adopt expectation.
+		meta, outcome := s.seedImmutableActive(w, r, key, entry, digestHex == "")
 		switch outcome {
 		case activeSeedUseEntry:
 			return s.deliverImmutableActive(w, r, key, path, entry, meta)
@@ -128,13 +138,17 @@ const (
 	activeSeedUseEntry activeSeedOutcome = iota
 	// activeSeedServed: the response was already delivered; the handler is done.
 	activeSeedServed
-	// activeSeedFallback: nothing was written; the caller must use the old chain.
+	// activeSeedOrdinary: nothing was consumed; the caller delivers this same
+	// response through the ordinary chain instead of fetching again.
+	activeSeedOrdinary
+	// activeSeedFallback: the response is no longer deliverable here; the caller
+	// must fetch again or answer with an error.
 	activeSeedFallback
 )
 
 // seedImmutableActive fetches the first response, validates it, hands it to the
 // entry and returns the metadata later readers share.
-func (s *Server) seedImmutableActive(w http.ResponseWriter, r *http.Request, key string, entry *activecache.Entry, algo hashstore.Algorithm, digestHex string) (activeMetadata, activeSeedOutcome) {
+func (s *Server) seedImmutableActive(w http.ResponseWriter, r *http.Request, key string, entry *activecache.Entry, useResponseDigest bool) (activeMetadata, activeSeedOutcome) {
 	// The body's lifetime is the shared cache's, not the creator's: a client
 	// that disconnects must not take away bytes other readers are waiting for.
 	// Detaching removes the client's cancellation; the transport still bounds
@@ -169,9 +183,32 @@ func (s *Server) seedImmutableActive(w http.ResponseWriter, r *http.Request, key
 		s.writeUpstreamError(w, r, err)
 		return activeMetadata{}, activeSeedServed
 	}
-
-	directives := RelayDirectivesFromHeader(resp.Header)
 	s.notePrefetchResponse(r, resp.Header)
+
+	meta, outcome := s.startActiveFromResponse(w, r, key, entry, resp, seedRange, useResponseDigest)
+	switch outcome {
+	case activeSeedUseEntry:
+		return meta, activeSeedUseEntry
+	case activeSeedOrdinary:
+		// The response is still untouched: deliver it exactly as the ordinary
+		// chain would, including a tee when it is storable, instead of asking
+		// upstream twice.
+		s.deliverActiveFallback(w, r, resp, key)
+		return activeMetadata{}, activeSeedServed
+	default:
+		return activeMetadata{}, activeSeedFallback
+	}
+}
+
+// startActiveFromResponse validates an already-fetched response and hands it to
+// the entry when it can be assembled. Every refusal before the adapter is built
+// leaves the response untouched, so the caller can deliver it through the
+// ordinary chain without a second upstream request. seedRange is the request
+// range this response answers when the caller narrowed a multipart Range itself.
+// useResponseDigest lets a response supply the Adopt expectation when no policy
+// pattern captured one.
+func (s *Server) startActiveFromResponse(w http.ResponseWriter, r *http.Request, key string, entry *activecache.Entry, resp *http.Response, seedRange string, useResponseDigest bool) (activeMetadata, activeSeedOutcome) {
+	directives := RelayDirectivesFromHeader(resp.Header)
 
 	if err := immutableActiveStorable(resp, directives); err != nil {
 		entry.Fail(err)
@@ -184,11 +221,7 @@ func (s *Server) seedImmutableActive(w http.ResponseWriter, r *http.Request, key
 			return activeMetadata{}, activeSeedFallback
 		}
 		logActiveSeedFallback(key, resp.StatusCode, err)
-		// The response was already fetched; deliver it exactly as the ordinary
-		// chain would, including a tee when it is storable, instead of asking
-		// upstream twice.
-		s.deliverActiveFallback(w, r, resp, key)
-		return activeMetadata{}, activeSeedServed
+		return activeMetadata{}, activeSeedOrdinary
 	}
 
 	if resp.StatusCode == http.StatusOK && seedRange != "" {
@@ -196,8 +229,7 @@ func (s *Server) seedImmutableActive(w http.ResponseWriter, r *http.Request, key
 		// it is an ordinary cacheable 200: the normal chain delivers and stores
 		// it, while the entry is not a byte-addressed assembly.
 		entry.Fail(errors.New("200 response to a ranged request"))
-		s.deliverActiveFallback(w, r, resp, key)
-		return activeMetadata{}, activeSeedServed
+		return activeMetadata{}, activeSeedOrdinary
 	}
 
 	size := immutableActiveSize(resp)
@@ -205,31 +237,52 @@ func (s *Server) seedImmutableActive(w http.ResponseWriter, r *http.Request, key
 		// A 206 with "Content-Range: bytes a-b/*" states no object extent, so the
 		// assembly could never publish and a later Range could not be bounded.
 		entry.Fail(errors.New("206 without a total size"))
-		s.deliverActiveFallback(w, r, resp, key)
-		return activeMetadata{}, activeSeedServed
+		return activeMetadata{}, activeSeedOrdinary
 	}
 	if size <= 0 {
 		// An unknown length cannot be reserved up front, and a zero-length body
 		// has nothing to assemble. The ordinary chain delivers it.
 		entry.Fail(errors.New("unknown or zero-length immutable object"))
-		s.deliverActiveFallback(w, r, resp, key)
-		return activeMetadata{}, activeSeedServed
+		return activeMetadata{}, activeSeedOrdinary
 	}
 	if budget := s.hashStore.Stats().Capacity; budget > 0 && size > budget {
 		// Adopt would reject this body; admitting it would only hold an upstream
 		// response and a scratch file for nothing.
 		entry.Fail(fmt.Errorf("body of %d bytes exceeds the %d-byte store budget", size, budget))
-		s.deliverActiveFallback(w, r, resp, key)
-		return activeMetadata{}, activeSeedServed
+		return activeMetadata{}, activeSeedOrdinary
+	}
+
+	// A response-declared digest is only an Adopt expectation and only when the
+	// body is the whole representation: a 206 describes a slice, so its digest
+	// cannot name the object, and a non-identity coding is already refused.
+	if useResponseDigest && resp.StatusCode == http.StatusOK {
+		if algo, digest := directives.Expectation(); algo != "" {
+			if encoding := strings.TrimSpace(resp.Header.Get("Content-Encoding")); encoding == "" || strings.EqualFold(encoding, "identity") {
+				if err := entry.SetExpectation(algo, digest); err != nil {
+					log.Printf("relay active: response digest for %q ignored: %v", key, err)
+				}
+			}
+		}
 	}
 
 	storedAt := s.currentTime()
+	headers := immutableActiveHeaders(resp.Header)
+	stored := headers
+	persistent := directives.Immutable
+	if persistent {
+		// The stored variant declares a persistent lifetime; the delivery keeps
+		// the upstream Cache-Control, exactly like the ordinary fallback path.
+		stored = headers.Clone()
+		withPersistentLifetime(stored)
+	}
 	meta := activeMetadata{
-		headers:   immutableActiveHeaders(resp.Header),
-		size:      size,
-		urlKey:    key,
-		storedAt:  storedAt,
-		expiresAt: freshnessExpiry(resp.Header, directives, storedAt),
+		headers:    headers,
+		stored:     stored,
+		persistent: persistent,
+		size:       size,
+		urlKey:     key,
+		storedAt:   storedAt,
+		expiresAt:  freshnessExpiry(stored, directives, storedAt),
 	}
 
 	// Later range requests must carry the relay host and the selected transport,
@@ -248,7 +301,7 @@ func (s *Server) seedImmutableActive(w http.ResponseWriter, r *http.Request, key
 	// is delivered (and stored) by the ordinary chain, so a full segment or a
 	// low disk never costs a second upstream read.
 	builderCalled := false
-	err = entry.InitFactory(meta, size, func() (tiered.UpstreamProvider, error) {
+	err := entry.InitFactory(meta, size, func() (tiered.UpstreamProvider, error) {
 		builderCalled = true
 		adapter, err := httpadapter.NewUpstreamFromResponse(resp, opts...)
 		if err != nil {
@@ -268,10 +321,114 @@ func (s *Server) seedImmutableActive(w http.ResponseWriter, r *http.Request, key
 			return activeMetadata{}, activeSeedFallback
 		}
 		logActiveFallback("init", key, err)
-		s.deliverActiveFallback(w, r, resp, key)
-		return activeMetadata{}, activeSeedServed
+		return activeMetadata{}, activeSeedOrdinary
 	}
 	return meta, activeSeedUseEntry
+}
+
+// responseImmutableEligible decides whether an already-fetched response may seed
+// the active segment because it declared X-MDB-Relay: immutable. It only
+// inspects request and response facts; nothing here fetches. A policy-declared
+// immutable path already made this decision before the request and keeps its own
+// key and digest, so it is excluded.
+func (s *Server) responseImmutableEligible(r *http.Request, resp *http.Response, directives RelayDirectives, old *hashstore.Variant, writable, cleanupAmbiguous bool) bool {
+	if s.active == nil || s.hashStore == nil || resp == nil || resp.Body == nil {
+		return false
+	}
+	if r.Method != http.MethodGet || !writable || old != nil || cleanupAmbiguous {
+		return false
+	}
+	if !directives.Immutable {
+		// A digest alone never selects the active path.
+		return false
+	}
+	if immutable, _ := immutableFromContext(r.Context()); immutable {
+		return false
+	}
+	if policy := requestCachePolicyFrom(r); policy.noStore || policy.forceRevalidate {
+		return false
+	}
+	// The assembly is an identity byte range. A client that refuses identity
+	// cannot be served from it.
+	if !AcceptEncodingFromRequest(r).Accepts(CodingIdentity) {
+		return false
+	}
+	if hasConditionalHeaders(r) {
+		return false
+	}
+	// A multipart range cannot seed one assembly whose extent the origin states
+	// in a way the client asked for.
+	if rangeHasMultipleIntervals(r.Header.Get("Range")) {
+		return false
+	}
+	switch resp.StatusCode {
+	case http.StatusOK:
+		// An origin that answers a range request with the full body keeps the
+		// ordinary writable path, which stores it as a complete representation.
+		if strings.TrimSpace(r.Header.Get("Range")) != "" {
+			return false
+		}
+	case http.StatusPartialContent:
+		// A 206 with a concrete total size can seed a byte-addressed assembly.
+		// The adapter would reject a body whose Content-Length disagrees with its
+		// Content-Range, and that rejection is not recoverable there (the adapter
+		// closes the body), so the mismatch is refused here and the same response
+		// is delivered ordinarily.
+		start, end, _, totalKnown, ok := parseActiveContentRange(resp.Header.Get("Content-Range"))
+		if !ok || !totalKnown {
+			return false
+		}
+		if resp.ContentLength >= 0 && resp.ContentLength != end-start+1 {
+			return false
+		}
+	default:
+		return false
+	}
+	// The response-side prohibitions are checked here too, not only in the
+	// seed: a response the active segment can never take must go straight to
+	// the ordinary chain instead of being acquired and logged as a fallback.
+	return immutableActiveStorable(resp, directives) == nil
+}
+
+// serveResponseImmutableActive seeds the active segment from a first MISS whose
+// response declared immutability. It reports whether the response was consumed;
+// false means it is still untouched and the caller must deliver it ordinarily.
+func (s *Server) serveResponseImmutableActive(w http.ResponseWriter, r *http.Request, key string, resp *http.Response, directives RelayDirectives) bool {
+	// The response digest is an expectation only: the entry keeps the URL key
+	// the response arrived under, so a response can never re-point a cache key.
+	entry, created, err := s.active.Acquire(r.Context(), key)
+	if err != nil {
+		logActiveFallback("response-acquire", key, err)
+		return false
+	}
+	defer entry.Release()
+	if !created {
+		// Another request already owns this URL key. This body is in hand, so it
+		// goes to the ordinary chain rather than into someone else's assembly;
+		// the existing entry is left untouched.
+		return false
+	}
+
+	meta, outcome := s.startActiveFromResponse(w, r, key, entry, resp, "", true)
+	switch outcome {
+	case activeSeedUseEntry:
+		if s.deliverImmutableActive(w, r, key, "", entry, meta) {
+			return true
+		}
+		log.Printf("relay active: response seed %q could not be delivered", key)
+		http.Error(w, "upstream error", http.StatusBadGateway)
+		return true
+	case activeSeedServed:
+		return true
+	case activeSeedOrdinary:
+		return false
+	default:
+		// The body was handed to an adapter that could not start, so it cannot be
+		// delivered here. Nothing has been written to the client yet.
+		log.Printf("relay active: response seed %q left no deliverable body", key)
+		http.Error(w, "upstream error", http.StatusBadGateway)
+		return true
+	}
 }
 
 // deliverActiveFallback hands an already-fetched response to the ordinary chain
@@ -284,7 +441,9 @@ func (s *Server) deliverActiveFallback(w http.ResponseWriter, r *http.Request, r
 		return
 	}
 	defer resp.Body.Close()
-	s.deliverUpstream(w, r, resp, key, nil, true, false)
+	// The response was already fetched for an active attempt, so this delivery
+	// must not start another one: fallback never re-enters response-active.
+	s.deliverUpstream(w, r, resp, key, nil, true, false, false)
 }
 
 // logActiveSeedFallback downgrades the statuses that are simply the upstream's
@@ -979,14 +1138,19 @@ func (s *Server) commitActiveAfterDelivery(r *http.Request, key string, entry *a
 	if meta.size >= 0 && content.Size != meta.size {
 		return
 	}
+	stored := meta.stored
+	if stored == nil {
+		stored = meta.headers
+	}
 	v := hashstore.Variant{
 		URL:             key,
 		NoVary:          true,
-		ResponseHeaders: meta.headers,
+		ResponseHeaders: stored,
 		BodySHA256:      content.SHA256,
 		BodySize:        content.Size,
 		StoredAt:        meta.storedAt,
 		ExpiresAt:       meta.expiresAt,
+		Persistent:      meta.persistent,
 	}
 	_ = s.commitVariant(r.Context(), v, nil)
 }

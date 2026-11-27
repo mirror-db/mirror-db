@@ -4,9 +4,10 @@
  * The value is Cache-Control-style: comma-separated `keyword` or
  * `keyword=value` tokens. It carries response decisions the relay can only make
  * after seeing the upstream answer — currently `no-store`, `no-vary`,
- * `prefetch` and `ttl=<seconds>` — and is deliberately absent from the mirror
- * manifest policy (see `server/relay-policy.ts`). The relay reads it and removes
- * it before delivering to a client.
+ * `prefetch`, `ttl=<seconds>`, `immutable`, `sha256=<hex>` and `sha1=<hex>` —
+ * and is deliberately absent from the mirror manifest policy (see
+ * `server/relay-policy.ts`). The relay reads it and removes it before delivering
+ * to a client.
  *
  * When a mirror has no explicit directive, the header is untouched. When it
  * does, the middleware merges: an existing directive always wins, so a response
@@ -23,12 +24,18 @@ export const RELAY_HOST_HEADER = "x-mdb-relay-host";
 /**
  * Directives a mirror may declare. Unknown keywords are tolerated on the wire
  * (relays ignore them), but the Worker only emits these.
+ *
+ * `sha256`/`sha1` stay opaque values: the relay validates hex length and treats
+ * the digest as an Adopt expectation, and a digest never implies `immutable`.
  */
 export type RelayDirective =
   | "no-store"
   | "no-vary"
   | "prefetch"
-  | `ttl=${number}`;
+  | "immutable"
+  | `ttl=${number}`
+  | `sha256=${string}`
+  | `sha1=${string}`;
 
 /** Split a directive list on commas outside quoted strings. */
 function splitDirectives(value: string): string[] {

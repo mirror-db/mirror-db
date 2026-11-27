@@ -35,6 +35,9 @@ var (
 	ErrInvalidSize = errors.New("activecache: invalid declared size")
 	// ErrAborted marks an entry the creator abandoned before Init.
 	ErrAborted = errors.New("activecache: entry aborted")
+	// ErrExpectationConflict means the entry already carries a different digest
+	// expectation, derived from its key or set earlier by its creator.
+	ErrExpectationConflict = errors.New("activecache: digest expectation conflict")
 )
 
 const scratchPrefix = "active-"

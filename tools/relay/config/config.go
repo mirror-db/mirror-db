@@ -46,6 +46,12 @@ func init() {
 	viper.SetDefault("prefetch.concurrency", DefaultPrefetchConcurrency)
 	viper.SetDefault("prefetch.max_tasks", DefaultPrefetchMaxTasks)
 
+	// A diagnostic switch, off by default: it logs every resolved mirror request
+	// whose merged policy did not declare immutability but whose path carries a
+	// digest-shaped run. It exists to find missing rules, not to run in steady
+	// state, so nothing scans a path while it is off.
+	viper.SetDefault("cache.log_immutable_miss", false)
+
 	// Env override (highest priority).
 	viper.AutomaticEnv()
 	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
@@ -306,6 +312,13 @@ func GetPrefetchMaxTasks() int {
 		return DefaultPrefetchMaxTasks
 	}
 	return n
+}
+
+// GetCacheLogImmutableMiss reports whether the immutable-miss diagnostic log is
+// enabled. It is off unless explicitly true; the switch is read once at startup,
+// so changing it needs a restart.
+func GetCacheLogImmutableMiss() bool {
+	return viper.GetBool("cache.log_immutable_miss")
 }
 
 // GetManifestSyncInterval is how often the mirror manifest is revalidated. It

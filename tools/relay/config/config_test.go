@@ -138,8 +138,10 @@ func TestManifestSyncInterval(t *testing.T) {
 
 func TestSecretKeyFilePermissions(t *testing.T) {
 	dir := t.TempDir()
-	viper.Set("relay.config_dir", dir)
-	t.Cleanup(func() { viper.Set("relay.config_dir", "/etc/mirror-relay") })
+	// The env binding is what production uses; a viper override would survive the
+	// test (viper has no unset) and shadow the env for every later run, which is
+	// exactly what breaks a repeated `-count` run of this package.
+	t.Setenv("RELAY_CONFIG_DIR", dir)
 
 	key := ensureSecretKeyFile()
 	if len(key) == 0 {
@@ -483,6 +485,36 @@ func TestActiveCacheConfigEnv(t *testing.T) {
 	}
 	if cfg.DiskWaterMark != 2<<30 {
 		t.Errorf("water mark = %d", cfg.DiskWaterMark)
+	}
+}
+
+func TestCacheLogImmutableMiss(t *testing.T) {
+	old := viper.Get("cache.log_immutable_miss")
+	t.Cleanup(func() { viper.Set("cache.log_immutable_miss", old) })
+
+	if GetCacheLogImmutableMiss() {
+		t.Fatal("diagnostic is enabled without configuration")
+	}
+	viper.Set("cache.log_immutable_miss", true)
+	if !GetCacheLogImmutableMiss() {
+		t.Fatal("explicit true was not honoured")
+	}
+	viper.Set("cache.log_immutable_miss", false)
+	if GetCacheLogImmutableMiss() {
+		t.Fatal("explicit false was not honoured")
+	}
+}
+
+// TestCacheLogImmutableMissEnvName pins the env spelling: the dotted key maps
+// through the shared dot-to-underscore replacer.
+func TestCacheLogImmutableMissEnvName(t *testing.T) {
+	t.Setenv("CACHE_LOG_IMMUTABLE_MISS", "true")
+	v := viper.New()
+	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+	v.AutomaticEnv()
+	v.SetDefault("cache.log_immutable_miss", false)
+	if !v.GetBool("cache.log_immutable_miss") {
+		t.Fatal("CACHE_LOG_IMMUTABLE_MISS did not reach cache.log_immutable_miss")
 	}
 }
 

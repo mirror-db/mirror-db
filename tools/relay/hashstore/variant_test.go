@@ -650,3 +650,39 @@ func TestConcurrentVariants(t *testing.T) {
 		}
 	}
 }
+
+// TestVariantPersistentFlagRoundTrip pins the spare-bit encoding: a persistent
+// variant survives encode/decode, and a row written before the bit existed
+// decodes as non-persistent (the zero value), so no stored row needs rewriting.
+func TestVariantPersistentFlagRoundTrip(t *testing.T) {
+	v := testVariant(t, testVariantURL, "body", nil, nil)
+	v.NoVary = true
+	v.Persistent = true
+
+	row, err := encodeVariant(v)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	decoded, err := decodeVariant(row)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !decoded.Persistent {
+		t.Fatal("persistent flag did not survive the round trip")
+	}
+
+	// A legacy row is a version-2 row with only the no-vary bit set, which is
+	// exactly what encoding a non-persistent variant produces.
+	v.Persistent = false
+	legacy, err := encodeVariant(v)
+	if err != nil {
+		t.Fatalf("encode legacy: %v", err)
+	}
+	old, err := decodeVariant(legacy)
+	if err != nil {
+		t.Fatalf("decode legacy: %v", err)
+	}
+	if old.Persistent {
+		t.Fatal("a row without the persistent bit decoded as persistent")
+	}
+}

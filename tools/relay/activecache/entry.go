@@ -100,6 +100,38 @@ func parseDigestKey(key string) (hashstore.Algorithm, string) {
 // Key returns the deduplication key this entry was acquired with.
 func (e *Entry) Key() string { return e.key }
 
+// SetExpectation records the content digest the body is expected to have. It is
+// an expectation for Adopt, never a key: the entry keeps the key it was acquired
+// with, so a URL-keyed entry stays URL-keyed. It must be called by the creator
+// before Init/InitFactory; anything else is ErrAlreadyInitialized. A digest
+// already derived from a digest-shaped key is never overwritten: restating it is
+// a no-op, and a different one is ErrExpectationConflict.
+func (e *Entry) SetExpectation(algo hashstore.Algorithm, digest string) error {
+	switch algo {
+	case hashstore.SHA1, hashstore.SHA256:
+	default:
+		return fmt.Errorf("%w: unknown algorithm %q", hashstore.ErrInvalidDigest, algo)
+	}
+	normalized, err := hashstore.NormalizeDigest(algo, digest)
+	if err != nil {
+		return err
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.state != statePending {
+		return ErrAlreadyInitialized
+	}
+	if e.algo != "" {
+		if e.algo == algo && e.digest == normalized {
+			return nil
+		}
+		return ErrExpectationConflict
+	}
+	e.algo = algo
+	e.digest = normalized
+	return nil
+}
+
 // Wait blocks until the creator initialized the entry or failed it. A creator
 // does not need it; Acquire already waited for non-creators.
 func (e *Entry) Wait(ctx context.Context) error { return e.wait(ctx) }
@@ -174,6 +206,7 @@ func (e *Entry) InitFactory(metadata any, size int64, build func() (tiered.Upstr
 		return fail(ErrAlreadyInitialized)
 	}
 	e.state = stateInitializing
+	algo, digest := e.algo, e.digest
 	e.mu.Unlock()
 
 	if err := e.m.admit(e, size); err != nil {
@@ -191,7 +224,7 @@ func (e *Entry) InitFactory(metadata any, size int64, build func() (tiered.Upstr
 	// The source is filled in only after build runs, so tiered.New cannot pull a
 	// body the caller has not handed over yet.
 	lazy := &lazySource{}
-	st := newEntryStore(e, e.algo, e.digest, e.m.adopt, e.m.handoff)
+	st := newEntryStore(e, algo, digest, e.m.adopt, e.m.handoff)
 	pc, err := tiered.New(tiered.Config{Source: lazy, Cache: cache, Store: st})
 	if err != nil {
 		return fail(fmt.Errorf("activecache: start tiered cache: %w", err))

@@ -76,9 +76,81 @@ export const OCI_DIGEST_PATTERN =
  * APT `by-hash` objects. This rule extracts the two digest algorithms the
  * schema declares, SHA-256 and SHA-1; an algorithm it does not name (such as
  * SHA512) does not match this extraction rule.
+ *
+ * The optional leading `(?:.+/)?` covers repositories nested below the mount
+ * root rather than directly under it: `microsoft` serves
+ * `/code/dists/…/by-hash/…` and `pigsty` serves `infra/dists/…` and
+ * `pgsql/<codename>/dists/…`. The plain `debian`-style `/dists/…` layout still
+ * matches, because the group is optional.
  */
 export const APT_BY_HASH_PATTERN =
-  String.raw`^/dists/.+/by-hash/(?:SHA256/(?<sha256>[0-9a-f]{64})|SHA1/(?<sha1>[0-9a-f]{40}))$`;
+  String.raw`^/(?:.+/)?dists/.+/by-hash/(?:SHA256/(?<sha256>[0-9a-f]{64})|SHA1/(?<sha1>[0-9a-f]{40}))$`;
+
+/**
+ * PyPI package files under `/pypi/`. Upstream forbids re-uploading a filename:
+ * a project may add a new file, but a path that exists keeps its bytes. The
+ * 64-hex segment in a `/packages/` path is an upstream layout id, **not** the
+ * body's SHA-256, so this rule declares immutability without capturing a digest.
+ */
+export const PYPI_PACKAGES_PATTERN = String.raw`^/packages/`;
+
+/**
+ * npm tarballs: `/<pkg>/-/<pkg>-<version>.tgz`, plus the scoped form
+ * `/<@scope>/<pkg>/-/<pkg>-<version>.tgz`. Package metadata documents
+ * (`/<pkg>`, `/<@scope>/<pkg>`) stay mutable — a new version rewrites them.
+ */
+export const NPM_TARBALL_PATTERN =
+  String.raw`^/(?:@[^/]+/)?[^/]+/-/[^/]+\.tgz$`;
+
+/**
+ * Node.js release directories: `/v<major>.<minor>.<patch>/…`. The `latest-*`
+ * aliases live at the same depth but do not start with `v<digits>.`.
+ */
+export const NODEJS_RELEASE_PATTERN = String.raw`^/v\d+\.\d+\.\d+/`;
+
+/**
+ * Go release files at the `go.dev/dl/` root. Covers source archives, the
+ * per-platform installers (including the `betaN` / `rcN` suffixes and the old
+ * `darwin-*-osx10.x` names) and the two `go<version>-bootstrap-<date>.tar.gz`
+ * toolchain seeds. Adjacent `*.sha256`, `*.asc` and the root `index.json`
+ * deliberately do not match: only release files are named.
+ */
+export const GO_RELEASE_PATTERN =
+  String.raw`^/go\d+(?:\.\d+)+(?:beta\d*|rc\d*)?(?:\.(?:src\.tar\.gz|(?:linux|darwin|windows|freebsd|netbsd|openbsd|dragonfly|solaris|illumos|aix|plan9)-[a-z0-9]+(?:-osx[0-9.]+)?\.(?:tar\.gz|zip|pkg|msi|tar\.xz))|-bootstrap-\d{8}\.tar\.gz)$`;
+
+/**
+ * Kubernetes release directories: `/release/v<major>.<minor>.<patch>/…`.
+ * `release/stable-<minor>.txt` is a moving pointer and does not match.
+ */
+export const KUBE_RELEASE_PATTERN = String.raw`^/release/v\d+\.\d+\.\d+/`;
+
+/**
+ * Debian CD/DVD release directories: `/12.9.0/…` and `/12.9.0-live/…`. The
+ * `current/` and `project/` aliases are moving pointers and do not match.
+ */
+export const DEBIAN_CD_PATTERN = String.raw`^/\d+(?:\.\d+)+(?:-live)?/`;
+
+/**
+ * Debian cloud images: `/<codename>/<YYYYMMDD>-<build>/…`. The `daily/` tree
+ * and the `latest/` aliases are moving pointers and do not match.
+ */
+export const DEBIAN_CLOUD_PATTERN = String.raw`^/[a-z]+/\d{8}-\d{4}/`;
+
+/**
+ * Ubuntu cloud images: `/releases/<codename>/release-<YYYYMMDD>/…`, including
+ * the `.N` rebuild suffix upstream uses when a dated build is reissued. The
+ * `daily*` trees and `latest` aliases do not match.
+ */
+export const UBUNTU_CLOUD_PATTERN =
+  String.raw`^/releases/[a-z]+/release-\d{8}(?:\.\d+)?/`;
+
+/**
+ * Ubuntu release directories: `/24.04.5/…`, `/24.04.5.1/…`. At least three
+ * numeric components are required, so a two-component moving alias such as
+ * `24.04/` (upstream repoints it at the current point release) and a codename
+ * alias such as `jammy/` both stay mutable.
+ */
+export const UBUNTU_RELEASES_PATTERN = String.raw`^/\d+\.\d+\.\d+(?:\.\d+)*/`;
 
 /**
  * Archive, image, installer, and package suffixes that benefit from sustained
@@ -102,9 +174,69 @@ export const relayPolicies: RelayPolicy[] = [
   },
   {
     name: "apt-by-hash",
-    description: "APT by-hash objects are addressed by their own content digest.",
+    description:
+      "APT by-hash objects are addressed by their own content digest, at the mount root or nested below it.",
     match: { tag: "apt", path_pattern: APT_BY_HASH_PATTERN },
     rules: { immutable: APT_BY_HASH_PATTERN },
+  },
+  {
+    name: "pypi-packages",
+    description:
+      "PyPI package files; upstream never accepts a second upload under one filename.",
+    match: { mirror: "pypi", path_pattern: PYPI_PACKAGES_PATTERN },
+    rules: { immutable: PYPI_PACKAGES_PATTERN },
+  },
+  {
+    name: "npm-tarballs",
+    description: "npm tarballs, scoped and unscoped; metadata stays mutable.",
+    match: { mirror: "npm", path_pattern: NPM_TARBALL_PATTERN },
+    rules: { immutable: NPM_TARBALL_PATTERN },
+  },
+  {
+    name: "nodejs-releases",
+    description:
+      "Node.js version directories; `latest-*` aliases stay mutable.",
+    match: { mirror: "nodejs", path_pattern: NODEJS_RELEASE_PATTERN },
+    rules: { immutable: NODEJS_RELEASE_PATTERN },
+  },
+  {
+    name: "go-releases",
+    description: "Go release archives and installers at the download root.",
+    match: { mirror: "go-releases", path_pattern: GO_RELEASE_PATTERN },
+    rules: { immutable: GO_RELEASE_PATTERN },
+  },
+  {
+    name: "kube-releases",
+    description:
+      "Kubernetes release directories; `stable-*.txt` pointers stay mutable.",
+    match: { mirror: "kube-releases", path_pattern: KUBE_RELEASE_PATTERN },
+    rules: { immutable: KUBE_RELEASE_PATTERN },
+  },
+  {
+    name: "debian-cd",
+    description:
+      "Debian CD/DVD release directories; `current/` and `project/` are aliases.",
+    match: { mirror: "debian-cd", path_pattern: DEBIAN_CD_PATTERN },
+    rules: { immutable: DEBIAN_CD_PATTERN },
+  },
+  {
+    name: "debian-cloud",
+    description:
+      "Dated Debian cloud image builds; `daily/` and `latest/` are aliases.",
+    match: { mirror: "debian-cloud", path_pattern: DEBIAN_CLOUD_PATTERN },
+    rules: { immutable: DEBIAN_CLOUD_PATTERN },
+  },
+  {
+    name: "ubuntu-cloud",
+    description: "Dated Ubuntu cloud image builds; `daily*` and aliases stay mutable.",
+    match: { mirror: "ubuntu-cloud", path_pattern: UBUNTU_CLOUD_PATTERN },
+    rules: { immutable: UBUNTU_CLOUD_PATTERN },
+  },
+  {
+    name: "ubuntu-releases",
+    description: "Ubuntu numbered release directories; codename aliases stay mutable.",
+    match: { mirror: "ubuntu-releases", path_pattern: UBUNTU_RELEASES_PATTERN },
+    rules: { immutable: UBUNTU_RELEASES_PATTERN },
   },
   {
     name: "oci-blobs",

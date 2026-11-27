@@ -24,10 +24,18 @@ var ErrVariantLimit = errors.New("hashstore: variant limit reached")
 
 // variantEncodingVersion lets a future encoding be recognised instead of being
 // misread as the current one. Version 2 added the explicit header-presence flag.
+// Further boolean properties use spare bits of the flags byte rather than a new
+// version: a reader that predates a bit ignores it, and a row written before it
+// decodes with the bit clear, so no stored row needs rewriting.
 const variantEncodingVersion byte = 2
 
 const (
 	variantFlagNoVary byte = 1 << 0
+	// variantFlagPersistent marks a variant whose response declared its bytes
+	// immutable. It keeps the persistent lifetime across a 304 revalidation even
+	// when the 304 no longer repeats that declaration. Older readers ignore an
+	// unknown flag bit, so a row written with it still decodes as before.
+	variantFlagPersistent byte = 1 << 1
 
 	// maxVariantsPerURL bounds one URL's variants. A request can only produce a
 	// few representations; 16 leaves room for Vary combinations without letting
@@ -82,6 +90,11 @@ type Variant struct {
 	// ExpiresAt is when the response stops being servable without revalidation.
 	// A zero value means no expiry is recorded.
 	ExpiresAt time.Time
+	// Persistent marks a response that declared its own immutability through the
+	// relay directive. Its stored lifetime is the relay's persistent one, and a
+	// later 304 keeps that property even without restating the declaration. It is
+	// metadata, never part of the variant identity.
+	Persistent bool
 }
 
 // Matches reports whether requestHeaders satisfy v's Vary contract. A no-vary
@@ -457,6 +470,9 @@ func encodeVariant(v Variant) ([]byte, error) {
 	if v.NoVary {
 		flags |= variantFlagNoVary
 	}
+	if v.Persistent {
+		flags |= variantFlagPersistent
+	}
 
 	buf := make([]byte, 0, 64+len(v.URL))
 	buf = append(buf, variantEncodingVersion, flags)
@@ -515,7 +531,10 @@ func decodeVariant(data []byte) (Variant, error) {
 		return Variant{}, err
 	}
 
-	v := Variant{NoVary: flags&variantFlagNoVary != 0}
+	v := Variant{
+		NoVary:     flags&variantFlagNoVary != 0,
+		Persistent: flags&variantFlagPersistent != 0,
+	}
 	if v.URL, err = d.string(); err != nil {
 		return Variant{}, err
 	}
