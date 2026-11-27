@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/mirror-db/mirror-db/tools/relay/hashstore"
+	"github.com/mirror-db/mirror-db/tools/relay/internal/variant"
 )
 
 func newTestPrefetchScheduler(clock *testClock, concurrency, maxTasks int, run prefetchRunner) *prefetchScheduler {
@@ -61,7 +62,7 @@ func TestPrefetchLazyRegistrationAndRenewal(t *testing.T) {
 	if len(p.tasks) != 1 {
 		t.Fatalf("tasks after prefetch = %d", len(p.tasks))
 	}
-	task := snapshotTask(t, p, normalTaskKey("mirror://test/x", true, nil, http.Header{}))
+	task := snapshotTask(t, p, normalTaskKey("mirror://test/x", variant.New(true, nil, nil)))
 	if !task.hasNext || !task.nextRun.Equal(clock.Now().Add(60*time.Second)) {
 		t.Fatalf("schedule = (%v, %v), want +60s", task.nextRun, task.hasNext)
 	}
@@ -101,19 +102,19 @@ func TestPrefetchFreshnessScheduling(t *testing.T) {
 	m := Mirror{Name: "test", Path: "test"}
 
 	noteNormal(t, p, m, "mirror://test/a", "/a", "/test/a", http.Header{}, "prefetch", "max-age=120", clock.Now())
-	a := snapshotTask(t, p, normalTaskKey("mirror://test/a", true, nil, http.Header{}))
+	a := snapshotTask(t, p, normalTaskKey("mirror://test/a", variant.New(true, nil, nil)))
 	if !a.hasNext || !a.nextRun.Equal(clock.Now().Add(120*time.Second)) {
 		t.Fatalf("max-age schedule = (%v, %v)", a.nextRun, a.hasNext)
 	}
 
 	noteNormal(t, p, m, "mirror://test/b", "/b", "/test/b", http.Header{}, "prefetch", "no-cache", clock.Now())
-	b := snapshotTask(t, p, normalTaskKey("mirror://test/b", true, nil, http.Header{}))
+	b := snapshotTask(t, p, normalTaskKey("mirror://test/b", variant.New(true, nil, nil)))
 	if b.hasNext {
 		t.Fatal("no-cache formed an automatic refresh schedule")
 	}
 
 	noteNormal(t, p, m, "mirror://test/c", "/c", "/test/c", http.Header{}, "prefetch", "", clock.Now())
-	c := snapshotTask(t, p, normalTaskKey("mirror://test/c", true, nil, http.Header{}))
+	c := snapshotTask(t, p, normalTaskKey("mirror://test/c", variant.New(true, nil, nil)))
 	if c.hasNext {
 		t.Fatal("a response without freshness formed an automatic refresh schedule")
 	}
@@ -140,7 +141,7 @@ func TestPrefetchTaskLimitAndBackoff(t *testing.T) {
 	for i, delay := range want {
 		p.dispatchDue()
 		p.wg.Wait()
-		task := snapshotTask(t, p, normalTaskKey("mirror://test/a", true, nil, http.Header{}))
+		task := snapshotTask(t, p, normalTaskKey("mirror://test/a", variant.New(true, nil, nil)))
 		if wantAt := clock.Now().Add(delay); !task.nextRun.Equal(wantAt) {
 			t.Fatalf("failure %d nextRun = %v, want %v", i+1, task.nextRun, wantAt)
 		}
@@ -226,7 +227,7 @@ func TestPrefetchNoStoreConflict(t *testing.T) {
 	p := newTestPrefetchScheduler(clock, 4, 4096, nil)
 	m := Mirror{Name: "test", Path: "test"}
 	noteNormal(t, p, m, "mirror://test/x", "/x", "/test/x", http.Header{}, "prefetch,no-store", "", clock.Now())
-	task := snapshotTask(t, p, normalTaskKey("mirror://test/x", true, nil, http.Header{}))
+	task := snapshotTask(t, p, normalTaskKey("mirror://test/x", variant.New(true, nil, nil)))
 	if !task.backgroundDisabled {
 		t.Fatal("no-store task was not disabled")
 	}
@@ -257,6 +258,54 @@ func TestPrefetchVariantRequestHeaders(t *testing.T) {
 		if task.noVary {
 			t.Fatal("Vary response was folded into no-vary")
 		}
+	}
+}
+
+func TestPrefetchIgnoresAcceptEncodingInTaskIdentity(t *testing.T) {
+	clock := newTestClock()
+	p := newTestPrefetchScheduler(clock, 4, 4096, nil)
+	m := Mirror{Name: "test", Path: "test"}
+	key := "mirror://test/coding"
+	h := http.Header{
+		"Cache-Control": {"max-age=60"},
+		"Vary":          {"Accept-Encoding, Accept-Language, X-Lang"},
+	}
+	d := ParseRelayDirectives([]string{"prefetch"})
+
+	// Same represented response, two codings. Accept-Encoding is never a task
+	// dimension, so both observations must land on one lease.
+	for _, coding := range []string{"gzip", "br"} {
+		req := http.Header{
+			"Accept-Encoding": {" " + coding + " "},
+			"Accept-Language": {"en"},
+			"X-Lang":          {"1"},
+		}
+		p.NoteNormalResponse(m, key, "/coding", "/test/coding", "/test/coding", "", req, h, d, clock.Now(), false)
+	}
+	if len(p.tasks) != 1 {
+		t.Fatalf("tasks = %d, want one lease for both codings", len(p.tasks))
+	}
+
+	identity := relayResponseIdentity(false, h.Values("Vary"), http.Header{
+		"Accept-Encoding": {"gzip"},
+		"Accept-Language": {"en"},
+		"X-Lang":          {"1"},
+	})
+	task := snapshotTask(t, p, normalTaskKey(key, identity))
+	if _, present := task.requestHeaders["accept-encoding"]; present {
+		t.Fatalf("task replay headers kept the coding: %v", task.requestHeaders)
+	}
+	if got := task.requestHeaders["accept-language"]; len(got) != 1 || got[0] != "en" {
+		t.Fatalf("Accept-Language replay = %v", got)
+	}
+	if got := task.requestHeaders["x-lang"]; len(got) != 1 || got[0] != "1" {
+		t.Fatalf("X-Lang replay = %v", got)
+	}
+	if got := fmt.Sprint(task.vary); got != "[accept-language x-lang]" {
+		t.Fatalf("task Vary = %s, want the sorted non-coding set", got)
+	}
+	if task.key != normalTaskKey(key, identity) {
+		t.Fatalf("task key = %q, want the identity codec", task.key)
 	}
 }
 

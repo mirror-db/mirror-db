@@ -12,6 +12,8 @@ import (
 	"time"
 
 	bolt "go.etcd.io/bbolt"
+
+	"github.com/mirror-db/mirror-db/tools/relay/internal/variant"
 )
 
 // ErrInvalidVariant means a variant identity or body reference was unusable.
@@ -104,18 +106,14 @@ type Variant struct {
 // absence and an explicit empty value are different, just as they are in the
 // key.
 func (v Variant) Matches(requestHeaders http.Header) bool {
-	if v.NoVary {
-		return true
-	}
-	got := normalizeRequestHeaders(requestHeaders, v.Vary)
-	for _, name := range v.Vary {
-		want, wantPresent := matchedValue(v.RequestHeaders, name)
-		have, havePresent := matchedValue(got, name)
-		if wantPresent != havePresent || want != have {
-			return false
-		}
-	}
-	return true
+	return v.Identity().Matches(requestHeaders)
+}
+
+// Identity returns the variant's identity as the shared domain value. It is
+// built from the same fields the store persists, so matching, equality and
+// encoding all start from one normalisation.
+func (v Variant) Identity() variant.Identity {
+	return variant.New(v.NoVary, v.Vary, v.RequestHeaders)
 }
 
 // Variants returns every variant stored for url, in stable key order. It does
@@ -223,20 +221,10 @@ func normalizeVariantIdentity(v Variant) (Variant, error) {
 		return Variant{}, fmt.Errorf("%w: empty URL", ErrInvalidVariant)
 	}
 
-	if !v.NoVary {
-		vary := normalizeVary(v.Vary)
-		if len(vary) == 0 || containsString(vary, "*") {
-			v.NoVary = true
-		} else {
-			v.Vary = vary
-			v.RequestHeaders = normalizeRequestHeaders(v.RequestHeaders, vary)
-			return v, nil
-		}
-	}
-
-	v.NoVary = true
-	v.Vary = nil
-	v.RequestHeaders = http.Header{}
+	identity := v.Identity()
+	v.NoVary = identity.NoVary()
+	v.Vary = identity.Vary()
+	v.RequestHeaders = identity.RequestHeaders()
 	return v, nil
 }
 
@@ -258,93 +246,6 @@ func normalizeVariant(v Variant) (Variant, error) {
 	}
 	v.ResponseHeaders = normalizeResponseHeaders(v.ResponseHeaders)
 	return v, nil
-}
-
-func normalizeVary(vary []string) []string {
-	seen := make(map[string]struct{}, len(vary))
-	out := make([]string, 0, len(vary))
-	for _, name := range vary {
-		name = strings.ToLower(strings.TrimSpace(name))
-		if name == "" {
-			continue
-		}
-		if _, dup := seen[name]; dup {
-			continue
-		}
-		seen[name] = struct{}{}
-		out = append(out, name)
-	}
-	sort.Strings(out)
-	return out
-}
-
-func containsString(list []string, want string) bool {
-	for _, s := range list {
-		if s == want {
-			return true
-		}
-	}
-	return false
-}
-
-// matchedValue reads one varied header. Normalised request headers are keyed by
-// lowercase name, so the map is indexed directly: http.Header.Get would
-// canonicalise the name and miss it. The boolean reports presence, which is part
-// of the identity.
-func matchedValue(h http.Header, name string) (string, bool) {
-	values, ok := h[name]
-	if !ok {
-		return "", false
-	}
-	if len(values) == 0 {
-		return "", true
-	}
-	return values[0], true
-}
-
-// normalizeRequestHeaders keeps only the headers Vary selected and reduces each
-// to one value. Header names are case-insensitive, so the lookup must be too:
-// http.Header.Get canonicalises the key it is given and would miss a map built
-// with lowercase names. A header the request did not carry stays absent; one
-// that was present with an empty value stays present with "".
-//
-// The caller's map may contain the same header under different casings. Map
-// iteration is unordered, so entries are merged in sorted original-name order;
-// otherwise the same request could produce different identities on two runs.
-func normalizeRequestHeaders(h http.Header, vary []string) http.Header {
-	type entry struct {
-		name   string
-		values []string
-	}
-	grouped := make(map[string][]entry, len(h))
-	for name, values := range h {
-		key := strings.ToLower(strings.TrimSpace(name))
-		if key == "" {
-			continue
-		}
-		grouped[key] = append(grouped[key], entry{name: name, values: values})
-	}
-
-	out := make(http.Header, len(vary))
-	for _, name := range vary {
-		entries := grouped[name]
-		if len(entries) == 0 {
-			continue
-		}
-		if len(entries) > 1 {
-			sort.Slice(entries, func(i, j int) bool { return entries[i].name < entries[j].name })
-		}
-		var parts []string
-		for _, e := range entries {
-			for _, value := range e.values {
-				if value = strings.TrimSpace(value); value != "" {
-					parts = append(parts, value)
-				}
-			}
-		}
-		out[name] = []string{strings.Join(parts, ", ")}
-	}
-	return out
 }
 
 // hopByHopResponseHeaders are stripped from stored metadata. Connection-named
@@ -424,18 +325,24 @@ func normalizeResponseHeaders(h http.Header) http.Header {
 // variantKey encodes the identity without hashing any field. Every string is
 // length-prefixed, so no value can be confused with a separator. A header's
 // presence is an explicit byte before its value, so absent and present-but-empty
-// are distinct identities.
+// are distinct identities. The byte layout is a storage format: it must not
+// change while rows written by an older relay are still readable.
 func variantKey(v Variant) ([]byte, error) {
-	buf := make([]byte, 0, len(v.URL)+32)
-	buf = appendString(buf, v.URL)
-	if v.NoVary {
+	return encodeVariantKey(v.URL, v.Identity())
+}
+
+func encodeVariantKey(url string, identity variant.Identity) ([]byte, error) {
+	buf := make([]byte, 0, len(url)+32)
+	buf = appendString(buf, url)
+	if identity.NoVary() {
 		buf = append(buf, variantFlagNoVary)
 	} else {
 		buf = append(buf, 0)
-		buf = binary.BigEndian.AppendUint32(buf, uint32(len(v.Vary)))
-		for _, name := range v.Vary {
+		vary := identity.Vary()
+		buf = binary.BigEndian.AppendUint32(buf, uint32(len(vary)))
+		for _, name := range vary {
 			buf = appendString(buf, name)
-			buf = appendMatchedHeader(buf, v.RequestHeaders, name)
+			buf = appendMatchedHeader(buf, identity, name)
 		}
 	}
 	if len(buf) > maxVariantKeySize {
@@ -444,8 +351,8 @@ func variantKey(v Variant) ([]byte, error) {
 	return buf, nil
 }
 
-func appendMatchedHeader(buf []byte, h http.Header, name string) []byte {
-	value, present := matchedValue(h, name)
+func appendMatchedHeader(buf []byte, identity variant.Identity, name string) []byte {
+	value, present := identity.Value(name)
 	if !present {
 		return append(buf, 0)
 	}
@@ -478,10 +385,11 @@ func encodeVariant(v Variant) ([]byte, error) {
 	buf = append(buf, variantEncodingVersion, flags)
 	buf = appendString(buf, v.URL)
 
+	identity := v.Identity()
 	buf = binary.BigEndian.AppendUint32(buf, uint32(len(v.Vary)))
 	for _, name := range v.Vary {
 		buf = appendString(buf, name)
-		buf = appendMatchedHeader(buf, v.RequestHeaders, name)
+		buf = appendMatchedHeader(buf, identity, name)
 	}
 
 	buf = appendHeaderMap(buf, v.ResponseHeaders)

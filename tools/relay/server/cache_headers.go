@@ -183,6 +183,23 @@ func varyContainsStar(values []string) bool {
 	return false
 }
 
+// withoutAcceptEncoding drops the coding from a Vary field list. Accept-Encoding
+// never splits a relay variant or an immutable assembly: the coding describes
+// the stored bytes, not which representation a request wants.
+func withoutAcceptEncoding(vary []string) []string {
+	if len(vary) == 0 {
+		return vary
+	}
+	out := make([]string, 0, len(vary))
+	for _, name := range vary {
+		if strings.EqualFold(name, "accept-encoding") {
+			continue
+		}
+		out = append(out, name)
+	}
+	return out
+}
+
 // persistentVariantLifetime is how long a stored variant of a response that
 // declared X-MDB-Relay: immutable is served without revalidation. The directive
 // is the response's own statement that its bytes cannot change, so the relay

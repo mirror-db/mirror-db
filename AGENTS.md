@@ -1358,7 +1358,10 @@ traffic. `GET`/`HEAD` for the same resource renews the lease.
   10% (max 30 s) deterministic jitter keyed by the task.
 - **Variant identity is preserved.** A normal task stores the URL key plus the
   variant's `Vary`-matched request headers, replays them on the background
-  request, and pins `Accept-Encoding: identity`. A background run is always
+  request, and pins `Accept-Encoding: identity`. The task key is an in-memory
+  codec over the same identity value the cache matches and files, so a header
+  that was absent can never share a lease with one that was present and empty.
+  A background run is always
   `GET`; `HEAD` may create or renew a lease but never becomes the refresh
   method. An ambiguous URL (several matching variants) is left to a real
   request.
@@ -1458,6 +1461,9 @@ content is still fetchable upstream.
   and the URL-variant commit, plus digest-hit and immutable stale-hit delivery.
   `immutable_miss.go` — the `CACHE_LOG_IMMUTABLE_MISS` diagnostic: the operator's
   unmodified expression, candidate extraction and the switch-first log gate.
+  `variant_identity.go` — the relay's adapter over `internal/variant`: build,
+  lookup and cleanup identities, with `Accept-Encoding` excluded from every
+  relay-visible dimension but never from the stored row.
 - `tools/relay/activecache/` — the in-process segment behind that path:
   `manager.go` (key map, acquire/init/fail, entry and byte accounting, idle
   reaper, close/retire), `entry.go` (one assembly, metadata, readers, publish
@@ -1501,11 +1507,16 @@ content is still fetchable upstream.
   Resolve/Delete, capacity + LRU + reconcile + publish windows + disk watermark),
   `index.go` + `index_variant.go` (bbolt:
   sizes, aliases, LRU order, pending deletes, variant rows and their reverse
-  body references, the global variant counter), `variant.go` (variant identity,
-  header normalisation, per-URL/global/row limits, and the `Persistent` flag bit
-  that survives a 304), `backend.go` (local bodies
+  body references, the global variant counter), `variant.go` (the bbolt identity
+  codec over the shared identity value, per-URL/global/row limits, and the
+  `Persistent` flag bit that survives a 304), `backend.go` (local bodies
   and offsets), `s3.go` (RustFS bodies + digest pointers), `prune.go` (dangling
   variant repair).
+- `tools/relay/internal/variant/` — the variant identity domain value: Vary
+  name normalisation, one merged request value per varied header, matching and
+  equality. The hash store's bbolt key and the prefetch scheduler's in-memory
+  task key are separate codecs over it; `Accept-Encoding` exclusion is the
+  relay's adapter policy, not part of the value.
 - `tools/relay/certclient/` — read-only `certmagic.Storage` that snapshots the
   parent's cert-pack hourly. Mutations return `ErrReadOnly`.
 - `tools/relay/certsrv/` — streams the cert-pack tar; skips lock files.

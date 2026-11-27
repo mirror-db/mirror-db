@@ -11,6 +11,8 @@ import (
 	"time"
 
 	bolt "go.etcd.io/bbolt"
+
+	"github.com/mirror-db/mirror-db/tools/relay/internal/variant"
 )
 
 func syntheticVariant(url, encoding string) Variant {
@@ -59,7 +61,7 @@ func forceVariantTotal(t *testing.T, s *Store, n int) {
 }
 
 func hasVariantEncoding(v Variant, encoding string) bool {
-	value, present := matchedValue(v.RequestHeaders, "accept-encoding")
+	value, present := v.Identity().Value("accept-encoding")
 	return present && value == encoding
 }
 
@@ -298,7 +300,7 @@ func TestNormalizeRequestHeadersMergeIsDeterministic(t *testing.T) {
 	}
 	const want = "br, gzip" // sorted original names: ACCEPT-ENCODING before Accept-Encoding
 	for i := 0; i < 50; i++ {
-		got := normalizeRequestHeaders(h, []string{"accept-encoding"})
+		got := variant.New(false, []string{"accept-encoding"}, h).RequestHeaders()
 		if values := got["accept-encoding"]; len(values) != 1 || values[0] != want {
 			t.Fatalf("iteration %d: %v, want %q", i, values, want)
 		}
@@ -319,6 +321,9 @@ func TestNormalizeRequestHeadersMergeIsDeterministic(t *testing.T) {
 		BodySHA256:     hashOf("key body").SHA256,
 		BodySize:       hashOf("key body").Size,
 	})
+	if !first.Identity().Equal(second.Identity()) {
+		t.Fatal("header casing changed the identity")
+	}
 	firstKey, err := variantKey(first)
 	if err != nil {
 		t.Fatal(err)

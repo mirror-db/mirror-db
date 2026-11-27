@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/mirror-db/mirror-db/tools/relay/hashstore"
+	"github.com/mirror-db/mirror-db/tools/relay/internal/variant"
 )
 
 // Metadata prefetch (M3).
@@ -389,7 +390,7 @@ func (p *prefetchScheduler) touchLocked(key string, now time.Time) *prefetchTask
 // hit. It never creates one: a restart has no tasks until a response carrying
 // the directive is seen again.
 func (p *prefetchScheduler) TouchNormalVariant(cacheKey string, v hashstore.Variant, now time.Time) {
-	key := normalTaskKey(cacheKey, v.NoVary, withoutAcceptEncoding(v.Vary), v.RequestHeaders)
+	key := normalTaskKey(cacheKey, relayStoredIdentity(v))
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.closed {
@@ -403,7 +404,8 @@ func (p *prefetchScheduler) TouchNormalVariant(cacheKey string, v hashstore.Vari
 // (for example after a restart, when the variant persisted but the lease did
 // not) and refreshes the next run from the folded variant expiry.
 func (p *prefetchScheduler) ObserveNormalVariant(m Mirror, cacheKey, relPath, clientPath, clientEscapedPath, rawQuery string, v hashstore.Variant, now time.Time, prefetch, noStore bool) bool {
-	key := normalTaskKey(cacheKey, v.NoVary, withoutAcceptEncoding(v.Vary), v.RequestHeaders)
+	identity := relayStoredIdentity(v)
+	key := normalTaskKey(cacheKey, identity)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	defer p.signal()
@@ -429,9 +431,9 @@ func (p *prefetchScheduler) ObserveNormalVariant(m Mirror, cacheKey, relPath, cl
 			clientEscapedPath: clientEscapedPath,
 			rawQuery:          rawQuery,
 			cacheKey:          cacheKey,
-			noVary:            v.NoVary,
-			vary:              withoutAcceptEncoding(v.Vary),
-			requestHeaders:    v.RequestHeaders.Clone(),
+			noVary:            identity.NoVary(),
+			vary:              identity.Vary(),
+			requestHeaders:    identity.RequestHeaders(),
 		}
 		p.tasks[key] = t
 	} else {
@@ -472,8 +474,8 @@ func (p *prefetchScheduler) applyNormalSchedule(t *prefetchTask, v hashstore.Var
 // response. prefetch reports whether this response actually carried the
 // directive; a response without it only renews an existing lease.
 func (p *prefetchScheduler) NoteNormalResponse(m Mirror, cacheKey, relPath, clientPath, clientEscapedPath, rawQuery string, reqHeaders, respHeaders http.Header, directives RelayDirectives, now time.Time, noStore bool) {
-	noVary, vary, matched := responseVariantIdentity(respHeaders, reqHeaders, directives)
-	key := normalTaskKey(cacheKey, noVary, vary, matched)
+	identity := relayResponseIdentity(directives.NoVary, respHeaders.Values("Vary"), reqHeaders)
+	key := normalTaskKey(cacheKey, identity)
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -500,9 +502,9 @@ func (p *prefetchScheduler) NoteNormalResponse(m Mirror, cacheKey, relPath, clie
 			clientEscapedPath: clientEscapedPath,
 			rawQuery:          rawQuery,
 			cacheKey:          cacheKey,
-			noVary:            noVary,
-			vary:              vary,
-			requestHeaders:    matched,
+			noVary:            identity.NoVary(),
+			vary:              identity.Vary(),
+			requestHeaders:    identity.RequestHeaders(),
 			retainUntil:       now.Add(prefetchRetention),
 		}
 		p.tasks[key] = t
@@ -516,7 +518,7 @@ func (p *prefetchScheduler) NoteNormalResponse(m Mirror, cacheKey, relPath, clie
 	if !directives.Prefetch {
 		return
 	}
-	v := hashstore.Variant{NoVary: noVary, Vary: vary, RequestHeaders: matched, ExpiresAt: prefetchExpiry(respHeaders, directives, now)}
+	v := hashstore.Variant{ExpiresAt: prefetchExpiry(respHeaders, directives, now)}
 	p.applyNormalSchedule(t, v, now, noStore)
 }
 
@@ -844,94 +846,32 @@ func (s *Server) withMirrorPolicy(req *http.Request, m Mirror, relPath string) *
 	return req.WithContext(withPolicyDecision(req.Context(), policyDecision{TrafficPolicy: d.TrafficPolicy}))
 }
 
-// responseVariantIdentity derives the same identity the cache store uses for a
-// response, keeping only the request headers named by Vary.
-func responseVariantIdentity(respHeaders, reqHeaders http.Header, directives RelayDirectives) (bool, []string, http.Header) {
-	if directives.NoVary {
-		return true, nil, http.Header{}
-	}
-	if varyContainsStar(respHeaders.Values("Vary")) {
-		return true, nil, http.Header{}
-	}
-	vary := withoutAcceptEncoding(varyNames(respHeaders.Values("Vary")))
-	if len(vary) == 0 {
-		return true, nil, http.Header{}
-	}
-	sort.Strings(vary)
-	return false, vary, selectRequestHeaders(reqHeaders, vary)
-}
-
-func selectRequestHeaders(h http.Header, vary []string) http.Header {
-	type entry struct {
-		name   string
-		values []string
-	}
-	grouped := make(map[string][]entry, len(h))
-	for key, values := range h {
-		name := strings.ToLower(strings.TrimSpace(key))
-		if name == "" {
-			continue
-		}
-		grouped[name] = append(grouped[name], entry{name: key, values: values})
-	}
-
-	out := make(http.Header, len(vary))
-	for _, name := range vary {
-		entries := grouped[strings.ToLower(name)]
-		if len(entries) == 0 {
-			continue
-		}
-		if len(entries) > 1 {
-			sort.Slice(entries, func(i, j int) bool { return entries[i].name < entries[j].name })
-		}
-		var parts []string
-		for _, e := range entries {
-			for _, value := range e.values {
-				if value = strings.TrimSpace(value); value != "" {
-					parts = append(parts, value)
-				}
-			}
-		}
-		out[name] = []string{strings.Join(parts, ", ")}
-	}
-	return out
-}
-
-func normalTaskKey(cacheKey string, noVary bool, vary []string, matched http.Header) string {
+// normalTaskKey is the prefetch scheduler's codec over a variant identity. The
+// shape is in-memory only — a restart starts with no tasks — but it must keep
+// distinguishing every identity the cache distinguishes, including absent from
+// present-but-empty. The "normal" namespace keeps it apart from APT tasks.
+func normalTaskKey(cacheKey string, identity variant.Identity) string {
 	var b strings.Builder
 	b.WriteString("normal\x00")
 	b.WriteString(cacheKey)
-	if noVary {
+	if identity.NoVary() {
 		b.WriteString("\x00nv")
 		return b.String()
 	}
-	for _, name := range withoutAcceptEncoding(vary) {
+	for _, name := range identity.Vary() {
 		b.WriteString("\x00v\x00")
 		b.WriteString(name)
 		b.WriteString("\x00")
-		values, ok := matchedValueLower(matched, name)
-		if !ok {
+		value, present := identity.Value(name)
+		if !present {
 			b.WriteString("-\x00")
 			continue
 		}
 		b.WriteString("=")
-		b.WriteString(values)
+		b.WriteString(value)
 		b.WriteString("\x00")
 	}
 	return b.String()
-}
-
-func matchedValueLower(h http.Header, name string) (string, bool) {
-	for key, values := range h {
-		if !strings.EqualFold(key, name) {
-			continue
-		}
-		if len(values) == 0 {
-			return "", true
-		}
-		return values[0], true
-	}
-	return "", false
 }
 
 func aptTaskKey(mirror string) string {

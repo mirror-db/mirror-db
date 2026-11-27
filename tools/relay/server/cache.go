@@ -198,31 +198,9 @@ func isRelaytestPath(path string) bool {
 func matchingVariants(variants []hashstore.Variant, h http.Header) []hashstore.Variant {
 	out := make([]hashstore.Variant, 0, len(variants))
 	for _, v := range variants {
-		if variantMatches(v, h) {
+		if relayStoredIdentity(v).Matches(h) {
 			out = append(out, v)
 		}
-	}
-	return out
-}
-
-func variantMatches(v hashstore.Variant, h http.Header) bool {
-	if v.NoVary {
-		return true
-	}
-	v.Vary = withoutAcceptEncoding(v.Vary)
-	return v.Matches(h)
-}
-
-func withoutAcceptEncoding(vary []string) []string {
-	if len(vary) == 0 {
-		return vary
-	}
-	out := make([]string, 0, len(vary))
-	for _, name := range vary {
-		if strings.EqualFold(name, "accept-encoding") {
-			continue
-		}
-		out = append(out, name)
 	}
 	return out
 }
@@ -716,26 +694,18 @@ func responseVariantHeaders(h http.Header, directives RelayDirectives) (http.Hea
 }
 
 func buildVariant(key string, stored http.Header, directives RelayDirectives, requestHeaders http.Header, storedAt, expiresAt time.Time, content hashstore.Content) hashstore.Variant {
-	v := hashstore.Variant{
+	identity := relayResponseIdentity(directives.NoVary, stored.Values("Vary"), requestHeaders)
+	return hashstore.Variant{
 		URL:             key,
+		NoVary:          identity.NoVary(),
+		Vary:            identity.Vary(),
+		RequestHeaders:  identity.RequestHeaders(),
 		ResponseHeaders: stored,
 		BodySHA256:      content.SHA256,
 		BodySize:        content.Size,
 		StoredAt:        storedAt,
 		ExpiresAt:       expiresAt,
 	}
-	if directives.NoVary {
-		v.NoVary = true
-		return v
-	}
-	vary := withoutAcceptEncoding(varyNames(stored.Values("Vary")))
-	if len(vary) == 0 {
-		v.NoVary = true
-		return v
-	}
-	v.Vary = vary
-	v.RequestHeaders = requestHeaders.Clone()
-	return v
 }
 
 // commitVariant writes metadata after the response has already been delivered.
@@ -772,59 +742,13 @@ func (s *Server) removeOtherVariants(key string, keep hashstore.Variant) {
 		return
 	}
 	for _, v := range variants {
-		if sameVariantIdentity(v, keep) {
+		if storedVariantIdentity(v).Equal(storedVariantIdentity(keep)) {
 			continue
 		}
 		if err := s.hashStore.DeleteVariant(ctx, v); err != nil && !errors.Is(err, hashstore.ErrClosed) {
 			log.Printf("relay cache: cleanup variant %q: %v", key, err)
 		}
 	}
-}
-
-func sameVariantIdentity(a, b hashstore.Variant) bool {
-	if a.NoVary || b.NoVary {
-		return a.NoVary == b.NoVary
-	}
-	if len(a.Vary) != len(b.Vary) {
-		return false
-	}
-	for _, name := range a.Vary {
-		found := false
-		for _, other := range b.Vary {
-			if !strings.EqualFold(name, other) {
-				continue
-			}
-			found = true
-			if variantHeaderValue(a.RequestHeaders, name) != variantHeaderValue(b.RequestHeaders, other) {
-				return false
-			}
-			break
-		}
-		if !found {
-			return false
-		}
-	}
-	return true
-}
-
-// variantHeaderValue reads a varied request value case-insensitively, using
-// the same normalisation the store applies: trim each value, drop empties, and
-// join multiple values in order. Stored variants use lowercase names while a
-// freshly built one carries canonical names, so a direct map lookup would miss
-// one side.
-func variantHeaderValue(h http.Header, name string) string {
-	var parts []string
-	for key, values := range h {
-		if !strings.EqualFold(key, name) {
-			continue
-		}
-		for _, value := range values {
-			if value = strings.TrimSpace(value); value != "" {
-				parts = append(parts, value)
-			}
-		}
-	}
-	return strings.Join(parts, ", ")
 }
 
 func (s *Server) dropVariant(v hashstore.Variant) {

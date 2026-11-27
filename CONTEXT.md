@@ -284,7 +284,9 @@ with its own status, stored response headers, body digest and freshness. A
 variant identity is the set of normalised request values for the request headers
 the upstream's `Vary` names: variants are compared field by field, so the same
 URL reached with the same normalised values is the same variant, and a URL whose
-upstream sends no `Vary` has exactly one. An upstream may declare the path
+upstream sends no `Vary` has exactly one. A request that did not carry one of
+those headers and one that carried it with an empty value are different
+identities. An upstream may declare the path
 sufficient on its own with the `no-vary` relay directive: then `Vary` does not
 split the URL, `Vary: *` included, and it has one variant. `Accept-Encoding` is
 never one of those fields, even when `Vary` names it. `Content-Encoding` is a
