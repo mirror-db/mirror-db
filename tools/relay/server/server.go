@@ -83,6 +83,12 @@ type Server struct {
 	// a counting sink to measure the count directly.
 	observer responseObservation
 
+	// activeDeliveries counts responses answered by the immutable active path.
+	// It is an internal seam only: it lets a test prove a response really came
+	// from a shared assembly instead of a URL variant that an earlier delivery
+	// published.
+	activeDeliveries atomic.Int64
+
 	// logImmutableMiss enables the diagnostic that reports a resolved request
 	// whose merged policy did not declare immutability although its path carries
 	// a digest-shaped run. Off unless CACHE_LOG_IMMUTABLE_MISS is explicitly true;

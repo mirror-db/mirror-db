@@ -234,9 +234,49 @@ func (s *Server) currentTime() time.Time {
 	return time.Now()
 }
 
-// serveHit answers a request from one fresh variant. It returns false only if
-// the caller should use the ordinary proxy path; definite body loss is
-// converted into a cache miss inside.
+// storedRepresentationSource serves one hash-store body. The store is the only
+// place a complete body lives, so the source is just its digest plus the
+// acquisition calls; everything after that is representation delivery.
+type storedRepresentationSource struct {
+	store  *hashstore.Store
+	digest string
+	size   int64
+	label  string
+}
+
+var _ representationSource = storedRepresentationSource{}
+
+func (s storedRepresentationSource) probe(ctx context.Context) error {
+	_, exists, err := s.store.Stat(ctx, hashstore.SHA256, s.digest)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return hashstore.ErrNotFound
+	}
+	return nil
+}
+
+func (s storedRepresentationSource) open(ctx context.Context) (io.ReadCloser, error) {
+	rc, size, err := s.store.Get(ctx, hashstore.SHA256, s.digest)
+	if err == nil && s.size >= 0 && size != s.size {
+		log.Printf("relay cache: %q stored size %d, body size %d", s.label, s.size, size)
+	}
+	return rc, err
+}
+
+func (s storedRepresentationSource) openSection(ctx context.Context, offset, length int64) (io.ReadCloser, error) {
+	rc, total, err := s.store.Range(ctx, hashstore.SHA256, s.digest, offset)
+	if err == nil && s.size >= 0 && total != s.size {
+		log.Printf("relay cache: %q stored size %d, body size %d", s.label, s.size, total)
+	}
+	return rc, err
+}
+
+// serveHit answers a request from one fresh variant. Coding negotiation and
+// transcoding stay here; conditional, range and full-body semantics belong to
+// deliverRepresentation. It returns false only if the caller should use the
+// ordinary proxy path; definite body loss is converted into a cache miss inside.
 func (s *Server) serveHit(w http.ResponseWriter, r *http.Request, key, path string, v hashstore.Variant) bool {
 	storedCoding, ok := ContentCodingFromHeaders(v.ResponseHeaders)
 	if !ok {
@@ -264,91 +304,74 @@ func (s *Server) serveHit(w http.ResponseWriter, r *http.Request, key, path stri
 	// Conditional evaluation uses the representation that would actually be
 	// delivered. A transcoded delivery has a weak validator, so a strong
 	// If-Match can never match it.
-	conditionHeaders := v.ResponseHeaders
+	validators := v.ResponseHeaders
+	header := representationHeaders(v.ResponseHeaders, v.StoredAt, s.currentTime())
+	acceptRanges := true
 	if transcode {
-		conditionHeaders = v.ResponseHeaders.Clone()
-		if conditionHeaders == nil {
-			conditionHeaders = make(http.Header)
+		validators = v.ResponseHeaders.Clone()
+		if validators == nil {
+			validators = make(http.Header)
 		}
-		ApplyTranscodedResponseHeaders(conditionHeaders, target)
-	}
-	switch evaluatePreconditions(r, conditionHeaders) {
-	case preconditionNotModified:
-		writeNotModified(w, r, s, v, target, transcode)
-		return true
-	case preconditionFailed:
-		w.WriteHeader(http.StatusPreconditionFailed)
-		return true
+		ApplyTranscodedResponseHeaders(validators, target)
+		ApplyTranscodedResponseHeaders(header, target)
+		header.Del("Accept-Ranges")
+		acceptRanges = false
 	}
 
-	hasRange := strings.TrimSpace(r.Header.Get("Range")) != ""
-	// HEAD never evaluates Range and never produces a body, but it must honour
-	// the same transcoding prohibitions as GET.
-	if r.Method == http.MethodHead {
-		if transcode && TranscodingForbidden(v.ResponseHeaders, path) {
-			return false
+	res := deliverRepresentation(w, r, representation{
+		validators:   validators,
+		header:       header,
+		size:         v.BodySize,
+		acceptRanges: acceptRanges,
+		source: storedRepresentationSource{
+			store:  s.hashStore,
+			digest: v.BodySHA256,
+			size:   v.BodySize,
+			label:  key,
+		},
+		// The transcoded body is written by serveTranscoded: this module still
+		// answers conditions and HEAD, but must not open the stored bytes.
+		deferBody: transcode,
+		label:     key,
+	})
+	if res.Delivered {
+		// A multipart failure is logged by the delivery module at the failing
+		// stage; other shapes have no other observer.
+		if !res.Multipart {
+			if err := firstDeliveryError(res); err != nil && r.Context().Err() == nil {
+				log.Printf("relay cache: stream %q: %v", key, err)
+			}
 		}
-		if ok, served := s.ensureBody(w, r, key, path, v); !ok {
-			return served
-		}
-		if transcode {
-			h := s.deliveryHeaders(v)
-			ApplyTranscodedResponseHeaders(h, target)
-			h.Del("Accept-Ranges")
-			copyHeader(w.Header(), h)
-			w.WriteHeader(http.StatusOK)
-			return true
-		}
-		h := s.deliveryHeaders(v)
-		h.Set("Content-Length", fmt.Sprint(v.BodySize))
-		h.Set("Accept-Ranges", "bytes")
-		copyHeader(w.Header(), h)
-		w.WriteHeader(http.StatusOK)
 		return true
 	}
-
-	if transcode {
-		if hasRange {
-			// Slicing a stream that is being decoded and re-encoded would need a
-			// full buffered copy; upstream answers instead.
-			return false
+	if res.Err == nil {
+		// The caller owns the body. A ranged transcoding request reaches
+		// upstream: slicing a stream while decoding it would need a full copy.
+		if transcode && strings.TrimSpace(r.Header.Get("Range")) == "" {
+			return s.serveTranscoded(w, r, v, storedCoding, target)
 		}
-		if TranscodingForbidden(v.ResponseHeaders, path) {
-			return false
-		}
-		return s.serveTranscoded(w, r, v, storedCoding, target)
-	}
-
-	if hasRange {
-		if ok, served := s.ensureBody(w, r, key, path, v); !ok {
-			return served
-		}
-		s.serveRanges(w, r, v)
-		return true
-	}
-
-	rc, size, err := s.hashStore.Get(r.Context(), hashstore.SHA256, v.BodySHA256)
-	if err != nil {
-		if errors.Is(err, hashstore.ErrNotFound) {
-			s.repairMissingVariant(w, r, key, path, v)
-			return true
-		}
-		log.Printf("relay cache: open %q: %v", key, err)
 		return false
 	}
-	defer rc.Close()
-	if size != v.BodySize {
-		log.Printf("relay cache: %q stored size %d, body size %d", key, v.BodySize, size)
+	if errors.Is(res.Err, hashstore.ErrNotFound) {
+		// Any definite body loss, ranged or not, is repaired as a fresh miss:
+		// the client's own Range is forwarded, so a multipart request can never
+		// receive a truncated multipart body built from a vanished entry.
+		s.repairMissingVariant(w, r, key, path, v)
+		return true
 	}
-	h := s.deliveryHeaders(v)
-	h.Set("Content-Length", fmt.Sprint(v.BodySize))
-	h.Set("Accept-Ranges", "bytes")
-	copyHeader(w.Header(), h)
-	w.WriteHeader(http.StatusOK)
-	if _, err := io.Copy(w, rc); err != nil && r.Context().Err() == nil {
-		log.Printf("relay cache: stream %q: %v", key, err)
+	log.Printf("relay cache: open %q: %v", key, res.Err)
+	return false
+}
+
+// firstDeliveryError returns the copy failure worth logging: a source failure
+// is always reported, and a client-side failure is reported too (an ordinary
+// delivery has no other observer). Active callers classify the same fields
+// themselves.
+func firstDeliveryError(res deliveryResult) error {
+	if res.ReadErr != nil {
+		return res.ReadErr
 	}
-	return true
+	return res.ClientErr
 }
 
 // serveStaleDigestHit answers a stale entry from the local store when the
@@ -382,24 +405,6 @@ func (s *Server) serveStaleDigestHit(w http.ResponseWriter, r *http.Request, key
 	return s.serveHit(w, r, key, path, v)
 }
 
-// ensureBody verifies the body behind a variant. A definite loss becomes a
-// cache miss: the stale metadata is dropped and the request is answered from
-// upstream, so served reports that the response has already been written. A
-// transient error is only logged; ok is false and served is false, telling the
-// caller to use the ordinary proxy without rewriting cache state.
-func (s *Server) ensureBody(w http.ResponseWriter, r *http.Request, key, path string, v hashstore.Variant) (ok, served bool) {
-	_, exists, err := s.hashStore.Stat(r.Context(), hashstore.SHA256, v.BodySHA256)
-	if err != nil {
-		log.Printf("relay cache: stat %q: %v", key, err)
-		return false, false
-	}
-	if !exists {
-		s.repairMissingVariant(w, r, key, path, v)
-		return false, true
-	}
-	return true, false
-}
-
 // repairMissingVariant is called when metadata names a body that is definitely
 // gone. It drops the stale metadata and answers the request as a fresh miss.
 func (s *Server) repairMissingVariant(w http.ResponseWriter, r *http.Request, key, path string, v hashstore.Variant) {
@@ -426,7 +431,7 @@ func (s *Server) serveTranscoded(w http.ResponseWriter, r *http.Request, v hashs
 	}
 	defer body.Close()
 
-	h := s.deliveryHeaders(v)
+	h := representationHeaders(v.ResponseHeaders, v.StoredAt, s.currentTime())
 	ApplyTranscodedResponseHeaders(h, to)
 	h.Del("Accept-Ranges")
 	copyHeader(w.Header(), h)
@@ -828,31 +833,6 @@ func (s *Server) dropVariant(v hashstore.Variant) {
 	if err := s.hashStore.DeleteVariant(ctx, v); err != nil && !errors.Is(err, hashstore.ErrClosed) {
 		log.Printf("relay cache: delete variant %q: %v", v.URL, err)
 	}
-}
-
-func (s *Server) deliveryHeaders(v hashstore.Variant) http.Header {
-	h := v.ResponseHeaders.Clone()
-	if h == nil {
-		h = make(http.Header)
-	}
-	h.Del("Content-Length")
-	h.Del("Transfer-Encoding")
-	h.Del("Content-Range")
-	h.Del("Age")
-	h.Del(RelayDirectiveHeader)
-	h.Set("Age", fmt.Sprint(ageSeconds(v.StoredAt, s.currentTime())))
-	return h
-}
-
-func writeNotModified(w http.ResponseWriter, r *http.Request, s *Server, v hashstore.Variant, target ContentCoding, transcode bool) {
-	h := s.deliveryHeaders(v)
-	h.Del("Content-Type")
-	if transcode {
-		ApplyTranscodedResponseHeaders(h, target)
-		h.Del("Accept-Ranges")
-	}
-	copyHeader(w.Header(), h)
-	w.WriteHeader(http.StatusNotModified)
 }
 
 // writeNotModifiedFromHeaders answers 304 from an upstream 200's header set,

@@ -1439,17 +1439,23 @@ content is still fetchable upstream.
   (all JWT-guarded).
 - `tools/relay/server/cache.go` — request-cache chain: lookup, hits,
   revalidation, MISS tee-and-store, metadata commit, ambiguity cleanup, index
-  hash-prediction delivery, and stale digest hits.
+  hash-prediction delivery, and stale digest hits. A hit only negotiates coding
+  (with transcoding kept here) and hands a stored representation to
+  `representation.go`.
   `disposition.go` — the response disposition module: one already-fetched
   response, one disposition (raw / stored / assembled), the pure decision table,
   exactly-once observation, body ownership and the pre-handoff fallback.
   `cache_headers.go` — stored-header selection, freshness, conditional
-  evaluation, request cache directives. `cache_range.go` — single/multipart
-  ranges and `416`. `cache_active.go` — the immutable active path: eligibility,
-  seeding (fetch/first range/metadata), the response-declared first-MISS seed
-  (eligibility, URL-keyed `SetExpectation`, no-recursion fallback), delivery from
-  the shared fragment, the bounded wait for publication and the URL-variant
-  commit, plus digest-hit and immutable stale-hit delivery.
+  evaluation, request cache directives. `representation.go` — the shared
+  representation-delivery module: conditional `304`/`412`, `If-Range`, the Range
+  grammar (`200`/`206` single/multipart/`416`, the 32-range cap) and the headers,
+  framing and `Age` of every shape, over a `representationSource`. The hash store
+  and an active entry differ only in that source; neither caller decides a
+  status. `cache_active.go` — the immutable active path: eligibility, seeding
+  (fetch/first range/metadata), the response-declared first-MISS seed
+  (eligibility, URL-keyed `SetExpectation`, no-recursion fallback), the active
+  byte source, reader-failure classification, the bounded wait for publication
+  and the URL-variant commit, plus digest-hit and immutable stale-hit delivery.
   `immutable_miss.go` — the `CACHE_LOG_IMMUTABLE_MISS` diagnostic: the operator's
   unmodified expression, candidate extraction and the switch-first log gate.
 - `tools/relay/activecache/` — the in-process segment behind that path:

@@ -6,10 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"mime/multipart"
 	"net/http"
-	"net/textproto"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -853,67 +850,87 @@ func (r *notifyingReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// deliverImmutableActive serves a request from an entry that is ready, whether
-// it is complete, partially filled, or already published. Only bytes the tiered
-// cache can actually produce are written; a partial entry is never exposed as a
-// complete body.
+// activeRepresentationSource serves an immutable assembly. It is the only
+// tier-specific part of an active delivery: the tiered entry can serve the
+// complete extent or any section of it, and reports an interval outside its
+// extent as a 416 rather than as a fallback.
+type activeRepresentationSource struct {
+	entry *activecache.Entry
+	size  int64
+}
+
+var _ representationSource = activeRepresentationSource{}
+
+func (s activeRepresentationSource) probe(ctx context.Context) error { return nil }
+
+func (s activeRepresentationSource) open(ctx context.Context) (io.ReadCloser, error) {
+	if s.size >= 0 {
+		return s.entry.ReadSection(ctx, 0, s.size)
+	}
+	// An entry admitted without a declared extent is read whole. It is never
+	// exposed as a complete body before publication, but the source does not
+	// pretend to know its size.
+	return s.entry.Read(ctx)
+}
+
+func (s activeRepresentationSource) openSection(ctx context.Context, offset, length int64) (io.ReadCloser, error) {
+	rc, err := s.entry.ReadSection(ctx, offset, length)
+	if errors.Is(err, tiered.ErrOutOfRange) {
+		return nil, errRangeUnsatisfiable
+	}
+	return rc, err
+}
+
+// deliverImmutableActive serves a GET from an entry that is ready, whether it
+// is complete, partially filled, or already published. HTTP representation
+// semantics come from deliverRepresentation; this function owns only the
+// active tier's body acquisition, its failure classification and its
+// publication follow-up.
 func (s *Server) deliverImmutableActive(w http.ResponseWriter, r *http.Request, key, path string, entry *activecache.Entry, meta activeMetadata) bool {
 	if r.Method != http.MethodGet {
 		return false
 	}
 
-	switch evaluatePreconditions(r, meta.headers) {
-	case preconditionNotModified:
-		writeActiveNotModified(w, meta, s.currentTime())
+	res := deliverRepresentation(w, r, representation{
+		validators:      meta.headers,
+		header:          representationHeaders(meta.headers, meta.storedAt, s.currentTime()),
+		size:            meta.size,
+		acceptRanges:    true,
+		trackCopyErrors: true,
+		source:          activeRepresentationSource{entry: entry, size: meta.size},
+		label:           key,
+	})
+	if res.Delivered {
+		s.activeDeliveries.Add(1)
+		if res.ReadErr != nil {
+			if !res.Multipart && r.Context().Err() == nil {
+				log.Printf("relay active: stream %q: %v", key, res.ReadErr)
+			}
+			if res.ClientErr == nil {
+				// The reader failed, not the client: the entry cannot complete
+				// this object, and a later request must not reuse the hole.
+				failActiveDelivery(entry, res.ReadErr)
+			}
+		}
+		if res.BodyComplete {
+			switch {
+			case res.WholeRepresentation:
+				s.commitActiveAfterDelivery(r, key, entry, meta, true)
+			case res.Multipart:
+				// A partial union never publishes, but the entry may already
+				// have been published by another reader.
+				s.commitActiveAfterDelivery(r, key, entry, meta, false)
+			}
+		}
 		return true
-	case preconditionFailed:
-		w.WriteHeader(http.StatusPreconditionFailed)
-		return true
 	}
-
-	rangeHeader := strings.TrimSpace(r.Header.Get("Range"))
-	if rangeHeader == "" {
-		return s.serveActiveFull(w, r, key, entry, meta)
-	}
-	if value := r.Header.Get("If-Range"); value != "" && !ifRangeMatches(value, meta.headers) {
-		// The validator does not describe this representation: ignore Range and
-		// send the complete body, exactly like a stored variant does.
-		return s.serveActiveFull(w, r, key, entry, meta)
-	}
-	if meta.size < 0 {
-		// A Range cannot be evaluated without a total size. The ordinary chain
-		// forwards the request and lets the upstream decide.
+	if res.Err == nil {
+		// A Range without a declared extent cannot be evaluated here; the
+		// ordinary chain forwards the request.
 		return false
 	}
-	ranges, satisfiable, valid := parseByteRanges(rangeHeader, meta.size)
-	if !valid || len(ranges) > maxMultipartRanges {
-		return s.serveActiveFull(w, r, key, entry, meta)
-	}
-	if !satisfiable {
-		writeActiveUnsatisfiable(w, meta, s.currentTime())
-		return true
-	}
-	if len(ranges) == 1 {
-		return s.serveActiveSingleRange(w, r, key, entry, meta, ranges[0])
-	}
-	return s.serveActiveMultipartRanges(w, r, key, entry, meta, ranges)
-}
-
-// activeResponseWriter remembers whether a delivery stopped because writing to
-// the client failed. A copy error with no write error came from the entry's
-// reader, which is evidence that the assembly is broken; a client disconnect
-// says nothing about the object.
-type activeResponseWriter struct {
-	Writer io.Writer
-	Err    error
-}
-
-func (w *activeResponseWriter) Write(p []byte) (int, error) {
-	n, err := w.Writer.Write(p)
-	if err != nil {
-		w.Err = err
-	}
-	return n, err
+	s.activeReadFailed(r, key, entry, res.Err)
+	return false
 }
 
 // failActiveDelivery fails an entry after a copy error that came from the
@@ -925,139 +942,13 @@ func failActiveDelivery(entry *activecache.Entry, err error) {
 		errors.Is(err, context.DeadlineExceeded) ||
 		errors.Is(err, activecache.ErrClosed) ||
 		errors.Is(err, errActivePartialFirst) ||
+		errors.Is(err, errRangeUnsatisfiable) ||
 		errors.Is(err, tiered.ErrOutOfRange) ||
 		errors.Is(err, tiered.ErrTooManyDownstreams) ||
 		errors.Is(err, tiered.ErrTooManyUpstreams) {
 		return
 	}
 	entry.Fail(err)
-}
-
-func (s *Server) serveActiveFull(w http.ResponseWriter, r *http.Request, key string, entry *activecache.Entry, meta activeMetadata) bool {
-	var (
-		rc  io.ReadCloser
-		err error
-	)
-	if meta.size >= 0 {
-		rc, err = entry.ReadSection(r.Context(), 0, meta.size)
-	} else {
-		rc, err = entry.Read(r.Context())
-	}
-	if err != nil {
-		s.activeReadFailed(r, key, entry, err)
-		return false
-	}
-	defer rc.Close()
-
-	h := activeDeliveryHeaders(meta, s.currentTime())
-	if meta.size >= 0 {
-		h.Set("Content-Length", strconv.FormatInt(meta.size, 10))
-	}
-	h.Set("Accept-Ranges", "bytes")
-	copyHeader(w.Header(), h)
-	w.WriteHeader(http.StatusOK)
-
-	writer := &activeResponseWriter{Writer: w}
-	written, copyErr := io.Copy(writer, rc)
-	if copyErr != nil && r.Context().Err() == nil {
-		log.Printf("relay active: stream %q: %v", key, copyErr)
-	}
-	if copyErr != nil && writer.Err == nil {
-		// The reader failed, not the client: the entry cannot complete this
-		// object, and a later request must not reuse the hole.
-		failActiveDelivery(entry, copyErr)
-	}
-	if copyErr == nil && (meta.size < 0 || written == meta.size) {
-		s.commitActiveAfterDelivery(r, key, entry, meta, true)
-	}
-	return true
-}
-
-func (s *Server) serveActiveSingleRange(w http.ResponseWriter, r *http.Request, key string, entry *activecache.Entry, meta activeMetadata, rng byteRange) bool {
-	rc, err := entry.ReadSection(r.Context(), rng.start, rng.length)
-	if err != nil {
-		if errors.Is(err, tiered.ErrOutOfRange) {
-			writeActiveUnsatisfiable(w, meta, s.currentTime())
-			return true
-		}
-		s.activeReadFailed(r, key, entry, err)
-		return false
-	}
-	defer rc.Close()
-
-	h := activeDeliveryHeaders(meta, s.currentTime())
-	h.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", rng.start, rng.start+rng.length-1, meta.size))
-	h.Set("Content-Length", strconv.FormatInt(rng.length, 10))
-	h.Set("Accept-Ranges", "bytes")
-	copyHeader(w.Header(), h)
-	w.WriteHeader(http.StatusPartialContent)
-
-	writer := &activeResponseWriter{Writer: w}
-	written, copyErr := io.CopyN(writer, rc, rng.length)
-	if copyErr != nil && r.Context().Err() == nil {
-		log.Printf("relay active: stream range %q: %v", key, copyErr)
-	}
-	if copyErr != nil && writer.Err == nil {
-		failActiveDelivery(entry, copyErr)
-	}
-	if copyErr == nil && written == rng.length && rangesCoverAll([]byteRange{rng}, meta.size) {
-		// The range covers the whole object, so publication is guaranteed once
-		// the tiered cache has the bytes. A URL variant is what makes a later
-		// no-digest request local.
-		s.commitActiveAfterDelivery(r, key, entry, meta, true)
-	}
-	return true
-}
-
-func (s *Server) serveActiveMultipartRanges(w http.ResponseWriter, r *http.Request, key string, entry *activecache.Entry, meta activeMetadata, ranges []byteRange) bool {
-	boundary := newBoundary()
-	mw := multipart.NewWriter(w)
-	_ = mw.SetBoundary(boundary)
-
-	h := activeDeliveryHeaders(meta, s.currentTime())
-	h.Set("Content-Type", "multipart/byteranges; boundary="+boundary)
-	h.Del("Content-Length")
-	h.Set("Accept-Ranges", "bytes")
-	copyHeader(w.Header(), h)
-	w.WriteHeader(http.StatusPartialContent)
-
-	contentType := strings.TrimSpace(meta.headers.Get("Content-Type"))
-	if contentType == "" {
-		contentType = "application/octet-stream"
-	}
-
-	for _, rng := range ranges {
-		partHeader := make(textproto.MIMEHeader)
-		partHeader.Set("Content-Type", contentType)
-		partHeader.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", rng.start, rng.start+rng.length-1, meta.size))
-		part, err := mw.CreatePart(partHeader)
-		if err != nil {
-			log.Printf("relay active: multipart %q: %v", key, err)
-			return true
-		}
-		rc, err := entry.ReadSection(r.Context(), rng.start, rng.length)
-		if err != nil {
-			log.Printf("relay active: multipart range %q: %v", key, err)
-			return true
-		}
-		writer := &activeResponseWriter{Writer: part}
-		_, copyErr := io.CopyN(writer, rc, rng.length)
-		_ = rc.Close()
-		if copyErr != nil {
-			log.Printf("relay active: multipart part %q: %v", key, copyErr)
-			if writer.Err == nil {
-				failActiveDelivery(entry, copyErr)
-			}
-			return true
-		}
-	}
-	if err := mw.Close(); err != nil && r.Context().Err() == nil {
-		log.Printf("relay active: multipart close %q: %v", key, err)
-	}
-	// The union of the parts may cover the whole object. Wait for that handoff
-	// before committing a URL variant; a partial union never publishes.
-	s.commitActiveAfterDelivery(r, key, entry, meta, rangesCoverAll(ranges, meta.size))
-	return true
 }
 
 // activeReadFailed records a cache read that failed before any header was
@@ -1070,7 +961,8 @@ func (s *Server) activeReadFailed(r *http.Request, key string, entry *activecach
 	if r.Context().Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return
 	}
-	if errors.Is(err, tiered.ErrOutOfRange) || errors.Is(err, tiered.ErrTooManyDownstreams) ||
+	if errors.Is(err, tiered.ErrOutOfRange) || errors.Is(err, errRangeUnsatisfiable) ||
+		errors.Is(err, tiered.ErrTooManyDownstreams) ||
 		errors.Is(err, tiered.ErrTooManyUpstreams) || errors.Is(err, errActivePartialFirst) {
 		return
 	}
@@ -1230,63 +1122,6 @@ func immutableSyntheticHeaders(path, sha256Hex, sha1Hex string) http.Header {
 		h.Set("Digest", digest)
 	}
 	return h
-}
-
-// activeDeliveryHeaders replays the stored headers a delivery may state and
-// recomputes the ones that describe this response.
-func activeDeliveryHeaders(meta activeMetadata, now time.Time) http.Header {
-	h := meta.headers.Clone()
-	if h == nil {
-		h = make(http.Header)
-	}
-	h.Del("Content-Length")
-	h.Del("Transfer-Encoding")
-	h.Del("Content-Range")
-	h.Del("Age")
-	h.Del(RelayDirectiveHeader)
-	h.Set("Age", fmt.Sprint(ageSeconds(meta.storedAt, now)))
-	return h
-}
-
-func writeActiveNotModified(w http.ResponseWriter, meta activeMetadata, now time.Time) {
-	h := activeDeliveryHeaders(meta, now)
-	h.Del("Content-Type")
-	copyHeader(w.Header(), h)
-	w.WriteHeader(http.StatusNotModified)
-}
-
-func writeActiveUnsatisfiable(w http.ResponseWriter, meta activeMetadata, now time.Time) {
-	h := activeDeliveryHeaders(meta, now)
-	h.Set("Content-Range", fmt.Sprintf("bytes */%d", meta.size))
-	h.Set("Content-Length", "0")
-	h.Set("Accept-Ranges", "bytes")
-	copyHeader(w.Header(), h)
-	w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
-}
-
-// rangesCoverAll reports whether the union of ranges covers [0,size). A single
-// full range and a multipart set that happens to tile the object both publish
-// the complete body, so both may wait for the handoff and write a variant.
-func rangesCoverAll(ranges []byteRange, size int64) bool {
-	if size <= 0 || len(ranges) == 0 {
-		return false
-	}
-	sorted := append([]byteRange(nil), ranges...)
-	sort.Slice(sorted, func(i, j int) bool { return sorted[i].start < sorted[j].start })
-	var covered int64
-	for _, rng := range sorted {
-		if rng.start > covered {
-			return false
-		}
-		end := rng.start + rng.length
-		if end > covered {
-			covered = end
-		}
-		if covered >= size {
-			return true
-		}
-	}
-	return covered >= size
 }
 
 // hasConditionalHeaders reports whether the first request depends on a

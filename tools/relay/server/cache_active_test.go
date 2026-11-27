@@ -1075,6 +1075,17 @@ func TestActiveReadFailureClassification(t *testing.T) {
 		t.Fatalf("partial-plan scheduling error failed the entry: %v", err)
 	}
 
+	// An interval outside the entry's extent is a 416 decision, not a broken
+	// object: neither classifier may fail a healthy entry for it.
+	s.activeReadFailed(req, "classify", entry, errRangeUnsatisfiable)
+	if err := entry.Err(); err != nil {
+		t.Fatalf("unsatisfiable range failed the entry on read: %v", err)
+	}
+	failActiveDelivery(entry, errRangeUnsatisfiable)
+	if err := entry.Err(); err != nil {
+		t.Fatalf("unsatisfiable range failed the entry during delivery: %v", err)
+	}
+
 	s.activeReadFailed(req, "classify", entry, errors.New("dial tcp: connection reset"))
 	if err := entry.Err(); err == nil {
 		t.Fatal("broken upstream body did not fail the entry")
