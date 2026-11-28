@@ -10,6 +10,7 @@ import (
 	"time"
 
 	tiered "github.com/geektr-cloud/go-tiered-cache"
+	digestadapter "github.com/geektr-cloud/go-tiered-cache/adapters/digest"
 	"github.com/mirror-db/mirror-db/tools/relay/hashstore"
 )
 
@@ -224,8 +225,18 @@ func (e *Entry) InitFactory(metadata any, size int64, build func() (tiered.Upstr
 	// The source is filled in only after build runs, so tiered.New cannot pull a
 	// body the caller has not handed over yet.
 	lazy := &lazySource{}
-	st := newEntryStore(e, algo, digest, e.m.adopt, e.m.handoff)
-	pc, err := tiered.New(tiered.Config{Source: lazy, Cache: cache, Store: st})
+	// Each entry owns one pair of digest sinks. They see every accepted byte, so
+	// a complete object arrives at the store handoff already hashed and the
+	// publication does not reread the file (ADR 0019).
+	sha1Sink := newDigestSink(digestadapter.NewSHA1())
+	sha256Sink := newDigestSink(digestadapter.NewSHA256())
+	st := newEntryStore(e, algo, digest, e.m.adopt, e.m.handoff, sha1Sink, sha256Sink)
+	pc, err := tiered.New(tiered.Config{
+		Source:      lazy,
+		Cache:       cache,
+		Store:       st,
+		PrefixSinks: []io.Writer{sha1Sink, sha256Sink},
+	})
 	if err != nil {
 		return fail(fmt.Errorf("activecache: start tiered cache: %w", err))
 	}

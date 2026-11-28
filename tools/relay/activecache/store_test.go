@@ -73,7 +73,7 @@ func TestSharedStoreReadsUseLocalDescriptor(t *testing.T) {
 		Capacity:    8 << 20,
 		MaxEntries:  4,
 		IdleTimeout: time.Minute,
-		adopt:       fake,
+		Adopt:       fake,
 	}
 	m, err := New(cfg)
 	if err != nil {

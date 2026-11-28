@@ -726,7 +726,7 @@ func TestEntryStoreCopyFallbackHonoursWatermark(t *testing.T) {
 		}
 	})
 	e := newEntry(m, "")
-	st := newEntryStore(e, hashstore.SHA256, sha256Hex([]byte("body")), m.adopt, false)
+	st := newEntryStore(e, hashstore.SHA256, sha256Hex([]byte("body")), m.adopt, false, nil, nil)
 	defer func() { _ = st.close() }()
 
 	if _, err := st.Write([]byte("body")); !errors.Is(err, ErrLowDiskSpace) {

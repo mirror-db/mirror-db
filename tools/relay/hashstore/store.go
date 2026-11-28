@@ -110,14 +110,17 @@ type Store struct {
 	// must both finish before the protection is dropped.
 	publishing map[string]int
 
-	// testAfterPublish and testCommitError are test seams and nil in production.
-	// The first runs after a body is published and before its index commit, so a
-	// test can hold a publish inside the reconcile-protected window; it runs
-	// without s.mu, but must not call back into the store. The second can fail a
-	// commit to model an index write failure; it runs with s.mu held, so it must
-	// not call the store either.
+	// testAfterPublish, testCommitError and testDigestRead are test seams and nil
+	// in production. The first runs after a body is published and before its
+	// index commit, so a test can hold a publish inside the reconcile-protected
+	// window; it runs without s.mu, but must not call back into the store. The
+	// second can fail a commit to model an index write failure; it runs with s.mu
+	// held, so it must not call the store either. The third marks a full reread
+	// performed only to compute digests, so a test can distinguish Adopt from
+	// AdoptTrusted without measuring I/O.
 	testAfterPublish func()
 	testCommitError  func() error
+	testDigestRead   func()
 
 	// opMu gates public operations against Close. Operations hold a read lock
 	// and re-check closed; Close flips closed first, then takes the write lock
@@ -209,6 +212,9 @@ func openWith(cfg Config, b backend, reconcile bool) (*Store, error) {
 			lru.WithPressureFunc(func() float64 { return 0 }),
 		),
 	}
+	// Test-only seam; nil in production and copied here so the store never reads
+	// a config struct again.
+	s.testAfterPublish = cfg.TestAfterPublish
 
 	records, err := ix.records()
 	if err != nil {
@@ -379,6 +385,9 @@ func (s *Store) Adopt(ctx context.Context, path string, size int64, expectAlgori
 		return Content{}, err
 	}
 
+	if s.testDigestRead != nil {
+		s.testDigestRead()
+	}
 	f, err := os.Open(src)
 	if err != nil {
 		return Content{}, err
@@ -420,9 +429,88 @@ func (s *Store) Adopt(ctx context.Context, path string, size int64, expectAlgori
 			return Content{}, fmt.Errorf("%w: %s is %s, expected %s", ErrDigestMismatch, algo, got, wantDigest)
 		}
 	}
+	return s.publishAdopted(ctx, src, c)
+}
 
-	// Same publish window as Put: the body becomes visible before its index
-	// record exists, so a concurrent reconcile must not treat it as an orphan.
+// AdoptTrusted publishes a body whose digests the caller already computed,
+// without reading the file again. It is the trusted counterpart of Adopt: the
+// caller hashed these exact bytes while it wrote them (the active cache's
+// PrefixSinks), so the store skips its own verification read.
+//
+// The trust boundary is explicit. A wrong Content is committed under a false
+// address and poisons the local index and a shared bucket; reconcile, LRU and
+// prune then treat the lie as a real body. Only call it from a caller that has
+// established the real SHA-1 and SHA-256 of exactly the bytes at path; anything
+// else must use Adopt.
+//
+// c.SHA1 and c.SHA256 are validated and normalised (hex alphabet and the
+// algorithm's fixed length), and c.Size must be non-negative and within
+// CACHE_MAX_SIZE. path must still be a completed regular file inside the store's
+// temp directory at exactly c.Size. That checks the path, the file mode and the
+// length only: an equal-length rewrite of the same file is not detectable here,
+// which is part of what the trusted contract means. expectAlgorithm may be
+// empty; when set, the matching digest in c must equal it or nothing is published
+// (ErrDigestMismatch) and an existing body is untouched.
+//
+// Everything after validation is the same publish tail Adopt uses: the publish
+// window, the backend put, the index commit, LRU accounting and the shared
+// rollback. Source handling is identical too — a local backend renames path into
+// place, a shared backend uploads and leaves path for the caller.
+func (s *Store) AdoptTrusted(ctx context.Context, path string, c Content, expectAlgorithm Algorithm, expectDigest string) (Content, error) {
+	if !s.enter() {
+		return Content{}, ErrClosed
+	}
+	defer s.leave()
+
+	algo, wantDigest, err := normalizeAdoptExpectation(expectAlgorithm, expectDigest)
+	if err != nil {
+		return Content{}, err
+	}
+	sha256Hex, err := NormalizeDigest(SHA256, c.SHA256)
+	if err != nil {
+		return Content{}, err
+	}
+	sha1Hex, err := NormalizeDigest(SHA1, c.SHA1)
+	if err != nil {
+		return Content{}, err
+	}
+	if c.Size < 0 {
+		return Content{}, fmt.Errorf("%w: negative size %d", ErrInvalidAdopt, c.Size)
+	}
+	if c.Size > s.maxSize {
+		return Content{}, fmt.Errorf("%w: %d bytes > %d", ErrOversized, c.Size, s.maxSize)
+	}
+	if err := ctx.Err(); err != nil {
+		return Content{}, err
+	}
+	// Checked before the source is inspected: a low watermark leaves no side
+	// effect, exactly like Adopt.
+	if err := s.space.Check(); err != nil {
+		return Content{}, err
+	}
+
+	src, err := s.adoptSource(path, c.Size)
+	if err != nil {
+		return Content{}, err
+	}
+	if algo != "" {
+		got := sha256Hex
+		if algo == SHA1 {
+			got = sha1Hex
+		}
+		if got != wantDigest {
+			return Content{}, fmt.Errorf("%w: %s is %s, expected %s", ErrDigestMismatch, algo, got, wantDigest)
+		}
+	}
+	return s.publishAdopted(ctx, src, Content{SHA1: sha1Hex, SHA256: sha256Hex, Size: c.Size})
+}
+
+// publishAdopted is the one publish sequence behind Adopt and AdoptTrusted: the
+// caller has already resolved the source and the real Content. The body becomes
+// visible before its index record exists, so the publish window protects it from
+// a concurrent reconcile or eviction, and a failed commit rolls a shared upload
+// back.
+func (s *Store) publishAdopted(ctx context.Context, src string, c Content) (Content, error) {
 	s.beginPublish(c.SHA256)
 	defer s.endPublish(c.SHA256)
 

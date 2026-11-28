@@ -70,14 +70,20 @@ func (c *scratchCache) Reclaim() error {
 // directly instead of copying it; the copy-based Write/Finalize path remains for
 // tests and for a Store that cannot hand off.
 //
+// When the adopter also accepts precomputed digests and both PrefixSinks saw the
+// whole object, publication uses AdoptTrusted and skips the store's verification
+// read. Every other case keeps Adopt, which recomputes both digests.
+//
 // The tiered core never closes adapters. close is called by Manager.retire after
 // the PassiveCache has stopped.
 type entryStore struct {
-	entry   *Entry
-	adopt   adopter
-	algo    hashstore.Algorithm
-	digest  string
-	handoff bool
+	entry      *Entry
+	adopt      adopter
+	algo       hashstore.Algorithm
+	digest     string
+	handoff    bool
+	sha1Sink   *digestSink
+	sha256Sink *digestSink
 
 	mu        sync.RWMutex
 	temp      *os.File
@@ -94,13 +100,15 @@ var (
 	_ tiered.CacheHandoff = (*entryStore)(nil)
 )
 
-func newEntryStore(e *Entry, algo hashstore.Algorithm, digest string, adopt adopter, handoff bool) *entryStore {
+func newEntryStore(e *Entry, algo hashstore.Algorithm, digest string, adopt adopter, handoff bool, sha1Sink, sha256Sink *digestSink) *entryStore {
 	return &entryStore{
-		entry:   e,
-		adopt:   adopt,
-		algo:    algo,
-		digest:  digest,
-		handoff: handoff,
+		entry:      e,
+		adopt:      adopt,
+		algo:       algo,
+		digest:     digest,
+		handoff:    handoff,
+		sha1Sink:   sha1Sink,
+		sha256Sink: sha256Sink,
 	}
 }
 
@@ -247,7 +255,7 @@ func (s *entryStore) publish(ctx context.Context, path string, size int64) error
 		return err
 	}
 
-	content, err := s.adopt.Adopt(ctx, path, size, s.algo, s.digest)
+	content, err := s.adoptContent(ctx, path, size)
 	if err != nil {
 		_ = file.Close()
 		err = fmt.Errorf("activecache: publish content: %w", err)
@@ -273,6 +281,19 @@ func (s *entryStore) publish(ctx context.Context, path string, size int64) error
 
 	s.entry.m.published(s.entry, content)
 	return nil
+}
+
+// adoptContent publishes the completed body. A store that accepts precomputed
+// digests is used only when both sinks saw exactly the published extent, so a
+// partial prefix can never be committed as the object's digest. Otherwise the
+// file goes through Adopt, which recomputes both digests itself.
+func (s *entryStore) adoptContent(ctx context.Context, path string, size int64) (hashstore.Content, error) {
+	if trusted, ok := s.adopt.(trustedAdopter); ok {
+		if content, ok := assembledContent(s.sha1Sink, s.sha256Sink, size); ok {
+			return trusted.AdoptTrusted(ctx, path, content, s.algo, s.digest)
+		}
+	}
+	return s.adopt.Adopt(ctx, path, size, s.algo, s.digest)
 }
 
 func (s *entryStore) close() error {

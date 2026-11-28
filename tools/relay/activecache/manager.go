@@ -70,10 +70,15 @@ type Config struct {
 	// admitting it would only waste an upstream fetch.
 	MaxBodySize int64
 
-	// diskOptions and adopt are test seams. Production callers cannot set them,
-	// so the real filesystem is always probed and bodies always go to Store.
+	// diskOptions is a test seam. Production callers cannot set it, so the real
+	// filesystem is always probed.
 	diskOptions []diskspace.Option
-	adopt       adopter
+
+	// Adopt overrides the publication destination. It is nil in production, and
+	// the manager then publishes through Store. It exists so a test outside this
+	// package (the HTTP layer) can hold publication open and prove that a
+	// completed response does not wait for it.
+	Adopt adopter
 	// disableHandoff forces the copy-based tiered.Store path in tests.
 	disableHandoff bool
 }
@@ -81,6 +86,17 @@ type Config struct {
 type adopter interface {
 	Adopt(ctx context.Context, path string, size int64, expectAlgorithm hashstore.Algorithm, expectDigest string) (hashstore.Content, error)
 }
+
+// trustedAdopter is the optional capability of an adopter that can publish a
+// body from digests computed while it was assembled, without rereading it. The
+// real *hashstore.Store implements it; a test or older adopter that only has
+// Adopt keeps the verification path.
+type trustedAdopter interface {
+	AdoptTrusted(ctx context.Context, path string, content hashstore.Content, expectAlgorithm hashstore.Algorithm, expectDigest string) (hashstore.Content, error)
+}
+
+// The real store is the one adopter that must keep both capabilities.
+var _ trustedAdopter = (*hashstore.Store)(nil)
 
 // Manager owns the active entries of one process. It is safe for concurrent use.
 type Manager struct {
@@ -129,18 +145,18 @@ func New(cfg Config) (*Manager, error) {
 	if cfg.DiskWaterMark < 0 {
 		return nil, fmt.Errorf("activecache: disk water mark must not be negative, got %d", cfg.DiskWaterMark)
 	}
-	if cfg.adopt == nil {
+	if cfg.Adopt == nil {
 		if cfg.Store == nil {
 			return nil, errors.New("activecache: nil hash store")
 		}
-		cfg.adopt = cfg.Store
+		cfg.Adopt = cfg.Store
 	}
 
 	maxBody := cfg.Capacity
 	if cfg.MaxBodySize > 0 && cfg.MaxBodySize < maxBody {
 		maxBody = cfg.MaxBodySize
 	}
-	if stats, ok := cfg.adopt.(interface{ Stats() hashstore.Stats }); ok {
+	if stats, ok := cfg.Adopt.(interface{ Stats() hashstore.Stats }); ok {
 		if limit := stats.Stats().Capacity; limit > 0 && limit < maxBody {
 			maxBody = limit
 		}
@@ -170,7 +186,7 @@ func New(cfg Config) (*Manager, error) {
 		idleTimeout: cfg.IdleTimeout,
 		reaperEvery: every,
 		space:       diskspace.New(cfg.Dir, cfg.DiskWaterMark, cfg.diskOptions...),
-		adopt:       cfg.adopt,
+		adopt:       cfg.Adopt,
 		handoff:     !cfg.disableHandoff,
 		ctx:         ctx,
 		cancel:      cancel,
