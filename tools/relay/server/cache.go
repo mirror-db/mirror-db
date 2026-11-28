@@ -564,6 +564,12 @@ func storableMetadata(h http.Header, directives RelayDirectives, noVary bool) bo
 // failures (an oversized body, a broken backend) only disable the tee: the
 // client still receives the complete upstream response. A body whose declared
 // length already exceeds the store's per-object budget is not teed at all.
+//
+// The tee's Put and the URL variant commit run in one detached task owned by
+// Server.background: the handler flushes and returns once the client has every
+// byte, and never waits for the store. The task learns from the delivery outcome
+// whether a variant may be written, so a truncated or aborted client response
+// still leaves no metadata naming a body it never received.
 func (s *Server) streamAndStore(w http.ResponseWriter, r *http.Request, resp *http.Response, key string, directives RelayDirectives, old *hashstore.Variant, cleanupAmbiguous bool) {
 	stored, persistent := responseVariantHeaders(resp.Header, directives)
 	storedAt := s.currentTime()
@@ -582,36 +588,99 @@ func (s *Server) streamAndStore(w http.ResponseWriter, r *http.Request, resp *ht
 	budget := s.hashStore.Stats().Capacity
 	storeBody := putSize < 0 || putSize <= budget
 
-	type putResult struct {
-		content hashstore.Content
-		err     error
-	}
-	var resultCh chan putResult
-	var pw *io.PipeWriter
+	var (
+		pw         *io.PipeWriter
+		deliveryCh chan bool
+	)
 	if storeBody {
 		pr, writer := io.Pipe()
 		pw = writer
-		resultCh = make(chan putResult, 1)
+		deliveryCh = make(chan bool, 1)
+		// Captured before returning: the request context is cancelled once the
+		// handler ends, and the request itself must not be read from another
+		// goroutine afterwards.
 		putCtx := context.WithoutCancel(r.Context())
-		go func() {
+		reqHeaders := r.Header.Clone()
+		// stop is closed when Server.Close begins. The task must not wait for a
+		// slow client's last byte during shutdown: Put has already returned, the
+		// pipe is closed, and no variant may be written for a response whose
+		// delivery outcome is unknown.
+		stop := s.background().stopping()
+		if !s.background().start(func() {
 			// Closing the reader is what unblocks a tee write after Put stops
 			// reading (an oversized body or any store error). It must run even if
 			// Put panics.
 			defer pr.Close()
-			result := putResult{}
-			defer func() {
-				if recovered := recover(); recovered != nil {
-					result.err = fmt.Errorf("hashstore Put panic: %v", recovered)
-				}
-				// Buffered, so this send can never wait for the consumer and leave
-				// the stream blocked on a full result channel.
-				resultCh <- result
+			var (
+				content hashstore.Content
+				putErr  error
+			)
+			func() {
+				defer func() {
+					if recovered := recover(); recovered != nil {
+						putErr = fmt.Errorf("hashstore Put panic: %v", recovered)
+					}
+				}()
+				content, putErr = s.hashStore.Put(putCtx, pr, putSize)
 			}()
-			result.content, result.err = s.hashStore.Put(putCtx, pr, putSize)
-		}()
+			// Put may return before the handler wrote the whole body (an
+			// oversized body, a store error). Close the reader now so the next
+			// tee write fails instead of blocking on a pipe nobody reads.
+			_ = pr.Close()
+			select {
+			case delivered := <-deliveryCh:
+				if !delivered {
+					// The body never fully reached the client, so no variant
+					// may name it.
+					return
+				}
+			case <-stop:
+				// Shutdown began while the handler was still writing to its
+				// client. The store work is already over; leave the response to
+				// finish and write no metadata for an unknown delivery outcome.
+				return
+			}
+			if putErr != nil {
+				log.Printf("relay cache: store %q: %v", key, putErr)
+				return
+			}
+			next := buildVariant(key, stored, directives, reqHeaders, storedAt, expiresAt, content)
+			next.Persistent = persistent
+			if err := s.commitVariant(context.Background(), next, old); err != nil {
+				return
+			}
+			if cleanupAmbiguous {
+				s.removeOtherVariants(key, next)
+			}
+		}) {
+			// The server is already closing; the response still reaches the
+			// client, just without a tee.
+			_ = pw.CloseWithError(context.Canceled)
+			_ = pr.Close()
+			pw = nil
+			deliveryCh = nil
+			storeBody = false
+		}
 	} else {
 		log.Printf("relay cache: %q declares %d bytes (budget %d), serving without storing", key, putSize, budget)
 	}
+
+	// The outcome must reach the detached task on every path, including a panic
+	// in the write loop below: a task that never learns the outcome would hold
+	// the server's background drain forever.
+	outcome := false
+	defer func() {
+		if pw != nil {
+			if outcome {
+				_ = pw.Close()
+			} else {
+				_ = pw.CloseWithError(errClientAborted)
+			}
+		}
+		if deliveryCh != nil {
+			deliveryCh <- outcome
+		}
+	}()
 
 	buf := make([]byte, 32*1024)
 	tee := storeBody
@@ -640,42 +709,16 @@ func (s *Server) streamAndStore(w http.ResponseWriter, r *http.Request, resp *ht
 		}
 	}
 
-	if tee {
-		if complete && clientOK {
-			_ = pw.Close()
-		} else {
-			_ = pw.CloseWithError(errClientAborted)
-		}
-	}
 	if complete && clientOK {
 		// The client has every byte; flush now instead of waiting for the store
 		// to finish. A ResponseWriter that cannot flush is fine.
 		_ = http.NewResponseController(w).Flush()
 	}
-	// The body is closed by the disposition module, which owns it across the
-	// store wait; closing here would be the second close.
-	if !storeBody {
-		return
-	}
-	result := <-resultCh
-
-	if !complete || !clientOK {
-		// The body never fully reached the client, so no variant may name it.
-		return
-	}
-	if result.err != nil {
-		log.Printf("relay cache: store %q: %v", key, result.err)
-		return
-	}
-
-	next := buildVariant(key, stored, directives, r.Header, storedAt, expiresAt, result.content)
-	next.Persistent = persistent
-	if err := s.commitVariant(r.Context(), next, old); err != nil {
-		return
-	}
-	if cleanupAmbiguous {
-		s.removeOtherVariants(key, next)
-	}
+	outcome = complete && clientOK
+	// The handler owns the upstream body through the disposition module, which
+	// closes it when this call returns. The detached tee no longer touches it:
+	// it only drains bytes already written into the pipe, and the outcome above
+	// decides whether they may be named.
 }
 
 // responseVariantHeaders returns the header set a stored variant keeps. A

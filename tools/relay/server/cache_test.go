@@ -96,6 +96,13 @@ type cacheServerOptions struct {
 	// separate from the store's watermark so a test can refuse active admission
 	// while the ordinary store still writes.
 	activeDiskWaterMark int64
+	// activeMutate adjusts the active manager configuration before it is
+	// created. It lets a test outside the activecache package inject a blocking
+	// publication adopter.
+	activeMutate func(*activecache.Config)
+	// storeMutate adjusts the hash store configuration before it is opened. It
+	// lets a test hold Put open inside its publish window.
+	storeMutate func(*hashstore.Config)
 }
 
 // newCacheServer builds a Server wired to a content store and a test upstream.
@@ -114,24 +121,32 @@ func newCacheServer(t *testing.T, upstream string, opts cacheServerOptions) (*Se
 	if opts.activeCapacity == 0 {
 		opts.activeCapacity = opts.maxSize
 	}
-	store, err := hashstore.Open(hashstore.Config{
+	storeCfg := hashstore.Config{
 		Dir:      opts.dir,
 		Capacity: 64 << 20,
 		MaxSize:  opts.maxSize,
-	})
+	}
+	if opts.storeMutate != nil {
+		opts.storeMutate(&storeCfg)
+	}
+	store, err := hashstore.Open(storeCfg)
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
 
-	active, err := activecache.New(activecache.Config{
+	activeCfg := activecache.Config{
 		Dir:           opts.dir,
 		Capacity:      opts.activeCapacity,
 		MaxEntries:    64,
 		IdleTimeout:   10 * time.Minute,
 		DiskWaterMark: opts.activeDiskWaterMark,
 		Store:         store,
-	})
+	}
+	if opts.activeMutate != nil {
+		opts.activeMutate(&activeCfg)
+	}
+	active, err := activecache.New(activeCfg)
 	if err != nil {
 		t.Fatalf("open active cache: %v", err)
 	}
@@ -166,6 +181,9 @@ func cacheRequest(s *Server, method, target string, headers map[string]string) *
 	}
 	rec := httptest.NewRecorder()
 	s.handleRequest(rec, req)
+	// Variant commits are detached from the response by design. Tests that
+	// inspect a variant wait for the work here instead of polling.
+	s.background().drain()
 	return rec
 }
 
@@ -176,6 +194,7 @@ func cacheRequestHost(s *Server, method, host, target string, headers map[string
 	}
 	rec := httptest.NewRecorder()
 	s.handleRequest(rec, req)
+	s.background().drain()
 	return rec
 }
 
@@ -1072,6 +1091,8 @@ func TestCacheKeepHTTPSharesTheChain(t *testing.T) {
 	if rec.Code != http.StatusOK || rec.Body.String() != "http" {
 		t.Fatalf("keepHTTP first = %d %q", rec.Code, rec.Body.String())
 	}
+	// The variant commit is detached from the response.
+	s.background().drain()
 	req = httptest.NewRequest(http.MethodGet, "http://relay.example.com/test/keep", nil)
 	rec = httptest.NewRecorder()
 	s.handleRequest(rec, req)

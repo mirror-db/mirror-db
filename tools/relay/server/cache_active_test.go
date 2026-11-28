@@ -940,7 +940,8 @@ func TestActiveUnknownSizeFallsBack(t *testing.T) {
 }
 
 // TestActiveWholeObjectRangePublishesVariant covers a Range that completes the
-// whole object: publication must be awaited and a URL variant written, exactly
+// whole object: publication and a URL variant must follow once the store
+// finishes, exactly
 // like a full GET.
 func TestActiveWholeObjectRangePublishesVariant(t *testing.T) {
 	t.Run("single range", func(t *testing.T) {

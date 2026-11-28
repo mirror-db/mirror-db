@@ -913,13 +913,17 @@ func (s *Server) deliverImmutableActive(w http.ResponseWriter, r *http.Request, 
 			}
 		}
 		if res.BodyComplete {
+			// The client has every byte. Flush what the writer buffered and
+			// return: publication and the URL variant are finished by a detached
+			// task, so the client's EOF never waits for the store.
+			_ = http.NewResponseController(w).Flush()
 			switch {
 			case res.WholeRepresentation:
-				s.commitActiveAfterDelivery(r, key, entry, meta, true)
+				s.commitActiveAfterDelivery(key, entry, meta, true)
 			case res.Multipart:
 				// A partial union never publishes, but the entry may already
 				// have been published by another reader.
-				s.commitActiveAfterDelivery(r, key, entry, meta, false)
+				s.commitActiveAfterDelivery(key, entry, meta, false)
 			}
 		}
 		return true
@@ -976,11 +980,18 @@ func (s *Server) activeReadFailed(r *http.Request, key string, entry *activecach
 	entry.Fail(err)
 }
 
-// commitActiveAfterDelivery waits for (wait) or observes publication, then
-// writes the ordinary URL variant. Nothing is written unless Adopt accepted the
-// complete body at the exact declared size, so a digest mismatch or a failed
-// handoff can never leave metadata naming bytes the store does not have.
-func (s *Server) commitActiveAfterDelivery(r *http.Request, key string, entry *activecache.Entry, meta activeMetadata, wait bool) {
+// commitActiveAfterDelivery writes the ordinary URL variant once the assembly is
+// published. With wait it schedules that work on Server.background, keyed by
+// entry so every concurrent reader of one assembly shares a single waiter; the
+// handler has already flushed and returns immediately. Without wait it keeps the
+// previous observation-only behaviour for a multipart union: a body that was
+// already published may be recorded, nothing is awaited.
+//
+// Nothing is written unless Adopt/AdoptTrusted accepted the complete body at the
+// exact declared size, so a digest mismatch or a failed handoff can never leave
+// metadata naming bytes the store does not have. A publication that fails does
+// not affect the client's response, which is already complete.
+func (s *Server) commitActiveAfterDelivery(key string, entry *activecache.Entry, meta activeMetadata, wait bool) {
 	// The entry's headers describe the response of the request that seeded it.
 	// A joiner on another URL (the same digest under another mirror or
 	// repository) may read the shared bytes, but committing those headers as its
@@ -989,29 +1000,52 @@ func (s *Server) commitActiveAfterDelivery(r *http.Request, key string, entry *a
 	if meta.urlKey != "" && meta.urlKey != key {
 		return
 	}
-	var (
-		content hashstore.Content
-		ok      bool
-	)
-	if wait {
-		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), activePublishTimeout)
-		published, err := entry.WaitPublished(ctx)
-		cancel()
-		if err != nil {
-			if r.Context().Err() == nil &&
-				!errors.Is(err, activecache.ErrCapacity) &&
-				!errors.Is(err, activecache.ErrLowDiskSpace) {
-				log.Printf("relay active: publish %q: %v", key, err)
-			}
-			return
+	if !wait {
+		if content, ok := entry.Content(); ok {
+			s.writeActiveVariant(key, content, meta)
 		}
-		content, ok = published, true
-	} else {
-		content, ok = entry.Content()
-	}
-	if !ok {
 		return
 	}
+	if !s.activeCommits.begin(entry) {
+		// Another reader of this entry already owns its publication waiter.
+		return
+	}
+	if !s.background().start(func() {
+		defer s.activeCommits.finish(entry)
+		// WaitPublished is bounded by activePublishTimeout and settles on
+		// publish, failure, or manager close. The entry remains safe to read
+		// after the handler's reference is released: retirement only marks it
+		// closed and keeps any published Content, and the waiter needs nothing
+		// but the settlement channel and that value.
+		ctx, cancel := context.WithTimeout(context.Background(), activePublishTimeout)
+		defer cancel()
+		content, err := entry.WaitPublished(ctx)
+		if err != nil {
+			logActivePublishFailure(key, err)
+			return
+		}
+		s.writeActiveVariant(key, content, meta)
+	}) {
+		s.activeCommits.finish(entry)
+	}
+}
+
+// logActivePublishFailure reports a publication a completed client response no
+// longer waits for. A shutdown, a capacity refusal and a low watermark are the
+// expected ways for the waiter to end without a body.
+func logActivePublishFailure(key string, err error) {
+	if err == nil ||
+		errors.Is(err, activecache.ErrClosed) ||
+		errors.Is(err, activecache.ErrCapacity) ||
+		errors.Is(err, activecache.ErrLowDiskSpace) ||
+		errors.Is(err, context.Canceled) {
+		return
+	}
+	log.Printf("relay active: publish %q: %v", key, err)
+}
+
+// writeActiveVariant records the URL variant for a published entry.
+func (s *Server) writeActiveVariant(key string, content hashstore.Content, meta activeMetadata) {
 	if meta.size >= 0 && content.Size != meta.size {
 		return
 	}
@@ -1029,7 +1063,7 @@ func (s *Server) commitActiveAfterDelivery(r *http.Request, key string, entry *a
 		ExpiresAt:       meta.expiresAt,
 		Persistent:      meta.persistent,
 	}
-	_ = s.commitVariant(r.Context(), v, nil)
+	_ = s.commitVariant(context.Background(), v, nil)
 }
 
 // serveImmutableDigestHit answers a digest-addressed immutable path from the

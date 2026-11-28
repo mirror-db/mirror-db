@@ -12,6 +12,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -88,6 +89,17 @@ type Server struct {
 	// from a shared assembly instead of a URL variant that an earlier delivery
 	// published.
 	activeDeliveries atomic.Int64
+
+	// bg owns work that outlives a completed response: the ordinary store tee
+	// and the active publication waiter. Close drains it before the hash store
+	// closes. bgOnce keeps a Server built directly in a test usable without an
+	// explicit constructor.
+	bg     *bgTasks
+	bgOnce sync.Once
+
+	// activeCommits deduplicates the publication waiter and URL variant commit
+	// of one active entry across its concurrent readers.
+	activeCommits activeCommitSet
 
 	// logImmutableMiss enables the diagnostic that reports a resolved request
 	// whose merged policy did not declare immutability although its path carries
@@ -457,11 +469,20 @@ func (s *Server) Close() {
 	}
 	// The active segment must stop before the store: its entries publish
 	// through hashstore.Adopt and close local descriptors owned by the store.
+	// Closing it also settles every unfinished entry, which is what wakes the
+	// publication waiters below.
 	if s.active != nil {
 		if err := s.active.Close(); err != nil {
 			log.Printf("active cache close: %v", err)
 		}
 	}
+	// Detached post-delivery work outlives its handler by design, so it must
+	// finish before the store closes: a waiter may commit a variant and a tee
+	// may still be inside Put. The active manager above has already settled the
+	// entries its waiters read, so they return instead of waiting out their
+	// bound. background() is used unconditionally so this read never races a
+	// handler creating the set.
+	s.background().close()
 	if s.hashStore != nil {
 		if err := s.hashStore.Close(); err != nil {
 			log.Printf("hash content store close: %v", err)

@@ -113,6 +113,12 @@ type Config struct {
 	// diskOptions injects the platform probe and recheck cadence in tests.
 	// Production callers cannot set it, so the real filesystem is always probed.
 	diskOptions []diskspace.Option
+
+	// TestAfterPublish is a test seam, nil in production. It runs after a body
+	// is published and before its index commit, so a test outside this package
+	// can hold a Put or Adopt open and prove that a completed client response
+	// does not wait for it. It must not call back into the store.
+	TestAfterPublish func()
 }
 
 // Normalize fills defaults and validates the configuration. It is idempotent:

@@ -113,8 +113,8 @@ func (w *flushRecorder) Flush() {
 	w.ResponseRecorder.Flush()
 }
 
-// C: after the client has every byte, the response is flushed before the
-// handler waits for the store, and the commit still lands.
+// C: after the client has every byte, the response is flushed and the handler
+// returns without waiting for the store; the detached commit still lands.
 func TestCacheMissFlushesBeforeStoreWait(t *testing.T) {
 	up, upSrv := startUpstream(t, func(w http.ResponseWriter, r *http.Request) {
 		writeResponse(w, r, http.StatusOK, "flushed", map[string]string{"Cache-Control": "max-age=3600"})
@@ -130,6 +130,8 @@ func TestCacheMissFlushesBeforeStoreWait(t *testing.T) {
 	if !rec.flushed {
 		t.Fatal("response was not flushed after the last client byte")
 	}
+	// The variant is written by a detached task, so wait for it explicitly.
+	s.background().drain()
 	if rec := cacheRequest(s, http.MethodGet, "/test/flush", nil); rec.Body.String() != "flushed" || up.count() != 1 {
 		t.Fatalf("flush path did not commit the variant: upstream %d", up.count())
 	}
