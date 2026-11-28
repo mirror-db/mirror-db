@@ -365,8 +365,14 @@ describe("AptSnapshot directories", () => {
   });
 
   it("404s a directory that the paths do not define", () => {
-    expect(() => snapshot.readdir("dists/nonexistent/")).toThrow();
-    expect(() => snapshot.readdir("nope")).toThrow();
+    for (const path of ["dists/nonexistent/", "nope"]) {
+      try {
+        snapshot.readdir(path);
+        expect.unreachable("unknown snapshot directories must not be listed");
+      } catch (error) {
+        expect(error).toMatchObject({ name: "WebListError", status: 404 });
+      }
+    }
   });
 });
 

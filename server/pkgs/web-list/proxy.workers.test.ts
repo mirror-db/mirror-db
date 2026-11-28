@@ -240,6 +240,83 @@ describe("WebListProxy — WebDAV", () => {
   });
 });
 
+// ── Listing recognition ─────────────────────────────────────────────────────
+
+describe("WebListProxy — listing recognition", () => {
+  const recognizedEmpty = "<table><tr><th>Name</th><th>Last modified</th><th>Size</th></tr></table>";
+  const unrecognized = "<html><body><h1>Welcome</h1><pre>Sign in to continue.</pre></body></html>";
+  const unrecognizedPages = [
+    { name: "navigation-only bare ul", html: '<ul><li><a href="/login">Sign in</a></li></ul>' },
+    {
+      name: "single-column product table",
+      html: "<table><tr><th>Product Name</th></tr><tr><td>Keyboard</td></tr></table>",
+    },
+  ];
+
+  it("renders a recognized empty HTML listing", async () => {
+    const proxy = makeProxy("https://empty.invalid/", recognizedEmpty);
+    const res = await proxy.fetch(...req("http://localhost/"));
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ rendered: true, count: 0 });
+  });
+
+  it("returns an empty entries array for a recognized empty JSON listing", async () => {
+    const proxy = makeProxy("https://empty.invalid/", recognizedEmpty);
+    const res = await proxy.fetch(...req("http://localhost/?format=json"));
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ path: "", entries: [] });
+  });
+
+  it("answers 502/no-store instead of rendering a successful non-listing page", async () => {
+    const proxy = makeProxy("https://portal.invalid/", unrecognized);
+    for (const path of ["/", "/?format=json"]) {
+      const res = await proxy.fetch(...req(`http://localhost${path}`));
+
+      expect(res.status).toBe(502);
+      expect(res.headers.get("cache-control")).toBe("no-store");
+      expect(await res.text()).toBe("Bad Gateway");
+    }
+  });
+
+  it.each(unrecognizedPages)(
+    "answers 502/no-store for a $name with the default parsers",
+    async ({ html }) => {
+      const proxy = makeProxy("https://portal.invalid/", html);
+      for (const path of ["/", "/?format=json"]) {
+        const res = await proxy.fetch(...req(`http://localhost${path}`));
+
+        expect(res.status).toBe(502);
+        expect(res.headers.get("cache-control")).toBe("no-store");
+        expect(await res.text()).toBe("Bad Gateway");
+      }
+    },
+  );
+
+  it("answers PROPFIND for a recognized empty listing with only itself", async () => {
+    const proxy = makeProxy("https://empty.invalid/", recognizedEmpty);
+    const res = await proxy.fetch(
+      ...req("http://localhost/empty/", "PROPFIND", { depth: "1" }),
+    );
+
+    expect(res.status).toBe(207);
+    const xml = await res.text();
+    expect((xml.match(/<D:response>/g) || []).length).toBe(1);
+    expect(xml).toContain("<D:collection/>");
+  });
+
+  it("answers 502/no-store for PROPFIND on a successful non-listing page", async () => {
+    const proxy = makeProxy("https://portal.invalid/", unrecognized);
+    const res = await proxy.fetch(
+      ...req("http://localhost/dists/", "PROPFIND", { depth: "1" }),
+    );
+
+    expect(res.status).toBe(502);
+    expect(res.headers.get("cache-control")).toBe("no-store");
+  });
+});
+
 // ── Failed listings ─────────────────────────────────────────────────────────
 
 describe("WebListProxy — upstream without a listing", () => {

@@ -509,10 +509,10 @@ Generic proxy for upstream sites that serve Apache/nginx autoindex HTML. Used by
 the APT mirror but reusable for any directory-listing upstream.
 
 - **`WebListFs`** — read-only FS abstraction over an upstream listing site. Uses
-  `cachedfetch` by default. `readdir(rel)` streams HTML through `HTMLRewriter`,
-  extracting `<tr>/<th>/<td>/<a>` into a 2D cell array, guesses column semantics
-  (Name/Last modified/Size) via regex, and cleans values into typed
-  `WebListEntry` objects.
+  `cachedfetch` by default. `readdir(rel)` streams HTML through `HTMLRewriter`
+  and the installed format parsers into typed `WebListEntry` objects. A
+  successful but unrecognized page throws `WebListError` with status 502 rather
+  than masquerading as an empty directory; the proxy answers 502/no-store.
 - **`WebListProxy`** — unified request handler exposing three access modes.
   `fetch(request, rel)` receives the original request and an explicit,
   already-resolved relative path; it never derives that path by stripping a
@@ -526,9 +526,14 @@ the APT mirror but reusable for any directory-listing upstream.
     default handling (APT proxy uses this for existence enforcement + caching).
   - `baseHref` — prefix for `<D:href>` in PROPFIND responses (must match the
     mount point for Windows WebClient compatibility).
-- **`parseListing`** — two-stage: `collectRows` (HTMLRewriter, Workers-only) →
-  `rowsToEntries` (pure, testable in Node). Handles text-chunk deduplication
-  between `<td>` and nested `<a>` via `inAnchor` depth tracking.
+- **`parseListing`** — installs the table, NVIDIA `ul`, legacy `pre` and bare
+  `ul` parsers on one `HTMLRewriter`. The first non-empty result wins; otherwise
+  it returns `[]` when at least one parser recognized its format, or `null` when
+  none did. An empty table needs a Name plus Last modified or Size autoindex
+  header; a bare `ul` has no safe empty-listing signal and is recognized only
+  after yielding a valid non-parent entry. Recognized empty listings render
+  normally in HTML/JSON and PROPFIND contains only the directory itself.
+  `rowsToEntries` and the value cleaners are shared pure helpers, testable in Node.
 - **`webdav.ts`** — hand-crafted RFC 4918 class 1 responses (no XML library
   needed). `propfindResponse`, `optionsResponse`, `methodNotAllowed`.
 

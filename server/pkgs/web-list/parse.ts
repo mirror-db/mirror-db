@@ -9,8 +9,9 @@
  * - Pre (Apache legacy `<pre>` block)
  *
  * All parsers are installed on a single HTMLRewriter; the first to produce
- * results wins. Custom parser sets can be passed to `parseListing` or to
- * `WebListFs` for per-site tuning.
+ * results wins. If no parser produces entries, a recognized format yields an
+ * empty list and an unrecognized page yields `null`. Custom parser sets can be
+ * passed to `parseListing` or to `WebListFs` for per-site tuning.
  *
  * Shared helpers (`guessColumns`, `rowsToEntries`, `cleanName`, etc.) remain
  * exported for use by individual parsers and for unit-testing under Node.
@@ -150,31 +151,6 @@ export function rowsToEntries({ headerRows, dataRows }: ListingRows): WebListEnt
   return entries;
 }
 
-// ── Legacy collectRows (kept for backward compat, delegates to TableParser) ─
-
-/**
- * @deprecated Use `parseListing` with parser factories instead. This function
- * is kept only for tests that inspect raw rows.
- */
-export async function collectRows(input: Response | string): Promise<ListingRows> {
-  if (typeof HTMLRewriter === "undefined") {
-    throw new Error("collectRows requires HTMLRewriter (Workers runtime)");
-  }
-  // Import inline to avoid circular — TableParser imports from this file.
-  const { TableParser } = await import("./parsers/table");
-  const parser = new TableParser();
-  const res = typeof input === "string" ? new Response(input) : input;
-  const rewriter = new HTMLRewriter();
-  parser.install(rewriter);
-  await rewriter.transform(res).arrayBuffer();
-  // Access internal state — TableParser exposes result() but we need raw rows
-  // for backward compat. Use a helper cast.
-  return {
-    headerRows: (parser as any).headerRows ?? [],
-    dataRows: (parser as any).dataRows ?? [],
-  };
-}
-
 // ── Main entry point ────────────────────────────────────────────────────────
 
 /**
@@ -183,11 +159,13 @@ export async function collectRows(input: Response | string): Promise<ListingRows
  *
  * @param input - A Response to stream, or an HTML string.
  * @param parsers - Parser factories to use (default: all known formats).
+ * @returns Entries, an empty list for a recognized empty listing, or `null`
+ * when no parser recognizes the page as a listing.
  */
 export async function parseListing(
   input: Response | string,
   parsers?: WebListParserFactory[],
-): Promise<WebListEntry[]> {
+): Promise<WebListEntry[] | null> {
   if (typeof HTMLRewriter === "undefined") {
     throw new Error("parseListing requires HTMLRewriter (Workers runtime)");
   }
@@ -201,10 +179,13 @@ export async function parseListing(
   const res = typeof input === "string" ? new Response(input) : input;
   await rewriter.transform(res).arrayBuffer();
 
-  // Return results from the first parser that produced entries.
+  // Return results from the first parser that produced entries. Recognition
+  // only distinguishes an empty listing from a page in an unknown format.
+  let recognized = false;
   for (const p of instances) {
     const r = p.result();
     if (r.length > 0) return r;
+    if (p.recognized) recognized = true;
   }
-  return [];
+  return recognized ? [] : null;
 }

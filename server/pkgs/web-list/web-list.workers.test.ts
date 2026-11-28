@@ -7,7 +7,14 @@ import nvidiaHtml from "./__fixtures__/nvidia-cuda-repos.html?raw";
 import releasesUbuntuHtml from "./__fixtures__/releases-ubuntu.html?raw";
 import cdimageUbuntuHtml from "./__fixtures__/cdimage-ubuntu.html?raw";
 import microsoftHtml from "./__fixtures__/packages-microsoft.html?raw";
-import { WebListFs, type WebListEntry } from "./web-list";
+import { parseListing } from "./parse";
+import {
+  createBareUlParser,
+  createPreParser,
+  createTableParser,
+  createUlParser,
+} from "./parsers";
+import { WebListError, WebListFs, type WebListEntry } from "./web-list";
 
 // Runs in the workers pool → real HTMLRewriter. The fetch impl is stubbed so
 // the test is offline + deterministic; only the parsing is under test.
@@ -24,6 +31,125 @@ const fsFor = (base: string, html: string) => {
 
 const byName = (entries: WebListEntry[]) =>
   Object.fromEntries(entries.map((e) => [e.name, e]));
+
+const parserRecognitionCases = [
+  {
+    name: "table",
+    factory: createTableParser,
+    empty: "<table><tr><th>Name</th><th>Last modified</th><th>Size</th></tr></table>",
+    unrecognized: "<table><tr><th>Product Name</th></tr><tr><td>Keyboard</td></tr></table>",
+  },
+  {
+    name: "NVIDIA ul",
+    factory: createUlParser,
+    empty: '<ul class="directorycontents"></ul>',
+    unrecognized: '<ul class="navigation"><li><a href="x">x</a></li></ul>',
+  },
+  {
+    name: "pre",
+    factory: createPreParser,
+    empty: '<pre><a href="?C=N;O=D">Name</a> <a href="?C=M;O=A">Last modified</a> <a href="?C=S;O=A">Size</a></pre>',
+    unrecognized: "<pre>This is introductory text, not a directory listing.</pre>",
+  },
+];
+
+describe.each(parserRecognitionCases)("parseListing — $name recognition", ({
+  factory,
+  empty,
+  unrecognized,
+}) => {
+  it("returns an empty list when its format is recognized but has no entries", async () => {
+    expect(await parseListing(empty, [factory])).toEqual([]);
+  });
+
+  it("returns null when the page is not its listing format", async () => {
+    expect(await parseListing(unrecognized, [factory])).toBeNull();
+  });
+});
+
+describe("parseListing — bare ul recognition", () => {
+  it.each([
+    "<ul></ul>",
+    '<ul><li><a href="/login">Sign in</a></li></ul>',
+    '<ul class="navigation"><li><a href="x">x</a></li></ul>',
+  ])("returns null without a valid non-parent entry: %s", async (html) => {
+    expect(await parseListing(html, [createBareUlParser])).toBeNull();
+  });
+
+  it("recognizes a listing when it yields a valid non-parent entry", async () => {
+    const entries = await parseListing(
+      '<ul><li><a href="release/">release/</a></li></ul>',
+      [createBareUlParser],
+    );
+    expect(entries?.map((entry) => entry.name)).toEqual(["release"]);
+  });
+});
+
+describe("parseListing — result selection", () => {
+  it("keeps the first non-empty parser result ahead of later parsers", async () => {
+    const html = `
+      <pre><a href="from-pre">from-pre</a></pre>
+      <table>
+        <tr><th>Name</th></tr>
+        <tr><td><a href="from-table">from-table</a></td></tr>
+      </table>`;
+
+    const entries = await parseListing(html, [createPreParser, createTableParser]);
+
+    expect(entries?.map((entry) => entry.name)).toEqual(["from-pre"]);
+  });
+
+  it("continues past a recognized empty parser to a later non-empty result", async () => {
+    const html = `
+      <table><tr><th>Name</th><th>Size</th></tr></table>
+      <ul class="directorycontents"><li><span class="file"><a href="from-ul">from-ul</a></span></li></ul>`;
+
+    const entries = await parseListing(html, [createTableParser, createUlParser]);
+
+    expect(entries?.map((entry) => entry.name)).toEqual(["from-ul"]);
+  });
+
+  it("returns null when no parser recognizes a successful HTML page", async () => {
+    const html = "<html><body><h1>Welcome</h1><pre>Sign in to continue.</pre></body></html>";
+    expect(await parseListing(html)).toBeNull();
+  });
+
+  it.each([
+    '<ul><li><a href="/login">Sign in</a></li></ul>',
+    "<table><tr><th>Product Name</th></tr><tr><td>Keyboard</td></tr></table>",
+  ])("rejects an ambiguous non-listing page with the default parsers: %s", async (html) => {
+    expect(await parseListing(html)).toBeNull();
+  });
+
+  it("keeps valid entries from a name-only table", async () => {
+    const html = `
+      <table>
+        <tr><th>Name</th></tr>
+        <tr><td><a href="from-table">from-table</a></td></tr>
+      </table>`;
+    const entries = await parseListing(html, [createTableParser]);
+    expect(entries?.map((entry) => entry.name)).toEqual(["from-table"]);
+  });
+});
+
+describe("WebListFs.readdir — listing recognition", () => {
+  it("turns a successful but unrecognized page into a diagnostic 502", async () => {
+    const { fs } = fsFor(
+      "https://portal.invalid/private/",
+      "<html><body>secret upstream response body</body></html>",
+    );
+
+    const pending = fs.readdir("nested");
+    await expect(pending).rejects.toBeInstanceOf(WebListError);
+    await expect(pending).rejects.toMatchObject({
+      status: 502,
+      message: expect.stringContaining("unrecognized directory listing"),
+    });
+    await expect(pending).rejects.toMatchObject({
+      message: expect.not.stringContaining("secret upstream response body"),
+    });
+  });
+});
 
 describe("WebListFs.readdir — ftp.hk.debian.org/debian", () => {
   it("parses every listing row into a typed entry", async () => {

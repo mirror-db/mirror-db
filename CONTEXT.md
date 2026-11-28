@@ -75,7 +75,11 @@ hop-by-hop headers.
 
 An upstream that answers a directory URL with an autoindex HTML page. A
 browsing mirror over a listing site supports three access modes on the same
-data: HTML, JSON (`?format=json`), and read-only WebDAV.
+data: HTML, JSON (`?format=json`), and read-only WebDAV. A recognized listing
+with no entries is an empty directory; a successful page that cannot be
+recognized as a listing is an upstream failure, not an empty directory. Some
+formats have no safe empty-listing signal, so an ambiguous empty or
+navigation-only page remains unrecognized.
 
 ### Res resource
 

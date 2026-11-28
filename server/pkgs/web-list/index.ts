@@ -9,7 +9,6 @@ export type {
 export { defaultRender } from "./render";
 export {
   parseListing,
-  collectRows,
   rowsToEntries,
   guessColumns,
   cleanName,

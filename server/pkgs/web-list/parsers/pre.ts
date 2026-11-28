@@ -28,6 +28,8 @@ export class PreParser implements WebListParser {
   private inAnchor = false;
   private current: PreEntry | null = null;
   private entries: PreEntry[] = [];
+  private sawHeader = false;
+  private headerTextTail = "";
   /** Trailing text accumulator — text after </a> until next \n or <a>. */
   private trailing = "";
 
@@ -43,6 +45,7 @@ export class PreParser implements WebListParser {
         },
         text: (t) => {
           if (!this.active || this.inAnchor) return;
+          this.noteHeaderText(t.text);
           // Text outside anchors: trailing metadata for the current entry,
           // or inter-entry whitespace. Split by newlines to detect line ends.
           const parts = t.text.split("\n");
@@ -75,11 +78,19 @@ export class PreParser implements WebListParser {
         },
         text: (t) => {
           if (!this.active) return;
+          this.noteHeaderText(t.text);
           if (this.current) {
             this.current.name += t.text;
           }
         },
       });
+  }
+
+  get recognized(): boolean {
+    return this.sawHeader || this.entries.some((entry) => {
+      const name = cleanName(entry.name.trim());
+      return name !== "" && name !== "Parent Directory";
+    });
   }
 
   result(): WebListEntry[] {
@@ -99,6 +110,13 @@ export class PreParser implements WebListParser {
     return results;
   }
 
+  private noteHeaderText(text: string) {
+    if (this.sawHeader) return;
+    const sample = this.headerTextTail + text;
+    this.sawHeader = PRE_HEADER_RE.test(sample);
+    this.headerTextTail = sample.slice(-128);
+  }
+
   private flush() {
     if (this.current) {
       this.current.trailing = this.trailing;
@@ -108,6 +126,9 @@ export class PreParser implements WebListParser {
     this.trailing = "";
   }
 }
+
+/** Apache's legacy header is sufficient evidence even when there are no rows. */
+const PRE_HEADER_RE = /(?:^|\n)\s*Name\s+Last\s+modified\s+Size\b/i;
 
 /** Extract size token from trailing metadata text.
  * Format: `2025-07-31 15:39    -   Description` or `2026-02-12 14:46  594 `

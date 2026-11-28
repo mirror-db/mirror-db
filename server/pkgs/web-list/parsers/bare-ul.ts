@@ -16,8 +16,9 @@ interface BareEntry {
  * ```
  * No date, no size — entries carry only name/href/type.
  *
- * Only activates on `<ul>` elements without a `class` attribute to avoid
- * matching navigational `<ul>` (which always have framework classes).
+ * Only activates on `<ul>` elements without a `class` attribute. The selector
+ * alone is not recognition: an empty or navigation-only list is ambiguous, so
+ * recognition requires at least one valid non-parent entry.
  */
 export class BareUlParser implements WebListParser {
   private entries: BareEntry[] = [];
@@ -28,8 +29,7 @@ export class BareUlParser implements WebListParser {
     rewriter
       .on("ul", {
         element: (el) => {
-          // Only activate on classless <ul> — avoids nav menus and NVIDIA's
-          // `ul.directorycontents` (handled by UlParser).
+          // NVIDIA's `ul.directorycontents` is handled by UlParser.
           if (el.getAttribute("class") != null) return;
           this.active = true;
           el.onEndTag(() => { this.active = false; });
@@ -57,6 +57,10 @@ export class BareUlParser implements WebListParser {
           if (this.current) this.current.name += t.text;
         },
       });
+  }
+
+  get recognized(): boolean {
+    return this.result().length > 0;
   }
 
   result(): WebListEntry[] {

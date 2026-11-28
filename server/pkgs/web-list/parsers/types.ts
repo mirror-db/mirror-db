@@ -11,6 +11,8 @@ import type { WebListEntry } from "../parse";
 export interface WebListParser {
   /** Register element/text handlers on the shared rewriter. */
   install(rewriter: HTMLRewriter): void;
+  /** Whether the page contains enough evidence of this parser's listing format. */
+  readonly recognized: boolean;
   /** Return parsed entries after `.transform().arrayBuffer()` finishes. */
   result(): WebListEntry[];
 }

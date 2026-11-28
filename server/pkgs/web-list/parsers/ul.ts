@@ -34,6 +34,7 @@ interface LiRow {
  */
 export class UlParser implements WebListParser {
   private rows: LiRow[] = [];
+  private matched = false;
   private active = false;
   private liRow: LiRow | null = null;
   private liCell: "name" | "size" | "date" | null = null;
@@ -43,6 +44,7 @@ export class UlParser implements WebListParser {
     rewriter
       .on("ul.directorycontents", {
         element: (el) => {
+          this.matched = true;
           this.active = true;
           el.onEndTag(() => { this.active = false; });
         },
@@ -94,6 +96,10 @@ export class UlParser implements WebListParser {
           }
         },
       });
+  }
+
+  get recognized(): boolean {
+    return this.matched;
   }
 
   result(): WebListEntry[] {

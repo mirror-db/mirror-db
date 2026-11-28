@@ -80,6 +80,13 @@ export class TableParser implements WebListParser {
       });
   }
 
+  get recognized(): boolean {
+    const columns = guessColumns(this.headerRows);
+    const autoindexHeader = columns.name !== -1 &&
+      (columns.lastModified !== -1 || columns.size !== -1);
+    return autoindexHeader || this.result().length > 0;
+  }
+
   result(): WebListEntry[] {
     if (this.headerRows.length === 0 && this.dataRows.length === 0) return [];
     return rowsToEntries({ headerRows: this.headerRows, dataRows: this.dataRows });

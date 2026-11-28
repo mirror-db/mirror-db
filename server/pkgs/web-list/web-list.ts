@@ -92,6 +92,13 @@ export class WebListFs {
     const factories = typeof this.parsers === "function"
       ? this.parsers(dir)
       : this.parsers;
-    return parseListing(res, factories);
+    const entries = await parseListing(res, factories);
+    if (entries === null) {
+      throw new WebListError(
+        `readdir ${dir || "/"}: unrecognized directory listing (HTTP ${res.status})`,
+        502,
+      );
+    }
+    return entries;
   }
 }

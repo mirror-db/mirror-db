@@ -17,7 +17,7 @@ describe("file-tree mirrors", () => {
     }
   });
 
-  it("serves a listing through its own mount prefix", async () => {
+  it("fetches an unrecognized listing through its own mount prefix", async () => {
     const mirror = byName.get("debian-cd")!;
 
     const requested: Request[] = [];
@@ -27,8 +27,8 @@ describe("file-tree mirrors", () => {
         headers: { "content-type": "text/html" },
       });
     });
-    // `parseListing` needs HTMLRewriter; the listing body is not what this test
-    // is about, so a no-op rewriter is enough to reach the upstream fetch.
+    // `parseListing` needs HTMLRewriter; a no-op rewriter matches this empty
+    // body, which is genuinely unrecognized and must not render as a listing.
     class NoopRewriter {
       on() {
         return this;
@@ -56,7 +56,7 @@ describe("file-tree mirrors", () => {
       vi.unstubAllGlobals();
     }
 
-    expect(status).toBe(200);
+    expect(status).toBe(502);
     expect(requested.length).toBeGreaterThan(0);
     expect(requested[0].url).toBe("https://cdimage.debian.org/debian-cd/");
     // Relay host is internal request context, not an upstream request header.
