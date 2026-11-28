@@ -337,12 +337,17 @@ Behaviour:
 
 - A body is stored once, keyed by its real SHA-256, and is readable through
   either digest. SHA-1 is an alias, not a second copy.
-- Two ways in: `Put` copies a reader into `.tmp` while hashing it, and `Adopt`
-  publishes a file another component already wrote in full there. `Adopt`
-  re-reads the file to compute **both** digests, requires a completed regular
-  file of the declared size inside `<CACHE_DIR>/.tmp`, and treats an expected
-  digest as a check — a mismatch publishes nothing. A local store renames the
-  file into `data/`; a shared bucket uploads it.
+- Three ways in: `Put` copies a reader into `.tmp` while hashing it; `Adopt`
+  publishes a file another component already wrote in full there, re-reading it
+  to compute **both** digests; and `AdoptTrusted` publishes the same kind of file
+  without that reread, for a trusted caller that already hashed exactly those
+  bytes. Both adopt paths require a completed regular file of the declared size
+  inside `<CACHE_DIR>/.tmp` and treat an expected digest as a check — a mismatch
+  publishes nothing. `AdoptTrusted` still validates the path, file mode, size and
+  expectation, but a wrong digest would poison the index and a shared bucket, so
+  only the active segment's own digest sinks call it; every untrusted caller uses
+  `Adopt`. A local store renames the file into `data/`; a shared bucket uploads
+  it.
 - `cache.disk_water_mark` stops new local writes (`Put`, `Adopt`, and the active
   segment's admission) when free space on `CACHE_DIR`'s filesystem drops below
   it, re-probing during a large write. Reads, deletes and pruning still work, and
@@ -422,11 +427,14 @@ runs first for every request.
   rule. Its first MISS can still seed the active segment, so such a path gets the
   same assembly instead of paying a plain MISS first (see
   [Immutable active cache](#immutable-active-cache)). The key stays the request
-  URL; the digest is only an Adopt expectation.
+  URL; the digest is only an adopt-path (`Adopt`/`AdoptTrusted`) expectation.
 - **MISS** — the upstream body is streamed to the client while a tee writes
   `<CACHE_DIR>/.tmp` and computes SHA-1 + SHA-256; metadata is committed after a
   complete `200` GET whose bytes reached the client. Only a complete `200` GET
-  creates an entry, so a `HEAD` never leaves a body-less entry behind.
+  creates an entry, so a `HEAD` never leaves a body-less entry behind. The
+  client's EOF does not wait for the store: the tee and the variant commit run
+  detached, and the variant is written only after a complete delivery and a
+  successful `Put`.
 - **Client request cache control** — `Cache-Control: no-store` skips both lookup
   and write; `no-cache` and `max-age=0` force revalidation of a fresh entry
   (`Pragma: no-cache` only when no `Cache-Control` is present).
@@ -474,8 +482,11 @@ segment (ADR 0016), built on `go-tiered-cache`:
   Once published, the entry leaves the active map, the scratch name is reclaimed,
   and readers already streaming keep their open descriptor until they finish.
   LRU and eviction remain the store's.
-- **Variant** — after the delivery that completed the object, the relay writes
-  the normal URL variant, so a later request without a digest capture is local.
+- **Variant** — a completed delivery hands off to one detached task per
+  assembly, which waits for publication (bounded at 60 s) and, only once that
+  succeeded, writes the normal URL variant, so a later request without a digest
+  capture is local. The client's EOF never waits for it, and only a complete
+  object is ever committed.
 - **Limits** — `cache.active_max_entries`, `cache.active_capacity` and
   `cache.active_idle_timeout` bound only new entries; an admitted assembly is
   never truncated. Fragments live in `<CACHE_DIR>/.tmp` and are discarded on
@@ -498,9 +509,10 @@ seeds the same assembly, before the response is written to the client.
   with a full `200` takes the ordinary writable path. A merged policy that
   already matched `immutable` wins and is never re-decided by a response.
 - **Key** — the ordinary URL cache key. The declared digest is never a key; it is
-  passed to `Adopt` as an expectation, and a mismatch publishes nothing and
-  writes no variant while the client still receives its body. SHA-256 is used
-  when both digests are declared; a `206` digest is not an expectation.
+  passed to the adopt path (`Adopt`/`AdoptTrusted`) as an expectation, and a
+  mismatch publishes nothing and writes no variant while the client still
+  receives its body. SHA-256 is used when both digests are declared; a `206`
+  digest is not an expectation.
 - **Persistence** — the committed variant is marked persistent and stores the
   365-day lifetime, while the first response keeps the upstream `Cache-Control`.
   A later `304` keeps the persistent lifetime even when it states `max-age=0` and
@@ -561,7 +573,7 @@ A response-control header the upstream sends to the relay, shaped like
 | `prefetch` | the resource is eligible for background refresh while the relay keeps seeing demand for it; storage and delivery of this response are unchanged |
 | `ttl=<seconds>` | fallback lifetime when the response states none; `0` means none |
 | `immutable` | this response's bytes cannot change: its first MISS may assemble it, and its stored variant is persistent |
-| `sha256=<64 hex>` / `sha1=<40 hex>` | the response body's digest, used only as an `Adopt` expectation — never a cache key, and never a reason to treat the response as immutable |
+| `sha256=<64 hex>` / `sha1=<40 hex>` | the response body's digest, used only as an adopt-path (`Adopt`/`AdoptTrusted`) expectation — never a cache key, and never a reason to treat the response as immutable |
 
 A digest is accepted only at its exact hex length and is normalised to lowercase;
 anything else is ignored as if absent. Two different valid values for the same

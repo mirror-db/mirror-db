@@ -65,15 +65,17 @@ error the HTTP layer turns into the ordinary path.
 
 ### 3. The complete object still goes to the hash store
 
-The tiered cache's `Store` is `hashstore.Adopt`, not a second body store. A
-fragment lives in one scratch file under `<CACHE_DIR>/.tmp`; once the cache covers
-the whole extent it is published into the hash store under its real digest and the
-fragment storage is reclaimed. Nothing durable is added: the hash store remains
-the only place a complete body lives, with the same LRU, capacity, S3 backend and
-`/hash-content` interface as before. A body counts once, under its digest, no
-matter how many URL variants or mounts would have stored it separately.
+The tiered cache's `Store` is the hash store's adopt path (`hashstore.Adopt`,
+or `AdoptTrusted` when the assembly digest is complete — ADR 0019), not a second
+body store. A fragment lives in one scratch file under `<CACHE_DIR>/.tmp`; once
+the cache covers the whole extent it is published into the hash store under its
+real digest and the fragment storage is reclaimed. Nothing durable is added: the
+hash store remains the only place a complete body lives, with the same LRU,
+capacity, S3 backend and `/hash-content` interface as before. A body counts once,
+under its digest, no matter how many URL variants or mounts would have stored it
+separately.
 
-### 4. `Adopt` recomputes both digests and trusts no caller
+### 4. `Adopt` verifies every byte for an untrusted caller
 
 `hashstore.Adopt(ctx, path, size, algo, digest)` validates that `path` is a
 completed regular file (not a symlink) strictly inside the store's temp directory
@@ -84,6 +86,12 @@ body under that digest is untouched. The same publish window as `Put` protects t
 new body from a concurrent reconcile or an LRU eviction that could otherwise
 delete bytes whose index record has not been committed yet; a shared backend rolls
 back its upload only when the caller is the last active publisher with no record.
+
+That verification read is the contract for a source the store did not watch being
+written. [ADR 0019](0019-precomputed-adoption-digests.md) adds a separate
+`AdoptTrusted` for the one caller that hashed the bytes while assembling them;
+`Adopt` itself is unchanged and remains the only entry point for anything else,
+so "trusts no caller" still describes the default path.
 
 ### 5. Two `Store` finalize paths, one publication
 
@@ -96,15 +104,21 @@ back its upload only when the caller is the last active publisher with no record
   through `entryStore.Write` into its own temp file and calls `Finalize`, which
   adopts that file.
 
-Both paths end in the same `Adopt`, so a body is published exactly once and only
-at the exact declared size. Before adoption the entry opens a local descriptor on
-the source; that descriptor stays valid after a local backend renames the file
-into the data tree or after a shared backend leaves the file for the caller, so
-readers that are still streaming do not depend on the scratch name.
+Both paths end in the same publish tail (`publishAdopted` inside the store), so a
+body is published exactly once and only at the exact declared size. Since
+[ADR 0019](0019-precomputed-adoption-digests.md) the active segment also feeds
+both digests from `PrefixSinks` while it caches the object and publishes through
+`AdoptTrusted`, which skips the store's verification read only when both sinks
+saw the whole extent; every other case still takes `Adopt` and its reread. Before
+adoption the entry opens a local descriptor on the source; that descriptor stays
+valid after a local backend renames the file into the data tree or after a shared
+backend leaves the file for the caller, so readers that are still streaming do
+not depend on the scratch name.
 
 ### 6. Publication reclaims the fragment; old readers drain on their own descriptor
 
-On a successful `Adopt` the entry leaves the active map **immediately** — a new
+On a successful publication (`Adopt` or `AdoptTrusted`) the entry leaves the
+active map **immediately** — a new
 request finds the hash store instead of joining an assembly that is already
 finished. Existing readers keep reading their open descriptor until they release.
 The scratch name is then removed (`Reclaim` treats a missing file as success,
@@ -143,8 +157,10 @@ its URL rather than by a declared digest.
   complete `GET` fails too; a failure after the section already produced bytes,
   or a continuation fragment answered `200`, is terminal and never replayed.
 - **Variant commit:** after a delivery that completed the object, the HTTP layer
-  waits (bounded at 60 s) for `Adopt` and writes the ordinary URL variant, so a
-  later request without a digest capture is still served locally.
+  flushes and returns, and a detached per-entry waiter (bounded at 60 s) writes
+  the ordinary URL variant once publication succeeds, so a later request without
+  a digest capture is still served locally. The client's response and its EOF
+  never wait for the store.
 - **Non-immutable requests are untouched.** They never enter the manager and keep
   `streamAndStore` exactly as ADR 0011 defined it.
 
@@ -208,7 +224,8 @@ stage through `<CACHE_DIR>/.tmp`.
 
 ### 11. Local and shared-storage constraints
 
-`Adopt` only accepts a source inside `<CACHE_DIR>/.tmp`, so the active manager
+The adopt path (`Adopt` and `AdoptTrusted` alike) only accepts a source inside
+`<CACHE_DIR>/.tmp`, so the active manager
 must be opened with the same directory as the hash store. A local backend renames
 the adopted file into the content tree (the source path disappears on success); a
 shared backend uploads it and leaves the file for the caller to remove. Readers

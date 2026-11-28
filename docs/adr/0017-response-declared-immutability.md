@@ -101,7 +101,9 @@ object identity before the response arrives.
 `activecache.Entry.SetExpectation` is the safety seam. A creator may set the
 expected algorithm and digest before `Init`; joining readers cannot override it;
 a digest already derived from a digest-shaped key accepts only the same value.
-`Adopt` still recomputes both digests from the file, so a mismatch publishes
+The expectation is compared before publication — by `Adopt`, or by
+`AdoptTrusted` when the assembly's own `PrefixSinks` saw the complete extent
+([ADR 0019](0019-precomputed-adoption-digests.md)) — so a mismatch publishes
 nothing. The client's body is unaffected — it streams from the scratch cache —
 but no hash object and no URL variant is written, and the next request is a
 fresh MISS.

@@ -1093,6 +1093,14 @@ themselves. There is no separate TMP_DIR.
   a concurrent reconcile or LRU eviction from deleting bytes whose index record is
   not committed yet, and a failed commit on a shared backend rolls the upload back
   only if no peer publisher or index record owns it.
+- `AdoptTrusted(path, content, algo, digest)` is the trusted counterpart for the
+  one caller that hashed the bytes while producing them (the active segment's
+  PrefixSinks, ADR 0019): it validates and normalises both digests, requires the
+  same `.tmp` regular file at `content.Size`, compares the expectation before any
+  side effect, then runs the same publish tail as `Adopt` without the verification
+  read. A wrong digest would poison the index and a shared bucket, so only a
+  caller that established the real digests may use it; `Adopt` keeps its full
+  reread for everyone else.
 - `CACHE_MAX_SIZE` is the LRU budget and the largest single body: a strict byte
   LRU over logical body bytes (`google/go-lru`, runtime-pressure eviction
   disabled by a constant-zero pressure func). `CACHE_CAPACITY` is the space the
@@ -1197,11 +1205,15 @@ Decision order (`serveCache`):
    revalidation still reaches upstream.
 5. MISS streams the upstream response into `<CACHE_DIR>/.tmp` via an
    `io.Pipe` while writing the client, computes SHA-1 and SHA-256, and commits
-   metadata under a timeout independent of the client connection. Only a
-   complete `200` GET whose body reached the client becomes an entry. A MISS
-   whose response carries `X-MDB-Relay: immutable` may instead seed the active
-   segment before the client is written (see the response-declared seed below);
-   every refusal delivers that same response through this ordinary tee.
+   metadata under a timeout independent of the client connection. The handler
+   flushes and returns as soon as the client has every byte; the tee's `Put` and
+   the variant commit run in one detached task owned by the server, so an
+   unknown-length (chunked) client response gets its EOF from the handler return
+   instead of waiting for the store. Only a complete `200` GET whose body reached
+   the client becomes an entry. A MISS whose response carries
+   `X-MDB-Relay: immutable` may instead seed the active segment before the client
+   is written (see the response-declared seed below); every refusal delivers that
+   same response through this ordinary tee.
 
 **Content-addressed digests ignore stale metadata.** Before rule 4, a request
 whose path addresses an OCI object by digest (`…/blobs/sha256:<64 hex>` or
@@ -1219,7 +1231,7 @@ digest additionally has to name the stored body.
 **Immutable active path** ([cache_active.go](tools/relay/server/cache_active.go),
 [ADR 0016](docs/adr/0016-tiered-active-cache-for-immutable-objects.md)). Only
 this path diverges from the ordinary chain; a request that does not match
-`immutable` keeps `streamAndStore` unchanged.
+`immutable` uses `streamAndStore`.
 
 - **Eligibility.** Active manager present, merged policy matched `immutable`, no
   client-forced revalidation, client accepts `identity`, and the method is `GET`.
@@ -1282,21 +1294,27 @@ this path diverges from the ordinary chain; a request that does not match
   were already delivered to the section (including a continuation fragment
   answered `200`) keeps the ordinary terminal semantics: it is not replayed from
   byte zero.
-- **Publication.** A complete fragment is published through
-  `hashstore.Adopt`, which validates that the source is a completed regular file
-  inside `<CACHE_DIR>/.tmp` at the declared size and recomputes **both** digests;
-  a captured digest is an expectation, and a mismatch publishes nothing and
-  leaves an existing body untouched. `entryStore` implements both finalize paths:
-  `FinalizeFromCache` adopts the scratch file in place (normal), `Finalize`
-  adopts a copy (fallback when handoff is refused). After publication the entry
-  leaves the active map immediately, the scratch name is reclaimed, and readers
-  that already hold a local descriptor drain on it; the bytes stay accounted
-  until the last reference retires. LRU, capacity and eviction remain the hash
-  store's, unchanged: the active segment only limits how many assemblies run.
-- **Variant.** After a delivery that completed the object the handler waits
-  (bounded at 60 s) for `Adopt` and writes the ordinary URL variant, so a later
-  request without a digest capture is still local. Nothing is written when
-  publication failed or the size disagrees. The committed variant uses the
+- **Publication.** A complete fragment is published through the hash store's
+  adopt path: `hashstore.Adopt`, or `AdoptTrusted` when the adopter supports it
+  and both PrefixSinks saw the whole extent. Either way the source must be a
+  completed regular file inside `<CACHE_DIR>/.tmp` at the declared size, and a
+  captured digest is an expectation whose mismatch publishes nothing and leaves
+  an existing body untouched. `Adopt` recomputes **both** digests; `AdoptTrusted`
+  takes the assembly's digests and skips that reread (ADR 0019), and the entry
+  falls back to `Adopt` whenever a sink's byte count differs from the size.
+  `entryStore` implements both finalize paths: `FinalizeFromCache` adopts the
+  scratch file in place (normal), `Finalize` adopts a copy (fallback when handoff
+  is refused). After publication the entry leaves the active map immediately, the
+  scratch name is reclaimed, and readers that already hold a local descriptor
+  drain on it; the bytes stay accounted until the last reference retires. LRU,
+  capacity and eviction remain the hash store's, unchanged: the active segment
+  only limits how many assemblies run.
+- **Variant.** Publication and the ordinary URL variant are finished by a
+  detached task, one per entry shared by every reader, bounded at 60 s: a
+  delivery that completed the object flushes and returns, and its client EOF
+  never waits for `Adopt`/`AdoptTrusted` or the variant commit. A later request
+  without a digest capture is local once that task succeeds. Nothing is written
+  when publication failed or the size disagrees. The committed variant uses the
   stored header set, not the delivered one: a response that declared
   `immutable` persists the 365-day lifetime and is marked `Persistent`, while the
   first client already received the upstream `Cache-Control`.
@@ -1305,9 +1323,13 @@ this path diverges from the ordinary chain; a request that does not match
   `CACHE_ACTIVE_IDLE_TIMEOUT` (reaper on `StalledTime`) refuse new entries; an
   admitted entry is never truncated. All three, plus the disk watermark, turn
   into the ordinary upstream path.
-- **Close order.** `Server.Close` stops the active manager before the hash store:
-  entries publish through `Adopt` and own descriptors the store manages, so the
-  reverse order could adopt into a closed store.
+- **Close order.** `Server.Close` stops the active manager, then drains the
+  server's detached work (the publication waiters and ordinary store tees), and
+  only then closes the hash store: entries publish through `Adopt` and own
+  descriptors the store manages, closing the manager first settles the waiters,
+  and the store must not close while a waiter may still commit a variant. After
+  a tee's `Put` has returned, it stops waiting for its client's delivery outcome
+  when closing begins, so that wait is no longer extended by a slow client.
 
 Freshness (`freshnessExpiry`): `no-cache` stores but is immediately stale;
 otherwise shared-cache preference `s-maxage` → `max-age` → `Expires` → the
@@ -1513,7 +1535,10 @@ content is still fetchable upstream.
   reaper, close/retire), `entry.go` (one assembly, metadata, readers, publish
   settlement, `SetExpectation` for a URL-keyed entry with a response-declared
   digest), `store.go` (scratch file cache and the `tiered.Store` +
-  `CacheHandoff` that publishes through `hashstore.Adopt`).
+  `CacheHandoff` that publishes through `hashstore.Adopt`, or `AdoptTrusted` when
+  the adopter supports it and both sinks are complete), `digest_sink.go` (the
+  per-entry `PrefixSinks` pair: a lazy SHA-1/SHA-256 hash plus the byte count
+  that gates a trusted publication, ADR 0019).
 - `tools/relay/diskspace/` — `Checker` for one directory: watermark probe,
   throttled mid-write recheck, `ErrLowDiskSpace`; platform probe in
   `probe_linux.go` / `probe_other.go`, degrading to "no watermark" when the probe
@@ -1547,7 +1572,8 @@ content is still fetchable upstream.
   read-only handler (400/404/405 matrix), registered before the proxy catch-all.
 - `tools/relay/prune.go` — `relay prune` cobra command: offline cache cleanup,
   prints counts to stdout, non-zero on any failure.
-- `tools/relay/hashstore/` — content store: `store.go` (Put/Adopt/Get/Range/Stat/
+- `tools/relay/hashstore/` — content store: `store.go`
+  (Put/Adopt/AdoptTrusted/Get/Range/Stat/
   Resolve/Delete, capacity + LRU + reconcile + publish windows + disk watermark),
   `index.go` + `index_variant.go` (bbolt:
   sizes, aliases, LRU order, pending deletes, variant rows and their reverse
@@ -1641,7 +1667,15 @@ lifetime (and `no-store` still disabling it), the two-concurrent-miss contract
 switch (default off, policy miss versus hit, passthrough, no query in the line,
 unresolved mirror silent) plus the candidate scanner's documented boundaries
 (path start/end, 41..63 and runs longer than 64, escaped delimiters, shared
-delimiter, non-ASCII delimiter). Shared-storage unit cases
+delimiter, non-ASCII delimiter). The precomputed-digest round adds
+`AdoptTrusted` (digest format and size validation, expectation mismatch,
+cancelled context, watermark, local rename and `Stats`, shared bucket plus
+pointers, rollback, publish window, idempotence) with a digest-read seam proving
+`Adopt` reads once and `AdoptTrusted` zero times, and the active segment's sink
+path (precomputed digest used on direct handoff, copy fallback and unknown-size
+out-of-order assembly; an adopt-only adopter falls back; a partial read and
+`Manager.Close` publish nothing; a sink byte-count mismatch falls back to
+`Adopt`). Shared-storage unit cases
 use a fake object store; the separate manual Docker RustFS 1.0.6 check is not part
 of CI. CI runs vet + test before building.
 
@@ -1674,8 +1708,9 @@ deployment has been verified.
 ### Build
 
 Go 1.26+ (`google/go-lru` requires it). The immutable active segment uses
-`github.com/geektr-cloud/go-tiered-cache v0.0.1` — its core plus the `adapters/fs`
-and `adapters/http` subpackages — as the only additional runtime module;
+`github.com/geektr-cloud/go-tiered-cache v0.0.2` — its core plus the `adapters/fs`,
+`adapters/http` and `adapters/digest` subpackages (the last feeds the assembly's
+`PrefixSinks`, ADR 0019) — as the only additional runtime module;
 `go.uber.org/goleak` is test-only.
 
 ```bash
