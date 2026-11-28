@@ -1,6 +1,11 @@
 import { MdbCacheName, MdbCacheSizeLimit, MdbRevalidateIntervalMs } from "./const";
 import { buildRequest, ezfetch, mdbfetch } from "./fetch";
-import { parseContentLength, parseRange, STRIP_RESPONSE_HEADERS } from "./http";
+import {
+  parseContentLength,
+  parseRange,
+  sanitizeResponse,
+  STRIP_RESPONSE_HEADERS,
+} from "./http";
 import { waitUntil } from "cloudflare:workers";
 
 export type MdbCache = string | Cache | undefined | Promise<Cache>;
@@ -285,16 +290,18 @@ export type CacheOutcome = "hit" | "revalidated" | "miss" | "bypass";
 export const MDB_CACHE_HEADER = "x-mdb-cache";
 
 /**
- * Strip the manager's bookkeeping headers and record the outcome on the way
- * out — both describe the cache, not the object, so the stored headers never
- * travel to clients while `x-mdb-cache` (which clients and probes *do* want)
- * is added.
+ * Apply the one delivery contract shared by hits, misses and bypasses: strip
+ * unsafe upstream and cache bookkeeping headers, record the outcome, and never
+ * give a HEAD response a body. Mirror-specific cache directives are applied by
+ * the caller afterwards.
  */
 const mark = (
+  req: Request,
   resp: Response,
   outcome: CacheOutcome,
 ): Response => {
-  const headers = new Headers(resp.headers);
+  const sanitized = sanitizeResponse(resp);
+  const headers = new Headers(sanitized.headers);
   headers.delete(MDB_STORED_AT);
   headers.delete(MDB_REVALIDATE_AFTER);
   // Restore the lifetime this mirror chose for clients; the stored copy carries
@@ -305,9 +312,9 @@ const mark = (
     headers.delete(MDB_CLIENT_CACHE_CONTROL);
   }
   headers.set(MDB_CACHE_HEADER, outcome);
-  return new Response(resp.body, {
-    status: resp.status,
-    statusText: resp.statusText,
+  return new Response(req.method === "HEAD" ? null : sanitized.body, {
+    status: sanitized.status,
+    statusText: sanitized.statusText,
     headers,
   });
 };
@@ -327,7 +334,7 @@ async function revalidate(
 ): Promise<Response> {
   if (!ctx.claimRevalidation(req.url)) {
     // Another request is already asking the source; serve what we have.
-    return mark(cached, "hit");
+    return mark(req, cached, "hit");
   }
 
   try {
@@ -345,7 +352,7 @@ async function revalidate(
       res = await mdbfetch(probe);
     } catch {
       // Source unreachable: keep serving the stored copy rather than failing.
-      return mark(cached, "hit");
+      return mark(req, cached, "hit");
     }
 
     if (res.status === 304) {
@@ -356,28 +363,28 @@ async function revalidate(
       });
       restamped.headers.set(MDB_STORED_AT, String(ctx.now()));
       waitUntil(ctx.save(req, restamped.clone()));
-      return mark(restamped, "revalidated");
+      return mark(req, restamped, "revalidated");
     }
 
     // The source answers HEAD inconsistently (405/501): treat the entry as
     // stale and fetch again through the normal path.
     if (res.status === 405 || res.status === 501) {
       await ctx.delete(req);
-      return mark(await mdbfetch(req), "miss");
+      return mark(req, await mdbfetch(req), "miss");
     }
 
     if (res.status === 200) {
       const fresh = await mdbfetch(req);
       if (fresh.ok) waitUntil(ctx.save(req, fresh.clone()));
-      return mark(fresh, "miss");
+      return mark(req, fresh, "miss");
     }
 
     // Gone upstream (404/410) or an error: drop the entry, serve the source.
     await ctx.delete(req);
     if (res.status === 404 || res.status === 410) {
-      return mark(await mdbfetch(req), "miss");
+      return mark(req, await mdbfetch(req), "miss");
     }
-    return mark(cached, "hit");
+    return mark(req, cached, "hit");
   } finally {
     ctx.releaseRevalidation(req.url);
   }
@@ -401,50 +408,61 @@ const liftable = (resp: Response): Response => {
   });
 };
 
-export const cachedfetch = (async (reqInfo, arg2, arg3) => {
-  const req = buildRequest(reqInfo, arg2, arg3);
+/**
+ * Bind the read-through fetch contract to a cache manager. `cachedfetch` below
+ * keeps the production singleton; tests and embedders can supply a
+ * manager without mutating its internals.
+ */
+export function createCachedfetch(
+  manager: MdbCacheManager = mdbCache,
+): typeof ezfetch {
+  return (async (reqInfo, arg2, arg3) => {
+    const req = buildRequest(reqInfo, arg2, arg3);
 
-  // Cache strategy by method:
-  // - GET: full cache (match → fetch → save), with periodic revalidation
-  // - HEAD: match with ignoreMethod (reuse GET cache), no save on miss
-  // - Other methods: bypass cache entirely
+    // Cache strategy by method:
+    // - GET: full cache (match → fetch → save), with periodic revalidation
+    // - HEAD: match with ignoreMethod (reuse GET cache), no save on miss
+    // - Other methods: bypass cache entirely
 
-  if (req.method === "GET") {
-    // Skip cache for range requests — a 206 partial keyed by full URL would
-    // serve incomplete content to subsequent non-range requests.
-    const hasRange = req.headers.has("range");
+    if (req.method === "GET") {
+      // Skip cache for range requests — a 206 partial keyed by full URL would
+      // serve incomplete content to subsequent non-range requests.
+      const hasRange = req.headers.has("range");
 
-    if (!hasRange) {
-      const cached = await mdbCache.match(req);
-      if (cached) {
-        const due = mdbCache.revalidateInterval(cached);
-        if (due === undefined || due > 0) return mark(cached, "hit");
-        return revalidate(req, cached, mdbCache);
+      if (!hasRange) {
+        const cached = await manager.match(req);
+        if (cached) {
+          const due = manager.revalidateInterval(cached);
+          if (due === undefined || due > 0) return mark(req, cached, "hit");
+          return revalidate(req, cached, manager);
+        }
       }
+
+      const resp = await mdbfetch(req);
+
+      // Only cache successful, complete responses.
+      if (resp.ok && !hasRange) {
+        waitUntil(manager.save(req, resp.clone()));
+        // Advertise the same lifetime the stored copy carries, so a client and a
+        // later cache hit see the same value instead of an upstream figure that
+        // disappears after the first request.
+        return mark(req, liftable(resp), "miss");
+      }
+      return mark(req, resp, hasRange ? "bypass" : "miss");
     }
 
-    const resp = await mdbfetch(req);
+    if (req.method === "HEAD") {
+      // Try to reuse GET cache (ignoreMethod allows HEAD to match GET entries)
+      const cached = await manager.match(req, { ignoreMethod: true });
+      if (cached) return mark(req, cached, "hit");
 
-    // Only cache successful, complete responses.
-    if (resp.ok && !hasRange) {
-      waitUntil(mdbCache.save(req, resp.clone()));
-      // Advertise the same lifetime the stored copy carries, so a client and a
-      // later cache hit see the same value instead of an upstream figure that
-      // disappears after the first request.
-      return mark(liftable(resp), "miss");
+      // Miss: fetch directly but don't cache (HEAD responses have no body)
+      return mark(req, await mdbfetch(req), "bypass");
     }
-    return mark(resp, hasRange ? "bypass" : "miss");
-  }
 
-  if (req.method === "HEAD") {
-    // Try to reuse GET cache (ignoreMethod allows HEAD to match GET entries)
-    const cached = await mdbCache.match(req, { ignoreMethod: true });
-    if (cached) return mark(cached, "hit");
+    // Other methods (POST, PUT, etc.): bypass cache entirely
+    return mark(req, await mdbfetch(req), "bypass");
+  }) as typeof ezfetch;
+}
 
-    // Miss: fetch directly but don't cache (HEAD responses have no body)
-    return mark(await mdbfetch(req), "bypass");
-  }
-
-  // Other methods (POST, PUT, etc.): bypass cache entirely
-  return mark(await mdbfetch(req), "bypass");
-}) as typeof ezfetch;
+export const cachedfetch = createCachedfetch();

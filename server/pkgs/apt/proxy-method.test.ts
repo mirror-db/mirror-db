@@ -41,8 +41,9 @@ function makeProxy(hashes: string[] = []): ReturnType<typeof createAptProxy> {
 
 describe("createAptProxy — real ezfetch method forwarding", () => {
   it("sends a pool HEAD upstream as HEAD and returns no body", async () => {
+    // Match the Fetch contract: a HEAD upstream response has no body.
     fetchMock.mockImplementation(async () =>
-      new Response("ignored", { status: 200, headers: { "content-length": "7" } }),
+      new Response(null, { status: 200, headers: { "content-length": "7" } }),
     );
 
     const res = await makeProxy().fetch(

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import debianHtml from "./__fixtures__/cloudflaremirrors-debian.html?raw";
 import ubuntuHtml from "./__fixtures__/nl-archive-ubuntu.html?raw";
@@ -120,6 +120,52 @@ describe("WebListProxy — File passthrough", () => {
     const body = await res.text();
     expect(body).toContain("file-content-of:");
     expect(body).toContain("/README");
+  });
+
+  it("sanitises a file delivered through the default cachedfetch", async () => {
+    const upstream = vi.spyOn(globalThis, "fetch").mockImplementation(async () =>
+      new Response("file", {
+        status: 200,
+        headers: {
+          "www-authenticate": 'Bearer realm="upstream"',
+          "set-cookie": "session=secret",
+          "set-cookie2": "legacy=secret",
+          "x-mdb-relay": "no-store",
+          age: "12",
+          connection: "keep-alive",
+          "keep-alive": "timeout=5",
+          "transfer-encoding": "chunked",
+          "content-length": "4",
+          "x-upstream": "kept",
+          vary: "Accept",
+        },
+      }),
+    );
+    const proxy = new WebListProxy({
+      baseURL: `https://web-list-security.invalid/${Math.random()}/`,
+      render: () => new Response("unused"),
+    });
+
+    try {
+      const res = await proxy.fetch(req("http://localhost/README"));
+      for (const name of [
+        "www-authenticate",
+        "set-cookie",
+        "set-cookie2",
+        "x-mdb-relay",
+        "age",
+        "connection",
+        "keep-alive",
+        "transfer-encoding",
+      ]) {
+        expect(res.headers.has(name), name).toBe(false);
+      }
+      expect(res.headers.get("x-upstream")).toBe("kept");
+      expect(res.headers.get("vary")).toBe("Accept");
+      expect(await res.text()).toBe("file");
+    } finally {
+      upstream.mockRestore();
+    }
   });
 });
 

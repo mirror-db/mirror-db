@@ -369,10 +369,13 @@ through these, not bare `fetch`, so user-agent + rate-limiting are uniform.
   when joining path segments to a base; returns the `Response`.
   `cachedfetch` shares the same overloaded signature.
 - **`cachedfetch`** — `ezfetch` + read-through Cache API via the module-level
-  `mdbCache` (`MdbCacheManager`): cache strategy by method: GET full cache (match
+  `mdbCache` (`MdbCacheManager`); `createCachedfetch(manager)` binds another
+  manager through the public seam. Cache strategy by method: GET full cache (match
   → fetch → save); HEAD match with `ignoreMethod: true` (reuse GET cache), miss
-  fetches directly without save; other methods bypass cache entirely. Guards: only
-  caches 2xx GET, skips Range requests (206 partial would poison full-URL key),
+  fetches directly without save; other methods bypass cache entirely. Every hit,
+  miss, revalidation and bypass goes through the same `sanitizeResponse` delivery
+  step, and every delivered HEAD has a null body with its metadata intact. Guards:
+  only caches 2xx GET, skips Range requests (206 partial would poison full-URL key),
   size ≤ `MdbCacheSizeLimit`, no `content-range`, in-flight write dedup. Used by
   the **APT proxy** ([apt/proxy.ts](server/pkgs/apt/proxy.ts)), `AptRepo`'s
   Release fetch, **`upstreamProxy`**, and PyPI. The **OCI proxy** does *not* use
@@ -408,7 +411,9 @@ through these, not bare `fetch`, so user-agent + rate-limiting are uniform.
   `age`, hop-by-hop; **not** `vary`) from an upstream response before serving to
   clients. `cacheControl` overrides only the cacheability/lifetime directives on
   a 200; `mergeCacheControl` keeps orthogonal ones such as `no-transform`, which
-  the relay must still see. Shared by both OCI and APT proxies.
+  the relay must still see. `cachedfetch` applies the base cleaning on delivery;
+  mirror layers keep it only for a direct `mdbfetch`/`ezfetch` or a specific
+  override such as APT/OCI cache control.
 - Constants in [const.ts](server/pkgs/fetch/const.ts): `CFCacheLimit` (512 MB,
   CF Free/Pro per-object cap) = `MdbCacheSizeLimit`, `MdbMaxConcurrentRequests`,
   `MdbCacheName` (`"upstream"`), `MdbUserAgent`, `MdbRevalidateIntervalMs`
@@ -445,8 +450,8 @@ Composable hook chain for non-OCI mirrors that just need prefix-strip + base-URL
 
 - **`upstreamProxy(upstream)`** — factory returning a `ProxyRequest` pre-wired
   with: `stripPrefix` → `setBaseUrl` → `filterHeaders` (Range + extras) →
-  `standardizeUserAgent` → `followRedirects` → `sanitize` (post). Fetches via
-  `cachedfetch` internally.
+  `standardizeUserAgent` → `followRedirects`. Fetches via `cachedfetch`, which
+  owns response sanitising, so the factory adds no duplicate post-hook.
 - **`Upstream`** interface: `{ url, prefix?, passthroughHeaders? }`.
 - **`ProxyRequest`** class: `.pre(hook)` / `.post(hook)` / `.apply(req)`.
   Pre-hooks transform the outbound Request; post-hooks transform the Response.
@@ -587,7 +592,7 @@ Single path-routed mirror (`/charts/`) hosting many Helm repos, one per entry in
   silently corrupting the served index. FAILSAFE keeps every scalar a string so
   the load → mutate-urls → dump roundtrip is lossless. The relative `res/` path
   makes `helm` pull tarballs back through the mirror.
-- `res/<uuid>/*` responses pass through `sanitizeResponse` (strip
+- `res/<uuid>/*` responses are sanitised by `cachedfetch` (strip
   `set-cookie`/`www-authenticate`/etc.) before serving — chart tarballs come
   from arbitrary CDNs (S3, GitHub). Upstream index fetch failures surface as 502.
 - Routes (under `/charts/<repo>/`): `index.yaml` (rewritten index),

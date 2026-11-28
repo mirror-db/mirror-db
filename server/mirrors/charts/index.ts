@@ -16,7 +16,7 @@
  * Usage: `helm repo add <repo> https://mirs.uk/charts/<repo>`
  */
 
-import { cachedfetch, sanitizeResponse } from "@server/pkgs/fetch";
+import { cachedfetch } from "@server/pkgs/fetch";
 import type { Mirror } from "@server/types";
 
 import { registry } from "./registry";
@@ -86,7 +86,7 @@ export const charts: Mirror = {
         await keeper.waitInitialized();
         const target = keeper.resolveRes(resMatch[1]);
         if (!target) return notFound();
-        return sanitizeResponse(await cachedfetch(target));
+        return cachedfetch(target);
       }
     } catch {
       // Upstream index.yaml unreachable or unparseable.

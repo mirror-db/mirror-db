@@ -52,14 +52,12 @@ export const pypi: Mirror = {
 
     // pypi/* — JSON API
     if (rel.startsWith("pypi/") || rel === "pypi") {
-      const upstream = await cachedfetch(PYPI_ORIGIN, [rel]);
-      return sanitizeResponse(upstream);
+      return cachedfetch(PYPI_ORIGIN, [rel]);
     }
 
     // packages/* — file downloads
     if (rel.startsWith("packages/")) {
-      const upstream = await cachedfetch(FILES_ORIGIN, [rel]);
-      return sanitizeResponse(upstream);
+      return cachedfetch(FILES_ORIGIN, [rel]);
     }
 
     return new Response("Not Found", { status: 404 });
@@ -78,8 +76,8 @@ async function handleSimpleIndex(request?: Request): Promise<Response> {
   }
 
   const res = await cachedfetch(PYPI_ORIGIN, ["simple/"]);
-  if (!res.ok) return sanitizeResponse(res);
-  return rewriteSimpleIndex(sanitizeResponse(res));
+  if (!res.ok) return res;
+  return rewriteSimpleIndex(res);
 }
 
 /**
@@ -122,7 +120,7 @@ function rewriteSimpleIndex(res: Response): Response {
 /** Fetch a package's file list and rewrite file URLs to local `../../packages/`. */
 async function handleSimplePackage(pkg: string): Promise<Response> {
   const res = await cachedfetch(PYPI_ORIGIN, ["simple", `${pkg}/`]);
-  if (!res.ok) return sanitizeResponse(res);
+  if (!res.ok) return res;
 
   const replaceFrom = `${FILES_ORIGIN}/packages/`;
   const replaceTo = "../../packages/";
@@ -135,5 +133,5 @@ async function handleSimplePackage(pkg: string): Promise<Response> {
         el.setAttribute("href", href.replace(replaceFrom, replaceTo));
       },
     })
-    .transform(sanitizeResponse(res));
+    .transform(res);
 }

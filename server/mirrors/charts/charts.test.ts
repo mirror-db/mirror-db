@@ -5,7 +5,6 @@ import { describe, expect, it, vi, beforeEach } from "vitest";
 vi.mock("@server/pkgs/fetch", () => ({
   ezfetch: vi.fn(),
   cachedfetch: vi.fn(),
-  sanitizeResponse: vi.fn((res: Response) => res),
 }));
 
 import { charts } from "./index";

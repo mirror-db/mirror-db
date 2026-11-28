@@ -44,8 +44,8 @@ export function parseContentLength(headersInit?: HeadersInit): number | undefine
 // ── Response sanitization ───────────────────────────────────────────────────
 
 /**
- * Headers stripped from upstream responses before serving to clients. Shared by
- * both OCI and APT proxies.
+ * Headers stripped from upstream responses before serving to clients. Applied
+ * by `cachedfetch` on every delivery and by mirror-specific proxy layers.
  *
  * - `www-authenticate`: never expose auth challenges to anonymous clients.
  * - `set-cookie` / `set-cookie2`: digest-shared cache would replay one client's

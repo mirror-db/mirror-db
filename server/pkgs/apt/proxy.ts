@@ -265,31 +265,14 @@ async function aptFetchHook(
       RELAY_CONTROL_HEADER,
       mergeRelayDirectives(headers.get(RELAY_CONTROL_HEADER), directives),
     );
-    return withoutBodyIfHead(
-      new Response(sanitized.body, {
-        status: sanitized.status,
-        statusText: sanitized.statusText,
-        headers,
-      }),
-      isHead,
-    );
+    return new Response(sanitized.body, {
+      status: sanitized.status,
+      statusText: sanitized.statusText,
+      headers,
+    });
   }
 
-  return withoutBodyIfHead(sanitized, isHead);
-}
-
-/**
- * A HEAD response must carry no body. Upstream already answers HEAD without
- * one, but the read-through cache can serve a stored GET (body included) for a
- * HEAD lookup, so the body is dropped here rather than trusted.
- */
-function withoutBodyIfHead(response: Response, isHead: boolean): Response {
-  if (!isHead || response.body === null) return response;
-  return new Response(null, {
-    status: response.status,
-    statusText: response.statusText,
-    headers: response.headers,
-  });
+  return sanitized;
 }
 
 /** `Cache-Control` derived from how long the source index stays valid. */

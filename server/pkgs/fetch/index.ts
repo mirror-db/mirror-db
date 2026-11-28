@@ -8,6 +8,7 @@ export {
   MdbCacheManager,
   ResolveCache,
   mdbCache,
+  createCachedfetch,
   cachedfetch,
   type MdbCache,
 } from "./cache";

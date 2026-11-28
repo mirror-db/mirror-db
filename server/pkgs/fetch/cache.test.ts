@@ -1,7 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { MdbCacheManager, cachedfetch, liftCacheControl, mdbCache } from "./cache";
-import { mdbfetch } from "./fetch";
+import { withRelayDirectives } from "@server/relay-control";
+
+import { createCachedfetch, MdbCacheManager, liftCacheControl } from "./cache";
 
 // `ResolveCache` does `instanceof Cache`; Node has no such global, so stub it
 // with an empty class that our fake is an instance of.
@@ -34,20 +35,9 @@ class FakeCache extends Cache {
 }
 
 const state = vi.hoisted(() => ({
-  cache: undefined as FakeCache | undefined,
   fetch: vi.fn(),
   now: Date.now(),
 }));
-
-// `cachedfetch` writes through the module-level `mdbCache`; redirect it (and
-// the upstream fetch) into the per-test fakes. The clock is virtual so the
-// max-age → revalidate schedule can be exercised without waiting.
-vi.mock("./cache", async (importOriginal) => {
-  const mod = await importOriginal<typeof import("./cache")>();
-  Object.defineProperty(mod.mdbCache, "cache", { get: () => state.cache });
-  Object.defineProperty(mod.mdbCache, "now", { get: () => () => state.now });
-  return mod;
-});
 
 vi.mock("./fetch", async (importOriginal) => {
   const mod = await importOriginal<typeof import("./fetch")>();
@@ -56,6 +46,20 @@ vi.mock("./fetch", async (importOriginal) => {
 
 const okResponse = () =>
   new Response("body", { status: 200, headers: { "content-length": "4" } });
+
+let cachedfetch: ReturnType<typeof createCachedfetch>;
+
+const dangerousHeaders = {
+  "www-authenticate": 'Bearer realm="upstream"',
+  "set-cookie": "session=secret",
+  "set-cookie2": "legacy=secret",
+  "x-mdb-relay": "no-store",
+  age: "12",
+  connection: "keep-alive",
+  "keep-alive": "timeout=5",
+  "transfer-encoding": "chunked",
+};
+const dangerousNames = Object.keys(dangerousHeaders);
 
 describe("MdbCacheManager", () => {
   let cache: FakeCache;
@@ -93,10 +97,13 @@ describe("cachedfetch", () => {
   let cache: FakeCache;
 
   beforeEach(() => {
-    cache = state.cache = new FakeCache();
+    cache = new FakeCache();
     state.fetch.mockReset();
     state.fetch.mockImplementation(async () => okResponse());
     state.now = Date.now();
+    cachedfetch = createCachedfetch(
+      new MdbCacheManager(cache, undefined, () => state.now),
+    );
   });
 
   it("caches 2xx GET responses", async () => {
@@ -112,25 +119,109 @@ describe("cachedfetch", () => {
     expect(state.fetch).not.toHaveBeenCalled();
   });
 
-  it("skips cache lookup and save for range requests", async () => {
+  it("sanitises a cold miss and its later hit identically", async () => {
+    const url = "https://x.com/sanitised-hit";
+    state.fetch.mockImplementation(async () =>
+      new Response("body", {
+        status: 200,
+        headers: {
+          ...dangerousHeaders,
+          "content-length": "4",
+          "content-type": "text/plain",
+          "cache-control": "public, max-age=60, no-transform",
+          etag: '"same"',
+          "x-upstream": "kept",
+        },
+      }),
+    );
+
+    const miss = await cachedfetch(url);
+    await vi.waitFor(() => expect(cache.entries.has(url)).toBe(true));
+    const hit = await cachedfetch(url);
+
+    expect(miss.headers.get("x-mdb-cache")).toBe("miss");
+    expect(hit.headers.get("x-mdb-cache")).toBe("hit");
+    for (const response of [miss, hit]) {
+      for (const name of dangerousNames) {
+        expect(response.headers.has(name), name).toBe(false);
+      }
+      expect(response.headers.get("content-type")).toBe("text/plain");
+      expect(response.headers.get("etag")).toBe('"same"');
+      expect(response.headers.get("x-upstream")).toBe("kept");
+      expect(response.headers.get("cache-control")).toBe(
+        "public, max-age=600, no-transform",
+      );
+    }
+    expect(await miss.text()).toBe("body");
+    expect(await hit.text()).toBe("body");
+    expect(state.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("lets mirror-owned relay directives be added after delivery", async () => {
+    state.fetch.mockImplementation(async () =>
+      new Response("body", {
+        headers: { "content-length": "4", "x-mdb-relay": "no-store" },
+      }),
+    );
+
+    const delivered = await cachedfetch("https://x.com/mirror-directive");
+    expect(delivered.headers.has("x-mdb-relay")).toBe(false);
+
+    const mirrorResponse = withRelayDirectives(delivered, ["no-vary"]);
+    expect(mirrorResponse.headers.get("x-mdb-relay")).toBe("no-vary");
+  });
+
+  it("sanitises a range bypass without caching it", async () => {
     const url = "https://x.com/range";
-    await cachedfetch(new Request(url, { headers: { range: "bytes=0-10" } }));
+    state.fetch.mockImplementation(async () =>
+      new Response("body", { headers: { ...dangerousHeaders, "content-length": "4" } }),
+    );
+    const res = await cachedfetch(
+      new Request(url, { headers: { range: "bytes=0-10" } }),
+    );
     expect(state.fetch).toHaveBeenCalledTimes(1);
     expect(state.fetch.mock.calls[0][0].headers.get("range")).toBe("bytes=0-10");
+    expect(res.headers.get("x-mdb-cache")).toBe("bypass");
+    for (const name of dangerousNames) expect(res.headers.has(name), name).toBe(false);
     expect(cache.entries.has(url)).toBe(false);
   });
 
-  it("HEAD matches the GET cache entry", async () => {
+  it("HEAD reuses GET metadata but never delivers its body", async () => {
     const url = "https://x.com/head";
-    cache.entries.set(url, new Response("cached"));
-    expect(await cachedfetch(new Request(url, { method: "HEAD" }))).toBeDefined();
+    cache.entries.set(
+      url,
+      new Response("cached", {
+        status: 200,
+        statusText: "Cached OK",
+        headers: {
+          ...dangerousHeaders,
+          "content-length": "6",
+          "content-type": "text/plain",
+          vary: "Accept",
+          "x-upstream": "kept",
+        },
+      }),
+    );
+
+    const res = await cachedfetch(new Request(url, { method: "HEAD" }));
+    expect(res.body).toBeNull();
+    expect(res.status).toBe(200);
+    expect(res.statusText).toBe("Cached OK");
+    expect(res.headers.get("x-mdb-cache")).toBe("hit");
+    expect(res.headers.get("content-length")).toBe("6");
+    expect(res.headers.get("content-type")).toBe("text/plain");
+    expect(res.headers.get("vary")).toBe("Accept");
+    expect(res.headers.get("x-upstream")).toBe("kept");
+    for (const name of dangerousNames) expect(res.headers.has(name), name).toBe(false);
     expect(state.fetch).not.toHaveBeenCalled();
   });
 
   it("HEAD forwards the method on a cache miss and does not save", async () => {
     const url = "https://x.com/head-miss";
-    await cachedfetch(new Request(url, { method: "HEAD" }));
+    const res = await cachedfetch(new Request(url, { method: "HEAD" }));
     expect(state.fetch.mock.calls[0][0].method).toBe("HEAD");
+    expect(res.body).toBeNull();
+    expect(res.headers.get("x-mdb-cache")).toBe("bypass");
     expect(cache.entries.has(url)).toBe(false);
   });
 
@@ -153,10 +244,16 @@ describe("cachedfetch", () => {
     expect(cache.entries.has(url)).toBe(false);
   });
 
-  it("bypasses cache entirely for POST", async () => {
+  it("sanitises other methods while bypassing the cache", async () => {
     const url = "https://x.com/post";
-    await cachedfetch(new Request(url, { method: "POST", body: "x" }));
+    state.fetch.mockImplementation(async () =>
+      new Response("body", { headers: dangerousHeaders }),
+    );
+    const res = await cachedfetch(new Request(url, { method: "POST", body: "x" }));
     expect(state.fetch.mock.calls[0][0].method).toBe("POST");
+    expect(res.headers.get("x-mdb-cache")).toBe("bypass");
+    for (const name of dangerousNames) expect(res.headers.has(name), name).toBe(false);
+    expect(await res.text()).toBe("body");
     expect(cache.entries.has(url)).toBe(false);
   });
 });
@@ -190,9 +287,11 @@ describe("cachedfetch — periodic revalidation", () => {
 
   beforeEach(() => {
     cache = new FakeCache();
-    state.cache = cache;
     state.fetch.mockReset();
     state.now = STORED_AT;
+    cachedfetch = createCachedfetch(
+      new MdbCacheManager(cache, undefined, () => state.now),
+    );
   });
 
   it("serves the stored copy between revalidation points, whatever max-age says", async () => {

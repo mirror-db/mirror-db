@@ -163,6 +163,5 @@ export const upstreamProxy = (upstream: Upstream) => {
   p.pre(filterHeaders([...GlobalPassthroughHeaders, ...(upstream.passthroughHeaders ?? [])]));
   p.pre(standardizeUserAgent);
   p.pre(followRedirects);
-  p.post(sanitize);
   return p;
 };

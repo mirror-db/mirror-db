@@ -22,24 +22,24 @@ vi.mock("./fetch", async (importOriginal) => {
   return { ...mod, mdbfetch: (...args: unknown[]) => upstream(...args) };
 });
 
-const { MdbCacheManager, cachedfetch, mdbCache } = await import("./cache");
+const { createCachedfetch, MdbCacheManager } = await import("./cache");
 
 const MINUTE = 60_000;
 
 describe("cachedfetch — revalidation in workerd", () => {
   let now = 1_000_000;
-  let cacheName: string;
+  let manager: InstanceType<typeof MdbCacheManager>;
+  let cachedfetch: ReturnType<typeof createCachedfetch>;
 
-  beforeEach(async () => {
-    cacheName = `rev-${Math.random()}`;
+  beforeEach(() => {
     now = 1_000_000;
     upstream.mockReset();
-    // Drive both clocks: the manager's and the swap target for `mdbCache`.
-    mdbCache.now = () => now;
-    Object.defineProperty(mdbCache, "cache", {
-      get: () => caches.open(cacheName),
-      configurable: true,
-    });
+    manager = new MdbCacheManager(
+      caches.open(`rev-${Math.random()}`),
+      undefined,
+      () => now,
+    );
+    cachedfetch = createCachedfetch(manager);
   });
 
   afterEach(() => {
@@ -47,8 +47,7 @@ describe("cachedfetch — revalidation in workerd", () => {
   });
 
   const store = async (url: string, body: string, etag = '"v1"') => {
-    const mgr = new MdbCacheManager(await caches.open(cacheName), undefined, () => now);
-    await mgr.save(
+    await manager.save(
       new Request(url),
       new Response(body, {
         headers: { etag, "content-type": "application/json" },

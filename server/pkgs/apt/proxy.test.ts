@@ -364,6 +364,8 @@ describe("createAptProxy — method forwarding", () => {
     new Request(`https://mirs.uk/${path}`, { method: "HEAD" });
 
   it("forwards HEAD for an ordinary pool file and answers without a body", async () => {
+    // A real HEAD upstream response is bodyless; this test owns method routing.
+    ezfetchMock.mockResolvedValue(new Response(null, { headers: { "content-length": "4" } }));
     const proxy = makeProxy({ ready: true, paths: [] });
     const res = await proxy.fetch(
       head("pool/main/n/nginx/nginx_1.0_amd64.deb"),
@@ -373,11 +375,12 @@ describe("createAptProxy — method forwarding", () => {
     const [url, init] = ezfetchMock.mock.calls[0]!;
     expect(url).toBe("https://up.example/debian/pool/main/n/nginx/nginx_1.0_amd64.deb");
     expect(init).toEqual({ method: "HEAD" });
-    // The mocked upstream returns a body regardless; a HEAD must not relay it.
-    expect(await res.text()).toBe("");
+    expect(res.body).toBeNull();
   });
 
   it("forwards HEAD for a by-hash file, asking for identity, without a body", async () => {
+    // cachedfetch owns HEAD body suppression; its mock follows that contract.
+    cachedfetchMock.mockResolvedValue(new Response(null, { headers: { "content-length": "4" } }));
     const proxy = makeProxy({ ready: true, hashes: [HASH] });
     const res = await proxy.fetch(
       head(`dists/trixie/main/binary-amd64/by-hash/SHA256/${HASH}`),
@@ -396,7 +399,7 @@ describe("createAptProxy — method forwarding", () => {
     expect(res.headers.get("cache-control")).toBe(
       "public, max-age=31536000, immutable",
     );
-    expect(await res.text()).toBe("");
+    expect(res.body).toBeNull();
   });
 
   it("asks for identity on a by-hash GET", async () => {
