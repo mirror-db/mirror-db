@@ -50,10 +50,11 @@ var (
 	ErrOversized = errors.New("hashstore: content exceeds max object size")
 	// ErrInvalidDigest means the algorithm or hex length was invalid.
 	ErrInvalidDigest = errors.New("hashstore: invalid digest")
-	// ErrDigestMismatch means an adopted body's real digest did not match the
-	// caller's expectation. Nothing was published and no existing body was
+	// ErrDigestMismatch means a body's real digest did not match the caller's
+	// expectation, whether the body was copied in by PutExpected or adopted
+	// from a staged file. Nothing was published and no existing body was
 	// touched.
-	ErrDigestMismatch = errors.New("hashstore: adopted content digest mismatch")
+	ErrDigestMismatch = errors.New("hashstore: content digest mismatch")
 	// ErrInvalidAdopt means the adopt source is not a completed regular file of
 	// the declared size inside the store's temp directory. Nothing was
 	// published.
@@ -266,11 +267,26 @@ func cleanTempDir(dir string) {
 // oversized object without pulling all of it. An oversized body is not stored
 // and does not evict anything.
 func (s *Store) Put(ctx context.Context, r io.Reader, size int64) (Content, error) {
+	return s.PutExpected(ctx, r, size, "", "")
+}
+
+// PutExpected is Put with an Adopt-style content expectation. The body is read
+// and hashed exactly once, as Put does, and the digest is compared before
+// anything becomes visible: a mismatch is ErrDigestMismatch and leaves no body,
+// index record or LRU entry behind, so a caller that knows the bytes a path
+// names can refuse to publish different ones without a second hashing pass.
+// expectAlgorithm may be empty, meaning no expectation; then expectDigest must
+// be empty too.
+func (s *Store) PutExpected(ctx context.Context, r io.Reader, size int64, expectAlgorithm Algorithm, expectDigest string) (Content, error) {
 	if !s.enter() {
 		return Content{}, ErrClosed
 	}
 	defer s.leave()
 
+	algo, wantDigest, err := normalizeContentExpectation(expectAlgorithm, expectDigest)
+	if err != nil {
+		return Content{}, err
+	}
 	if size > s.maxSize {
 		return Content{}, fmt.Errorf("%w: %d bytes > %d", ErrOversized, size, s.maxSize)
 	}
@@ -321,6 +337,15 @@ func (s *Store) Put(ctx context.Context, r io.Reader, size int64) (Content, erro
 		SHA256: hex.EncodeToString(h256.Sum(nil)),
 		Size:   n,
 	}
+	if algo != "" {
+		got := c.SHA256
+		if algo == SHA1 {
+			got = c.SHA1
+		}
+		if got != wantDigest {
+			return Content{}, fmt.Errorf("%w: %s is %s, expected %s", ErrDigestMismatch, algo, got, wantDigest)
+		}
+	}
 	// The body becomes visible before its index entry exists: mark it so a
 	// concurrent reconcile does not delete it as an orphan.
 	s.beginPublish(c.SHA256)
@@ -359,7 +384,7 @@ func (s *Store) Adopt(ctx context.Context, path string, size int64, expectAlgori
 	}
 	defer s.leave()
 
-	algo, wantDigest, err := normalizeAdoptExpectation(expectAlgorithm, expectDigest)
+	algo, wantDigest, err := normalizeContentExpectation(expectAlgorithm, expectDigest)
 	if err != nil {
 		return Content{}, err
 	}
@@ -462,7 +487,7 @@ func (s *Store) AdoptTrusted(ctx context.Context, path string, c Content, expect
 	}
 	defer s.leave()
 
-	algo, wantDigest, err := normalizeAdoptExpectation(expectAlgorithm, expectDigest)
+	algo, wantDigest, err := normalizeContentExpectation(expectAlgorithm, expectDigest)
 	if err != nil {
 		return Content{}, err
 	}
@@ -558,9 +583,9 @@ func (s *Store) adoptSource(path string, size int64) (string, error) {
 	return abs, nil
 }
 
-// normalizeAdoptExpectation validates the optional expected digest. An empty
+// normalizeContentExpectation validates the optional expected digest. An empty
 // algorithm means no expectation and requires an empty digest.
-func normalizeAdoptExpectation(algo Algorithm, digest string) (Algorithm, string, error) {
+func normalizeContentExpectation(algo Algorithm, digest string) (Algorithm, string, error) {
 	if strings.TrimSpace(string(algo)) == "" {
 		if strings.TrimSpace(digest) != "" {
 			return "", "", fmt.Errorf("%w: expected digest %q without an algorithm", ErrInvalidDigest, digest)

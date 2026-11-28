@@ -587,6 +587,27 @@ func (s *Server) streamAndStore(w http.ResponseWriter, r *http.Request, resp *ht
 	putSize := resp.ContentLength
 	budget := s.hashStore.Stats().Capacity
 	storeBody := putSize < 0 || putSize <= budget
+	// A policy that captured a digest from the path states which bytes the URL
+	// names. The ordinary tee is the only writer left when the active path
+	// refused the assembly, so it must apply the same expectation: publishing a
+	// body that contradicts the address would make the next request a hit on
+	// bytes the path never named.
+	digestPolicy := storedDigestPolicy(r, resp)
+	var putAlgo hashstore.Algorithm
+	var putDigest string
+	nonIdentity := false
+	if digestPolicy.declared {
+		if !digestPolicy.identity {
+			// A negotiated representation is not the object the digest names, so
+			// there is no usable expectation to compare: the response is still
+			// delivered whole, but it must not enter the store at all.
+			log.Printf("relay cache: %q has a policy digest but a non-identity coding, serving without storing", key)
+			nonIdentity = true
+			storeBody = false
+		} else {
+			putAlgo, putDigest = digestPolicy.algo, digestPolicy.digest
+		}
+	}
 
 	var (
 		pw         *io.PipeWriter
@@ -621,7 +642,7 @@ func (s *Server) streamAndStore(w http.ResponseWriter, r *http.Request, resp *ht
 						putErr = fmt.Errorf("hashstore Put panic: %v", recovered)
 					}
 				}()
-				content, putErr = s.hashStore.Put(putCtx, pr, putSize)
+				content, putErr = s.hashStore.PutExpected(putCtx, pr, putSize, putAlgo, putDigest)
 			}()
 			// Put may return before the handler wrote the whole body (an
 			// oversized body, a store error). Close the reader now so the next
@@ -661,7 +682,7 @@ func (s *Server) streamAndStore(w http.ResponseWriter, r *http.Request, resp *ht
 			deliveryCh = nil
 			storeBody = false
 		}
-	} else {
+	} else if !nonIdentity {
 		log.Printf("relay cache: %q declares %d bytes (budget %d), serving without storing", key, putSize, budget)
 	}
 
@@ -719,6 +740,44 @@ func (s *Server) streamAndStore(w http.ResponseWriter, r *http.Request, resp *ht
 	// closes it when this call returns. The detached tee no longer touches it:
 	// it only drains bytes already written into the pipe, and the outcome above
 	// decides whether they may be named.
+}
+
+// digestStorePolicy describes how the store must treat a response whose merged
+// policy captured a content digest from the path. declared means the capture is
+// a usable digest; identity means the response body is the object's own bytes
+// rather than a negotiated representation of them.
+type digestStorePolicy struct {
+	declared bool
+	identity bool
+	algo     hashstore.Algorithm
+	digest   string
+}
+
+// storedDigestPolicy returns the policy digest an ordinary or prefetch store
+// write must satisfy. A pattern that matched without a usable digest declares
+// immutability only. The digest names the object's bytes, not a negotiated
+// representation: a non-identity response is never stored, because its bytes
+// cannot be verified against (and are not) that object.
+func storedDigestPolicy(r *http.Request, resp *http.Response) digestStorePolicy {
+	_, digest := immutableFromContext(r.Context())
+	if digest.Algorithm == "" {
+		return digestStorePolicy{}
+	}
+	algo, err := hashstore.ParseAlgorithm(digest.Algorithm)
+	if err != nil {
+		return digestStorePolicy{}
+	}
+	normalized, err := hashstore.NormalizeDigest(algo, digest.Hex)
+	if err != nil {
+		return digestStorePolicy{}
+	}
+	coding, ok := ContentCodingFromHeaders(resp.Header)
+	return digestStorePolicy{
+		declared: true,
+		identity: ok && coding == CodingIdentity,
+		algo:     algo,
+		digest:   normalized,
+	}
 }
 
 // responseVariantHeaders returns the header set a stored variant keeps. A

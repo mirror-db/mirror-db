@@ -2,6 +2,8 @@ package server
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"io"
 	"math"
 	"net/http"
@@ -491,7 +493,8 @@ func TestDispositionPreHandoffFallbackDeliversAndClosesOnce(t *testing.T) {
 // TestDispositionPostHandoffPolicyStartsFreshExchange pins the policy-path
 // failure difference: when the adapter took the body and could not start, the
 // caller starts a new exchange with its own disposition. The first body is never
-// replayed and the client sees the new response.
+// replayed and the client sees the new response. The fresh response still has to
+// satisfy the path's policy digest before it may be stored.
 func TestDispositionPostHandoffPolicyStartsFreshExchange(t *testing.T) {
 	seedBody := activeBody()
 	ordinaryBody := bytes.ToUpper(seedBody)
@@ -555,9 +558,15 @@ func TestDispositionPostHandoffPolicyStartsFreshExchange(t *testing.T) {
 	if reads, closes := bodies[1].stats(); reads != len(ordinaryBody) || closes != 1 {
 		t.Fatalf("fresh body reads=%d closes=%d, want %d reads and exactly one close", reads, closes, len(ordinaryBody))
 	}
-	v := firstVariant(t, store, "mirror://docker/v2/app/blobs/sha256:"+digest)
-	if v.BodySHA256 != bodyDigestHex(string(ordinaryBody)) {
-		t.Fatalf("stored body = %q, want the fresh exchange", v.BodySHA256)
+	// The fresh exchange answered with different bytes, so it contradicts the
+	// policy digest the path names. It is delivered unchanged, but the ordinary
+	// chain must not publish it: a URL variant pointing at those bytes would make
+	// the next request a hit on content this address never named.
+	if got := len(activeVariants(t, store, "mirror://docker/v2/app/blobs/sha256:"+digest)); got != 0 {
+		t.Fatalf("contradictory fresh exchange published %d variants", got)
+	}
+	if _, _, err := store.Get(context.Background(), hashstore.SHA256, bodyDigestHex(string(ordinaryBody))); !errors.Is(err, hashstore.ErrNotFound) {
+		t.Fatalf("contradictory fresh body was published: %v", err)
 	}
 }
 

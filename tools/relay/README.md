@@ -337,12 +337,14 @@ Behaviour:
 
 - A body is stored once, keyed by its real SHA-256, and is readable through
   either digest. SHA-1 is an alias, not a second copy.
-- Three ways in: `Put` copies a reader into `.tmp` while hashing it; `Adopt`
-  publishes a file another component already wrote in full there, re-reading it
-  to compute **both** digests; and `AdoptTrusted` publishes the same kind of file
-  without that reread, for a trusted caller that already hashed exactly those
-  bytes. Both adopt paths require a completed regular file of the declared size
-  inside `<CACHE_DIR>/.tmp` and treat an expected digest as a check — a mismatch
+- Four entry points, in two pairs: `Put` copies a reader into `.tmp` while
+  hashing it, and `PutExpected` is `Put` with an expected digest compared before
+  anything is published; `Adopt` publishes a file another component already
+  wrote in full there, re-reading it to compute **both** digests; and
+  `AdoptTrusted` publishes the same kind of file without that reread, for a
+  trusted caller that already hashed exactly those bytes. Both adopt paths
+  require a completed regular file of the declared size inside
+  `<CACHE_DIR>/.tmp` and treat an expected digest as a check — a mismatch
   publishes nothing. `AdoptTrusted` still validates the path, file mode, size and
   expectation, but a wrong digest would poison the index and a shared bucket, so
   only the active segment's own digest sinks call it; every untrusted caller uses
@@ -434,7 +436,11 @@ runs first for every request.
   creates an entry, so a `HEAD` never leaves a body-less entry behind. The
   client's EOF does not wait for the store: the tee and the variant commit run
   detached, and the variant is written only after a complete delivery and a
-  successful `Put`.
+  successful `PutExpected`. A path whose merged policy captured a digest passes
+  it as an expectation: a body that contradicts the address is delivered whole
+  but writes neither a body nor a variant, and a non-identity representation of
+  such a path is never stored at all. Paths without a captured digest keep their
+  ordinary coding behaviour.
 - **Client request cache control** — `Cache-Control: no-store` skips both lookup
   and write; `no-cache` and `max-age=0` force revalidation of a fresh entry
   (`Pragma: no-cache` only when no `Cache-Control` is present).
@@ -676,7 +682,11 @@ and waits for real traffic.
 The refresh replays the variant's `Vary`-matched request headers and pins
 `Accept-Encoding: identity`, so it never invents a variant or stores a
 transcoded body. A background run is always `GET`: a `HEAD` may create or renew
-a lease, but never becomes the refresh method.
+a lease, but never becomes the refresh method. A captured policy digest is
+replayed too: a digest-addressed refresh publishes only an identity body that
+matches it, a mismatch keeps the last good variant, and a non-identity
+representation of such a path writes nothing. Tasks without a captured digest,
+including the APT and PyPI index refreshes, are unaffected.
 
 ## `relay prune` — offline cache cleanup
 

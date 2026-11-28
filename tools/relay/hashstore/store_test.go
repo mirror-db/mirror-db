@@ -128,6 +128,97 @@ func TestPutServesBothDigestsOnce(t *testing.T) {
 	}
 }
 
+// PutExpected is the ordinary tee's content-addressed write: the digest check
+// happens before publication, so a body that contradicts the expectation leaves
+// no object, no accounting and no temp file behind.
+func TestPutExpectedRefusesMismatchedContent(t *testing.T) {
+	dir := t.TempDir()
+	s := openLocal(t, Config{Dir: dir, Capacity: 1 << 20})
+	const body = "expected content"
+	want := hashOf(body)
+	other := hashOf("some other content")
+
+	for _, tc := range []struct {
+		name   string
+		algo   Algorithm
+		digest string
+	}{
+		{"sha256", SHA256, other.SHA256},
+		{"sha1", SHA1, other.SHA1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := s.PutExpected(context.Background(), strings.NewReader(body), int64(len(body)), tc.algo, tc.digest)
+			if !errors.Is(err, ErrDigestMismatch) {
+				t.Fatalf("mismatch error = %v, want ErrDigestMismatch", err)
+			}
+		})
+	}
+	if st := s.Stats(); st.Objects != 0 || st.Bytes != 0 {
+		t.Fatalf("mismatched puts changed stats: %+v", st)
+	}
+	if _, _, err := s.Get(context.Background(), SHA256, want.SHA256); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("mismatched body was published: %v", err)
+	}
+	if n := countFiles(t, filepath.Join(dir, dataDirName)); n != 0 {
+		t.Fatalf("data dir holds %d files, want 0", n)
+	}
+	if n := countFiles(t, filepath.Join(dir, tmpDirName)); n != 0 {
+		t.Fatalf("temp dir holds %d files after a mismatch, want 0", n)
+	}
+}
+
+// A matching expectation publishes exactly like Put, for either algorithm.
+func TestPutExpectedPublishesMatchingContent(t *testing.T) {
+	dir := t.TempDir()
+	s := openLocal(t, Config{Dir: dir, Capacity: 1 << 20})
+	const body = "expected content"
+	want := hashOf(body)
+
+	for _, tc := range []struct {
+		name   string
+		algo   Algorithm
+		digest string
+	}{
+		{"sha256", SHA256, want.SHA256},
+		{"sha1", SHA1, want.SHA1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, err := s.PutExpected(context.Background(), strings.NewReader(body), int64(len(body)), tc.algo, tc.digest)
+			if err != nil {
+				t.Fatalf("put: %v", err)
+			}
+			if c != want {
+				t.Fatalf("digests = %+v, want %+v", c, want)
+			}
+			if got := readContent(t, s, SHA256, want.SHA256); got != body {
+				t.Fatalf("stored body = %q", got)
+			}
+		})
+	}
+}
+
+// A mismatched expectation never disturbs a body that already exists at its
+// real address.
+func TestPutExpectedMismatchLeavesExistingBodyUntouched(t *testing.T) {
+	dir := t.TempDir()
+	s := openLocal(t, Config{Dir: dir, Capacity: 1 << 20})
+	const stored = "already stored"
+	const incoming = "different bytes"
+	existing := putBody(t, s, stored)
+	before := s.Stats()
+
+	_, err := s.PutExpected(context.Background(), strings.NewReader(incoming), int64(len(incoming)), SHA256, existing.SHA256)
+	if !errors.Is(err, ErrDigestMismatch) {
+		t.Fatalf("mismatch error = %v, want ErrDigestMismatch", err)
+	}
+	if got := readContent(t, s, SHA256, existing.SHA256); got != stored {
+		t.Fatalf("existing body = %q", got)
+	}
+	if after := s.Stats(); after != before {
+		t.Fatalf("stats changed: %+v -> %+v", before, after)
+	}
+}
+
 // Strict LRU in logical bytes: reading A protects it, so C displaces B.
 func TestLRUEvictsLeastRecentlyUsed(t *testing.T) {
 	dir := t.TempDir()

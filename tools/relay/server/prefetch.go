@@ -774,13 +774,23 @@ func (s *Server) runNormalPrefetch(ctx context.Context, task prefetchTask) prefe
 		stored, persistent := responseVariantHeaders(resp.Header, directives)
 		storedAt := s.currentTime()
 		expiresAt := freshnessExpiry(stored, directives, storedAt)
+		digestPolicy := storedDigestPolicy(out, resp)
+		if digestPolicy.declared && !digestPolicy.identity {
+			// The path names object bytes, and this response is a negotiated
+			// representation of them. Nothing can be verified against the digest
+			// and those bytes are not the object, so the refresh writes nothing.
+			// The old variant is not evidence against: this response says nothing
+			// about the identity representation it did not carry.
+			_, _ = io.Copy(io.Discard, resp.Body)
+			return prefetchOutcome{next: expiresAt, noNext: !expiresAt.After(storedAt)}
+		}
 		putSize := resp.ContentLength
 		budget := s.hashStore.Stats().Capacity
 		if putSize > budget {
 			_, _ = io.Copy(io.Discard, resp.Body)
 			return prefetchOutcome{noNext: true}
 		}
-		content, err := s.hashStore.Put(ctx, resp.Body, putSize)
+		content, err := s.hashStore.PutExpected(ctx, resp.Body, putSize, digestPolicy.algo, digestPolicy.digest)
 		if err != nil {
 			if errors.Is(err, hashstore.ErrOversized) {
 				// The stream declared no length and turned out to exceed the
@@ -834,8 +844,9 @@ func (s *Server) syntheticRequest(ctx context.Context, m Mirror, clientPath, cli
 	return req.WithContext(ctx)
 }
 
-// withMirrorPolicy attaches the manifest's transport preference for the
-// background path. Passthrough is a client-response decision and is not applied
+// withMirrorPolicy attaches the manifest's pre-request facts a background fetch
+// may act on: the transport preference and, for a content-addressed path, the
+// captured digest. Passthrough is a client-response decision and is not applied
 // to a background fetch: there is no response to pass through.
 func (s *Server) withMirrorPolicy(req *http.Request, m Mirror, relPath string) *http.Request {
 	st := s.manifest.Load()
@@ -843,7 +854,11 @@ func (s *Server) withMirrorPolicy(req *http.Request, m Mirror, relPath string) *
 		return req
 	}
 	d := st.policyFor(m, relPath)
-	return req.WithContext(withPolicyDecision(req.Context(), policyDecision{TrafficPolicy: d.TrafficPolicy}))
+	return req.WithContext(withPolicyDecision(req.Context(), policyDecision{
+		TrafficPolicy: d.TrafficPolicy,
+		Immutable:     d.Immutable,
+		Digest:        d.Digest,
+	}))
 }
 
 // normalTaskKey is the prefetch scheduler's codec over a variant identity. The

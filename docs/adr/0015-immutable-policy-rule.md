@@ -69,6 +69,18 @@ running — upgrade the relay before publishing a manifest that uses a newer key
 - A relay can reuse a stored body by predicted digest without a URL variant,
   when the pattern names a digest group; it validates that capture and checks
   size/digest before serving.
+- The captured digest is also a **store expectation**, not only an active-path
+  one. When the active segment is unavailable or refuses an assembly, the
+  ordinary tee hashes the body it is already streaming and publishes nothing if
+  the bytes contradict the path's digest (`hashstore.PutExpected`). The response
+  is still delivered whole; it simply never becomes a URL variant or a hash
+  object under a false address, so the next request is a fresh MISS rather than
+  a hit on bytes the path did not name. A normal prefetch refresh applies the
+  same expectation and keeps the last good variant on a mismatch. A response
+  with a non-identity coding is a negotiated representation, not the object the
+  digest names: on such a path it is delivered (or discarded by a refresh) and
+  never stored at all, while paths without a captured digest keep their coding
+  behaviour.
 - The relay merges the pattern like every other rule field, evaluates the
   surviving expression once against the mount-relative path, and treats a match
   as "these bytes cannot change" plus the captured digest when there is one. A

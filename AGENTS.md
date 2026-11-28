@@ -1082,8 +1082,12 @@ themselves. There is no separate TMP_DIR.
 
 - One body is stored once under its real SHA-256 and read through either digest;
   SHA-1 is an unweighted alias in the same index record.
-- Two ways in: `Put` copies a reader into `.tmp` and hashes while it copies;
-  `Adopt` publishes a body another component already wrote in full into `.tmp`.
+- Four entry points, in two pairs: `Put` copies a reader into `.tmp` and hashes
+  while it copies, `PutExpected` adds an Adopt-style expectation and compares
+  the digest it already computed before anything is published; `Adopt` publishes
+  a body another component already wrote in full into `.tmp`, and
+  `AdoptTrusted` publishes the same kind of file from digests the trusted caller
+  already computed.
   `Adopt(path, size, algo, digest)` accepts only a completed regular file at the
   declared size inside that directory, reads it once to recompute SHA-1 and
   SHA-256, and treats `algo`/`digest` as an expectation — a mismatch is
@@ -1206,14 +1210,21 @@ Decision order (`serveCache`):
 5. MISS streams the upstream response into `<CACHE_DIR>/.tmp` via an
    `io.Pipe` while writing the client, computes SHA-1 and SHA-256, and commits
    metadata under a timeout independent of the client connection. The handler
-   flushes and returns as soon as the client has every byte; the tee's `Put` and
-   the variant commit run in one detached task owned by the server, so an
-   unknown-length (chunked) client response gets its EOF from the handler return
-   instead of waiting for the store. Only a complete `200` GET whose body reached
-   the client becomes an entry. A MISS whose response carries
+   flushes and returns as soon as the client has every byte; the tee's
+   `PutExpected` and the variant commit run in one detached task owned by the
+   server, so an unknown-length (chunked) client response gets its EOF from the
+   handler return instead of waiting for the store. Only a complete `200` GET
+   whose body reached the client becomes an entry. A MISS whose response carries
    `X-MDB-Relay: immutable` may instead seed the active segment before the client
    is written (see the response-declared seed below); every refusal delivers that
    same response through this ordinary tee.
+   When the merged policy captured a digest from the path, the tee carries it as
+   a content expectation: a body that contradicts the address is delivered whole
+   but publishes nothing (no hash object, no variant), so an active refusal or a
+   post-handoff fresh exchange cannot turn a digest mismatch into a URL variant.
+   A non-identity representation of such a path (a negotiated coding) is also
+   delivered whole and never stored, because it is not the object the digest
+   names; ordinary paths without a captured digest keep their coding behaviour.
 
 **Content-addressed digests ignore stale metadata.** Before rule 4, a request
 whose path addresses an OCI object by digest (`…/blobs/sha256:<64 hex>` or
@@ -1431,6 +1442,13 @@ traffic. `GET`/`HEAD` for the same resource renews the lease.
   `GET`; `HEAD` may create or renew a lease but never becomes the refresh
   method. An ambiguous URL (several matching variants) is left to a real
   request.
+- **A captured policy digest constrains the refresh.** A normal task replays the
+  path's merged policy facts, so a digest-addressed 200 is published only when
+  its identity body matches the captured digest (`PutExpected`); a mismatch
+  keeps the last good variant and backs off. A non-identity representation of
+  such a path writes nothing and keeps scheduling from the response's own
+  freshness. Tasks without a captured digest are unchanged, including the APT
+  index and PyPI index refreshes.
 - **`no-store` wins, once per state change.** A prefetch lease never makes a
   response storable. An ordinary `no-store` plus `prefetch` response schedules
   nothing and logs one warning per resource when the conflict state changes, not

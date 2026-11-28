@@ -706,6 +706,149 @@ func TestActiveDigestMismatchNeverPublishes(t *testing.T) {
 	}
 }
 
+// A policy digest is a pre-request fact. When the active path refuses an
+// assembly and the same response is delivered by the ordinary chain, its bytes
+// still must not be published under a URL that names another digest. The client
+// body is unaffected, and every request remains a fresh MISS.
+func TestActiveDigestMismatchOrdinaryFallbackPublishesNothing(t *testing.T) {
+	body := activeBody()
+	real := bodyDigestHex(string(body))
+	wrong := bodyDigestHex("some other body")
+	up, upSrv := startUpstream(t, activeUpstreamHandler(body, map[string]string{"Cache-Control": "max-age=3600"}))
+	s, store := newCacheServer(t, upSrv.URL, cacheServerOptions{
+		mirrors:        []Mirror{{Name: "docker", Path: "docker"}},
+		policies:       activeOCIPolicies(),
+		activeCapacity: 64,
+	})
+	target := "/docker/v2/app/blobs/sha256:" + wrong
+	key := "mirror://docker/v2/app/blobs/sha256:" + wrong
+
+	for i := 0; i < 2; i++ {
+		rec := cacheRequest(s, http.MethodGet, target, nil)
+		if rec.Code != http.StatusOK || !bytes.Equal(rec.Body.Bytes(), body) {
+			t.Fatalf("GET %d = %d, %d bytes", i, rec.Code, rec.Body.Len())
+		}
+		if got := len(activeVariants(t, store, key)); got != 0 {
+			t.Fatalf("GET %d published %d variants", i, got)
+		}
+	}
+	if up.count() != 2 {
+		t.Fatalf("upstream requests = %d, want a fresh MISS each time", up.count())
+	}
+	if _, _, err := store.Get(context.Background(), hashstore.SHA256, real); !errors.Is(err, hashstore.ErrNotFound) {
+		t.Fatalf("mismatched body was published: %v", err)
+	}
+}
+
+// A path whose policy names a digest addresses object bytes. A response that
+// selected another coding is a representation of them, not the object: the
+// client gets the complete response, but the ordinary tee writes neither a body
+// nor a variant. The active path refuses the coding before admission.
+func TestActiveDigestNonIdentityFallbackStoresNothing(t *testing.T) {
+	body := activeBody()
+	var compressed bytes.Buffer
+	zw := gzip.NewWriter(&compressed)
+	if _, err := zw.Write(body); err != nil {
+		t.Fatalf("gzip body: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+	gzBody := compressed.Bytes()
+	// The path names the gzip representation's own bytes. Only the explicit
+	// non-identity refusal may keep them out of the store: a plain
+	// PutExpected would match and publish them.
+	wrong := bodyDigestHex(string(gzBody))
+
+	up, upSrv := startUpstream(t, activeUpstreamHandler(gzBody, map[string]string{
+		"Cache-Control":    "max-age=3600",
+		"Content-Encoding": "gzip",
+	}))
+	s, store := newCacheServer(t, upSrv.URL, cacheServerOptions{
+		mirrors:  []Mirror{{Name: "docker", Path: "docker"}},
+		policies: activeOCIPolicies(),
+	})
+	target := "/docker/v2/app/blobs/sha256:" + wrong
+	key := "mirror://docker/v2/app/blobs/sha256:" + wrong
+
+	for i := 0; i < 2; i++ {
+		rec := cacheRequest(s, http.MethodGet, target, nil)
+		if rec.Code != http.StatusOK || !bytes.Equal(rec.Body.Bytes(), gzBody) {
+			t.Fatalf("GET %d = %d, %d bytes", i, rec.Code, rec.Body.Len())
+		}
+		if got := rec.Header().Get("Content-Encoding"); got != "gzip" {
+			t.Fatalf("GET %d Content-Encoding = %q", i, got)
+		}
+		if got := len(activeVariants(t, store, key)); got != 0 {
+			t.Fatalf("GET %d published %d variants", i, got)
+		}
+	}
+	if up.count() != 2 {
+		t.Fatalf("upstream requests = %d, want a fresh MISS each time", up.count())
+	}
+	if _, _, err := store.Get(context.Background(), hashstore.SHA256, bodyDigestHex(string(gzBody))); !errors.Is(err, hashstore.ErrNotFound) {
+		t.Fatalf("non-identity body was published: %v", err)
+	}
+}
+
+// A failing assembly is visible after it settles and before it leaves the key
+// map. Many concurrent readers must hit that window without publishing
+// anything: the URL variant and the real body stay absent, and every client
+// still receives the complete upstream response. How many upstream fetches the
+// race costs is deliberately not asserted.
+func TestActiveDigestMismatchConcurrentReadersPublishNothing(t *testing.T) {
+	body := activeBody()
+	real := bodyDigestHex(string(body))
+	wrong := bodyDigestHex("some other body")
+	_, upSrv := startUpstream(t, activeUpstreamHandler(body, map[string]string{"Cache-Control": "max-age=3600"}))
+	s, store := newCacheServer(t, upSrv.URL, cacheServerOptions{
+		mirrors:  []Mirror{{Name: "docker", Path: "docker"}},
+		policies: activeOCIPolicies(),
+	})
+	target := "/docker/v2/app/blobs/sha256:" + wrong
+	key := "mirror://docker/v2/app/blobs/sha256:" + wrong
+
+	const (
+		readers = 64
+		rounds  = 100
+	)
+	for round := 0; round < rounds; round++ {
+		start := make(chan struct{})
+		errs := make(chan string, readers)
+		var wg sync.WaitGroup
+		for i := 0; i < readers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				req := httptest.NewRequest(http.MethodGet, "http://relay.example.com"+target, nil)
+				rec := httptest.NewRecorder()
+				s.handleRequest(rec, req)
+				if rec.Code != http.StatusOK || !bytes.Equal(rec.Body.Bytes(), body) {
+					select {
+					case errs <- fmt.Sprintf("round %d: status %d, %d bytes", round, rec.Code, rec.Body.Len()):
+					default:
+					}
+				}
+			}()
+		}
+		close(start)
+		wg.Wait()
+		s.background().drain()
+		select {
+		case msg := <-errs:
+			t.Fatal(msg)
+		default:
+		}
+		if got := len(activeVariants(t, store, key)); got != 0 {
+			t.Fatalf("round %d published %d variants", round, got)
+		}
+	}
+	if _, _, err := store.Get(context.Background(), hashstore.SHA256, real); !errors.Is(err, hashstore.ErrNotFound) {
+		t.Fatalf("mismatched body was published: %v", err)
+	}
+}
+
 func TestActiveCapacityFallsBackToOrdinaryResponse(t *testing.T) {
 	body := activeBody()
 	up, upSrv := startUpstream(t, activeUpstreamHandler(body, map[string]string{"Cache-Control": "max-age=3600"}))
