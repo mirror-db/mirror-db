@@ -31,7 +31,7 @@ import {
   sanitizeResponse,
   STRIP_RESPONSE_HEADERS,
 } from "@server/pkgs/fetch";
-import { withRelayDirectives } from "@server/relay-control";
+import { declarePathFact, immutablePathFact } from "@server/relay-path";
 import type { Mirror } from "@server/types";
 
 export const UPSTREAM = "https://snapshot.debian.org/";
@@ -63,13 +63,6 @@ const IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable";
  * upstream's own five-minute lifetime rather than inventing one.
  */
 const SHORT_CACHE_CONTROL = "public, max-age=600";
-
-/**
- * Statuses that can carry an immutable declaration for a pinned snapshot object.
- * A `206` is still the same object's bytes, and a `304` confirms the stored
- * copy; only a pinned archive+timestamp path qualifies at all.
- */
-const DECLARABLE_STATUSES = new Set([200, 206, 304]);
 
 export interface SnapshotCache {
   match(request: Request): Promise<Response | undefined>;
@@ -187,10 +180,8 @@ export function createDebianSnapshot(opts: DebianSnapshotOptions = {}): Mirror {
       // timestamp resolves to "newest snapshot", `mr/` is a changing JSON API and
       // an error names nothing. No digest is declared — the mirror never derives
       // one from a redirect or a header.
-      const declare = (response: Response): Response =>
-        stable && DECLARABLE_STATUSES.has(response.status)
-          ? withRelayDirectives(response, ["immutable"])
-          : response;
+      const pathFact = stable ? immutablePathFact() : null;
+      const declare = (response: Response): Response => declarePathFact(response, pathFact);
 
       const store = cacheable ? await cache() : undefined;
       const key = new Request(target.toString());

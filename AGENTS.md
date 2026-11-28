@@ -140,6 +140,10 @@ comma-separated `keyword` or `keyword=value`. The Worker parses/merges it, and
 the relay consumes it (see the Relay server section below).
 Keywords: `no-store`, `no-vary`, `prefetch`, `ttl=<seconds>`, `immutable`,
 `sha256=<64 hex>`, `sha1=<40 hex>`; unknown keywords are ignored.
+[server/relay-path.ts](server/relay-path.ts) owns runtime `PathFact` digest
+validation, `200`/`206`/`304` gating and declaration merging. The OCI proxy,
+verified APT `by-hash` branch and stable `debian-snapshot` branch construct those
+facts while retaining their own path grammars; policy patterns stay independent.
 
 - **Response-declared immutability.** `immutable` states that this response's
   bytes cannot change; `sha256`/`sha1` name its body digest. A digest never

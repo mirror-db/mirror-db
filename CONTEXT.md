@@ -116,6 +116,13 @@ because the relay must know them before it makes the request. Where an upstream
 forbids transformation with the standard `Cache-Control: no-transform`, the
 relay honours that header as well.
 
+### Path fact
+
+A fact about whether the bytes addressed by a request path are immutable,
+optionally including a content digest. Only path syntax can establish it; a
+response header cannot. A digest identifies content and does not by itself
+establish that its address is immutable.
+
 ### Response-declared immutability
 
 A statement, carried by the `immutable` relay directive, that the bytes of one

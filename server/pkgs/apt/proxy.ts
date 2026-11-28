@@ -15,11 +15,8 @@
  */
 
 import { cachedfetch, ezfetch, sanitizeResponse } from "@server/pkgs/fetch";
-import {
-  mergeRelayDirectives,
-  RELAY_CONTROL_HEADER,
-  type RelayDirective,
-} from "@server/relay-control";
+import { withRelayDirectives, type RelayDirective } from "@server/relay-control";
+import { contentAddressedPathFact, declarePathFact } from "@server/relay-path";
 import {
   WebListProxy,
   defaultRender,
@@ -49,29 +46,6 @@ const IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable";
 const RELAY_NO_STORE = "no-store";
 /** Asks the relay to refresh this resource while it sees demand for it. */
 const RELAY_PREFETCH = "prefetch";
-
-/**
- * Relay directives a verified `by-hash` object declares about itself: the path
- * names its bytes, so `immutable` holds, and a `SHA256`/`SHA1` directory adds
- * the digest the relay may turn into an Adopt expectation. `MD5Sum`/`SHA512`
- * declare immutability alone — the relay addresses neither.
- *
- * This is a **path** fact verified against the release index, never derived from
- * a response header, and it is what lets the relay's immutable active cache
- * serve these objects locally.
- */
-function byHashRelayDirectives(
-  algorithm: string,
-  hash: string,
-): RelayDirective[] {
-  const directives: RelayDirective[] = ["immutable"];
-  if (algorithm === "SHA256" && hash.length === 64) directives.push(`sha256=${hash}`);
-  else if (algorithm === "SHA1" && hash.length === 40) directives.push(`sha1=${hash}`);
-  return directives;
-}
-
-/** Statuses that can describe a content-addressed object. */
-const DECLARABLE_STATUSES = new Set([200, 206, 304]);
 
 /** `dists/<suite>/InRelease` or `dists/<suite>/Release` — the signed index. */
 const RELEASE_PATH_RE = /^dists\/[^/]+\/(?:InRelease|Release)$/;
@@ -199,24 +173,21 @@ async function aptFetchHook(
         : sourceCacheControl(facts?.validUntil ?? 0),
   });
 
-  // The same generation hazard applies to the relay's default request cache:
-  // tell it not to store a mutable dists index. by-hash objects are
-  // content-addressed and pool payloads are not indexes, so neither gets this.
-  const directives: string[] = [];
   // A by-hash object the generation proved exists is content-addressed: the
   // relay may keep it and answer from local bytes. Only a *verified* hash
   // qualifies — an unjudged pass-through (no index, or a snapshot generation
   // that has not loaded yet) declares nothing, and mutable `dists/` indexes and
   // `pool/` payloads are never called immutable.
-  if (
-    hash !== null &&
-    hashAlgorithm !== null &&
-    facts !== null &&
-    facts.hashes.has(hash) &&
-    DECLARABLE_STATUSES.has(sanitized.status)
-  ) {
-    directives.push(...byHashRelayDirectives(hashAlgorithm, hash));
-  }
+  const pathFact =
+    hash !== null && hashAlgorithm !== null && facts !== null && facts.hashes.has(hash)
+      ? contentAddressedPathFact(hashAlgorithm, hash)
+      : null;
+  const declared = declarePathFact(sanitized, pathFact);
+
+  // The same generation hazard applies to the relay's default request cache:
+  // tell it not to store a mutable dists index. by-hash objects are
+  // content-addressed and pool payloads are not indexes, so neither gets this.
+  const directives: RelayDirective[] = [];
   if (hash === null && rel.startsWith("dists/")) directives.push(RELAY_NO_STORE);
   // Release/InRelease is the entry point a relay can refresh by itself; the
   // Worker's own metadata snapshot is rebuilt from it.
@@ -229,20 +200,7 @@ async function aptFetchHook(
     directives.push(RELAY_PREFETCH);
   }
 
-  if (directives.length > 0) {
-    const headers = new Headers(sanitized.headers);
-    headers.set(
-      RELAY_CONTROL_HEADER,
-      mergeRelayDirectives(headers.get(RELAY_CONTROL_HEADER), directives),
-    );
-    return new Response(sanitized.body, {
-      status: sanitized.status,
-      statusText: sanitized.statusText,
-      headers,
-    });
-  }
-
-  return sanitized;
+  return withRelayDirectives(declared, directives);
 }
 
 /** `Cache-Control` derived from how long the source index stays valid. */

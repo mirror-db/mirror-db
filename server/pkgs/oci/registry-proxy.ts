@@ -12,7 +12,7 @@
  */
 
 import { CFCacheLimit, mdbfetch, parseContentLength, sanitizeResponse, STRIP_STORED_HEADERS } from "@server/pkgs/fetch";
-import { withRelayDirectives, type RelayDirective } from "@server/relay-control";
+import { contentAddressedPathFact, declarePathFact } from "@server/relay-path";
 
 import {
   basicAuthHeader,
@@ -112,34 +112,6 @@ const digestCacheKey = (upstream: string, digest: string): string =>
 
 /** One year — content-addressed data never changes under its digest. */
 const IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable";
-
-/**
- * Statuses that can describe an immutable digest-addressed object. A successful
- * body, a partial body and a revalidation all name the same bytes; an error does
- * not, so nothing is declared on it.
- */
-const DECLARABLE_STATUSES = new Set([200, 206, 304]);
-
-/**
- * Relay directives a by-digest path declares about itself.
- *
- * This is a **path** fact, never a response fact: the request URL names the
- * digest, so `immutable` holds whatever the upstream answered. `sha256`/`sha1`
- * are emitted only when the path names exactly that algorithm and the hex has
- * the length that algorithm requires, because the relay forges an Adopt
- * expectation from it. Other algorithms (`sha512`, …) declare immutability
- * without a digest: the relay cannot address them, and inventing a shorter
- * digest from the response is exactly what a path fact may not do.
- */
-function digestRelayDirectives(digest: string): RelayDirective[] {
-  const sep = digest.indexOf(":");
-  const algorithm = digest.slice(0, sep).toLowerCase();
-  const hex = digest.slice(sep + 1).toLowerCase();
-  const directives: RelayDirective[] = ["immutable"];
-  if (algorithm === "sha256" && hex.length === 64) directives.push(`sha256=${hex}`);
-  else if (algorithm === "sha1" && hex.length === 40) directives.push(`sha1=${hex}`);
-  return directives;
-}
 
 /**
  * Default cap on what we store in the Cache API. Cloudflare rejects objects over
@@ -244,14 +216,15 @@ export async function proxyRegistryRequest(
   // The key is the digest, so identical layers shared across repositories hit
   // the same entry.
   const digest = extractDigest(path);
+  const [digestAlgorithm = "", digestHex = ""] = digest?.split(":", 2) ?? [];
+  const pathFact = digest
+    ? contentAddressedPathFact(digestAlgorithm, digestHex)
+    : null;
   const cacheable = request.method === "GET" && !!opts.cache && digest !== null;
   const cacheKey = digest ? digestCacheKey(opts.upstream, digest) : upstreamUrl;
   // Declared on the delivered response only, never on the Worker's cached copy:
   // the directive is relay control, not part of the object.
-  const declareRelay = (response: Response): Response =>
-    digest !== null && DECLARABLE_STATUSES.has(response.status)
-      ? withRelayDirectives(response, digestRelayDirectives(digest))
-      : response;
+  const declareRelay = (response: Response): Response => declarePathFact(response, pathFact);
   // The Cache API holds the complete object and cannot answer a Range. Serving
   // that stored 200 to a ranged request would deliver the whole body as a plain
   // 200, so a ranged digest GET skips the lookup and reaches upstream for a real
