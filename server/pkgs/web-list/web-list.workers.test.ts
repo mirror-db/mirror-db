@@ -89,6 +89,14 @@ describe("WebListFs url/fetch", () => {
     await fs.fetch("README");
     expect(lastUrl()).toBe("http://ftp.us.debian.org/debian/README");
   });
+
+  it("passes the first empty segment, later empty segments and escapes to fetch", async () => {
+    const { fs, lastUrl } = fsFor("http://ftp.us.debian.org/debian", debianHtml);
+
+    await fs.fetch("/empty//x%2fCase%2F");
+
+    expect(lastUrl()).toBe("http://ftp.us.debian.org/debian//empty//x%2fCase%2F");
+  });
 });
 
 describe("WebListFs.readdir — developer.download.nvidia.com (UL-based)", () => {

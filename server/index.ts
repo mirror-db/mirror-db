@@ -9,7 +9,7 @@ import { handleSpeedtest } from "./speedtest";
 import { handleRelaytest } from "./relaytest";
 import { normalizeRelayRequest, withRelayDirectives } from "./relay-control";
 import { notFoundResponse } from "./not-found";
-import type { Mirror } from "./types";
+import type { Mirror, MountContext } from "./types";
 
 /** Client-side routes the SPA owns (see `src/router/`). */
 const SPA_ROUTES = new Set(["/", "/about"]);
@@ -25,10 +25,11 @@ export default {
     // A direct client must not be able to inject relay response controls; the
     // valid relay-host marker is what makes the header trustworthy.
     request = normalizeRelayRequest(request);
+    const url = new URL(request.url);
 
     // Route on the host, without any port: a relay or a local dev server on a
     // non-default port still has to resolve to the same mirror.
-    const rawHost = request.headers.get("host") || new URL(request.url).host;
+    const rawHost = request.headers.get("host") || url.host;
     const host = rawHost.replace(/:\d+$/, "").replace(/\.$/, "").toLowerCase();
     if (!host) return notFound(request);
     if (host !== env.BASE_DOMAIN && !host.endsWith(`.${env.BASE_DOMAIN}`)) {
@@ -40,9 +41,9 @@ export default {
 
     // Subdomain-routed mirrors (OCI registries) win first.
     const mirror = mirrorsBySubdomain.get(subdomain);
-    if (mirror) return serveMirror(mirror, request);
-
-    const url = new URL(request.url);
+    if (mirror) {
+      return serveMirror(mirror, request, { relativePath: url.pathname.slice(1) });
+    }
 
     // A subdomain that is not a mirror is not this site either: the web UI and
     // the path mounts live on the bare domain only. Serving the SPA shell here
@@ -56,7 +57,9 @@ export default {
     if (firstSeg === "relaytest") return handleRelaytest(request, rest[0]);
 
     const pathMirror = firstSeg && mirrorsByPath.get(firstSeg);
-    if (pathMirror) return serveMirror(pathMirror, request);
+    if (pathMirror) {
+      return serveMirror(pathMirror, request, { relativePath: rest.join("/") });
+    }
 
     if (firstSeg === "") return serveStatic(request);
     if (firstSeg === "keys") return keys.fetch(request);
@@ -83,8 +86,9 @@ export default {
 export async function serveMirror(
   mirror: Mirror,
   request: Request,
+  context: MountContext,
 ): Promise<Response> {
-  const response = await mirror.fetch(request);
+  const response = await mirror.fetch(request, context);
   return withRelayDirectives(response, mirror.relayDirectives);
 }
 

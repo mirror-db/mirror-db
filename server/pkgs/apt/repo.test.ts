@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { AptRepo } from "./repo";
+import { createAptProxy } from "./proxy";
 
 const HASH_A = "a".repeat(64);
 const VALID_UNTIL = "Sat, 14 Jun 2026 10:00:00 UTC";
@@ -13,10 +14,15 @@ SHA256:
 `;
 
 // `AptRepo` fetches each suite's Release through `cachedfetch`; mock it.
-const { cachedfetchMock } = vi.hoisted(() => ({ cachedfetchMock: vi.fn() }));
+const { cachedfetchMock, ezfetchMock } = vi.hoisted(() => ({
+  cachedfetchMock: vi.fn(),
+  ezfetchMock: vi.fn(),
+}));
 vi.mock("@server/pkgs/fetch", () => ({
   cachedfetch: cachedfetchMock,
+  ezfetch: ezfetchMock,
   mdbfetch: vi.fn(),
+  sanitizeResponse: (response: Response) => response,
 }));
 
 /** Serve InRelease for the given suites; everything else 404s. */
@@ -34,7 +40,11 @@ function mockUpstream(suites: string[]): { urls: string[] } {
   return { urls };
 }
 
-beforeEach(() => cachedfetchMock.mockReset());
+beforeEach(() => {
+  cachedfetchMock.mockReset();
+  ezfetchMock.mockReset();
+  ezfetchMock.mockResolvedValue(new Response("upstream"));
+});
 
 const BASE = "https://up.example/debian/";
 
@@ -84,5 +94,19 @@ describe("AptRepo facts", () => {
   it("normalizes a base without a trailing slash", () => {
     const repo = new AptRepo({ base: "https://up.example/debian" });
     expect(repo.url("dists/trixie/InRelease")).toBe(`${BASE}dists/trixie/InRelease`);
+  });
+
+  it("forwards the first empty segment, later empty segments and escapes upstream", async () => {
+    const repo = new AptRepo({ base: "https://up.example/debian" });
+    vi.spyOn(repo, "facts").mockResolvedValue(null);
+    const proxy = createAptProxy(repo);
+    const rel = "/empty//x%2fCase%2F";
+
+    await proxy.fetch(new Request(`https://mirs.uk/debian${rel}`), rel);
+
+    expect(ezfetchMock).toHaveBeenCalledWith(
+      `${BASE}/empty//x%2fCase%2F`,
+      undefined,
+    );
   });
 });

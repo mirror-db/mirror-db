@@ -19,19 +19,18 @@ import type { Mirror } from "@server/types";
 
 const UPSTREAM = "https://registry.npmjs.org";
 const PATH = "npm";
-const PREFIX = `/${PATH}`;
 
-const proxy = upstreamProxy({ url: UPSTREAM, prefix: PREFIX })
+const proxy = upstreamProxy({ url: UPSTREAM })
   .post(rewriteBody((body, req) => {
     // `request.url` is always the Worker's origin; the host the client actually
     // dialled lives in `x-mdb-relay-host`. Rewriting to the Worker origin would
     // send every tarball download straight past the relay.
-    const mirrorBase = `${relayInfo(req).origin}${PREFIX}/`;
+    const mirrorBase = `${relayInfo(req).origin}/${PATH}/`;
     return body.replaceAll(`${UPSTREAM}/`, mirrorBase);
   }));
 
 export const npm: Mirror = {
   name: "npm",
   path: PATH,
-  fetch: (request) => proxy.apply(request),
+  fetch: (request, context) => proxy.apply(request, context),
 };

@@ -88,6 +88,7 @@ describe("front door — mirror directive injection", () => {
     const res = await serveMirror(
       mirror,
       new Request("https://mirs.uk/debian/pool/main/n/nginx/nginx_1.0_amd64.deb"),
+      { relativePath: "pool/main/n/nginx/nginx_1.0_amd64.deb" },
     );
 
     expect(res.headers.get("x-mdb-relay")).toBe("no-vary");

@@ -39,7 +39,10 @@ function makeProxy(base: string, html: string) {
 }
 
 function req(url: string, method = "GET", headers?: Record<string, string>) {
-  return new Request(url, { method, headers });
+  return [
+    new Request(url, { method, headers }),
+    new URL(url).pathname.slice(1),
+  ] as const;
 }
 
 // ── JSON API ────────────────────────────────────────────────────────────────
@@ -48,7 +51,7 @@ describe("WebListProxy — JSON API", () => {
   const proxy = makeProxy("http://ftp.us.debian.org/debian/", debianHtml);
 
   it("GET /?format=json returns structured entries", async () => {
-    const res = await proxy.fetch(req("http://localhost/?format=json"));
+    const res = await proxy.fetch(...req("http://localhost/?format=json"));
     expect(res.status).toBe(200);
     const body: any = await res.json();
     expect(body.path).toBe("");
@@ -61,7 +64,7 @@ describe("WebListProxy — JSON API", () => {
 
   it("GET /dists/?format=json works for subdirectories", async () => {
     const proxy2 = makeProxy("https://nl.archive.ubuntu.com/ubuntu/", ubuntuHtml);
-    const res = await proxy2.fetch(req("http://localhost/dists/?format=json"));
+    const res = await proxy2.fetch(...req("http://localhost/dists/?format=json"));
     expect(res.status).toBe(200);
     const body: any = await res.json();
     expect(body.path).toBe("dists/");
@@ -74,7 +77,7 @@ describe("WebListProxy — Web listing", () => {
   const proxy = makeProxy("http://ftp.us.debian.org/debian/", debianHtml);
 
   it("GET / calls the render callback", async () => {
-    const res = await proxy.fetch(req("http://localhost/"));
+    const res = await proxy.fetch(...req("http://localhost/"));
     expect(res.status).toBe(200);
     const body: any = await res.json();
     expect(body.rendered).toBe(true);
@@ -83,7 +86,7 @@ describe("WebListProxy — Web listing", () => {
   });
 
   it("GET /pool/ renders subdirectory", async () => {
-    const res = await proxy.fetch(req("http://localhost/pool/"));
+    const res = await proxy.fetch(...req("http://localhost/pool/"));
     const body: any = await res.json();
     expect(body.rendered).toBe(true);
     expect(body.path).toBe("pool/");
@@ -103,7 +106,7 @@ describe("WebListProxy — Web listing", () => {
       },
     });
 
-    const res = await tracking.fetch(req("http://localhost/pool?format=json"));
+    const res = await tracking.fetch(...req("http://localhost/pool?format=json"));
     expect(res.status).toBe(200);
     expect(seen).toEqual(["http://ftp.us.debian.org/debian/pool/"]);
   });
@@ -115,7 +118,7 @@ describe("WebListProxy — File passthrough", () => {
   const proxy = makeProxy("http://ftp.us.debian.org/debian/", debianHtml);
 
   it("GET /README proxies the file from upstream", async () => {
-    const res = await proxy.fetch(req("http://localhost/README"));
+    const res = await proxy.fetch(...req("http://localhost/README"));
     expect(res.status).toBe(200);
     const body = await res.text();
     expect(body).toContain("file-content-of:");
@@ -147,7 +150,7 @@ describe("WebListProxy — File passthrough", () => {
     });
 
     try {
-      const res = await proxy.fetch(req("http://localhost/README"));
+      const res = await proxy.fetch(...req("http://localhost/README"));
       for (const name of [
         "www-authenticate",
         "set-cookie",
@@ -175,7 +178,7 @@ describe("WebListProxy — WebDAV", () => {
   const proxy = makeProxy("http://ftp.us.debian.org/debian/", debianHtml);
 
   it("OPTIONS returns DAV:1 and correct Allow", async () => {
-    const res = await proxy.fetch(req("http://localhost/", "OPTIONS"));
+    const res = await proxy.fetch(...req("http://localhost/", "OPTIONS"));
     expect(res.status).toBe(204);
     expect(res.headers.get("dav")).toBe("1");
     expect(res.headers.get("allow")).toContain("PROPFIND");
@@ -184,7 +187,7 @@ describe("WebListProxy — WebDAV", () => {
 
   it("PROPFIND / Depth:1 returns 207 with entries", async () => {
     const res = await proxy.fetch(
-      req("http://localhost/", "PROPFIND", { depth: "1" }),
+      ...req("http://localhost/", "PROPFIND", { depth: "1" }),
     );
     expect(res.status).toBe(207);
     const xml = await res.text();
@@ -197,7 +200,7 @@ describe("WebListProxy — WebDAV", () => {
 
   it("PROPFIND / Depth:0 returns only the directory itself", async () => {
     const res = await proxy.fetch(
-      req("http://localhost/", "PROPFIND", { depth: "0" }),
+      ...req("http://localhost/", "PROPFIND", { depth: "0" }),
     );
     expect(res.status).toBe(207);
     const xml = await res.text();
@@ -206,14 +209,33 @@ describe("WebListProxy — WebDAV", () => {
     expect(responseCount).toBe(1);
   });
 
+  it("combines the configured baseHref with the explicit relative path", async () => {
+    const mounted = new WebListProxy({
+      baseURL: "http://ftp.us.debian.org/debian/",
+      baseHref: "/debian-cd/",
+      fetchImpl: stubFetch(debianHtml),
+      render: () => new Response("unused"),
+    });
+    const [request] = req(
+      "https://mirs.uk/debian-cd/dists/?format=not-json",
+      "PROPFIND",
+      { depth: "0" },
+    );
+
+    const res = await mounted.fetch(request, "dists/");
+
+    expect(res.status).toBe(207);
+    expect(await res.text()).toContain("<D:href>/debian-cd/dists/</D:href>");
+  });
+
   it("PUT returns 405 Method Not Allowed", async () => {
-    const res = await proxy.fetch(req("http://localhost/test", "PUT"));
+    const res = await proxy.fetch(...req("http://localhost/test", "PUT"));
     expect(res.status).toBe(405);
     expect(res.headers.get("allow")).toContain("GET");
   });
 
   it("DELETE returns 405", async () => {
-    const res = await proxy.fetch(req("http://localhost/test", "DELETE"));
+    const res = await proxy.fetch(...req("http://localhost/test", "DELETE"));
     expect(res.status).toBe(405);
   });
 });
@@ -236,20 +258,20 @@ describe("WebListProxy — upstream without a listing", () => {
     // answered `500 error code: 1101`.
     const proxy = proxyReturning(404);
     for (const path of ["/dists/", "/dists/?format=json"]) {
-      const res = await proxy.fetch(req(`http://localhost${path}`));
+      const res = await proxy.fetch(...req(`http://localhost${path}`));
       expect(res.status).toBe(404);
     }
   });
 
   it("answers 404 for PROPFIND on such a directory", async () => {
     const res = await proxyReturning(404).fetch(
-      req("http://localhost/dists/", "PROPFIND", { depth: "0" }),
+      ...req("http://localhost/dists/", "PROPFIND", { depth: "0" }),
     );
     expect(res.status).toBe(404);
   });
 
   it("answers 502 when the upstream itself failed", async () => {
-    const res = await proxyReturning(500).fetch(req("http://localhost/dists/"));
+    const res = await proxyReturning(500).fetch(...req("http://localhost/dists/"));
     expect(res.status).toBe(502);
   });
 
@@ -263,11 +285,11 @@ describe("WebListProxy — upstream without a listing", () => {
         return new Response("");
       },
     });
-    expect((await proxy.fetch(req("http://localhost/"))).status).toBe(502);
+    expect((await proxy.fetch(...req("http://localhost/"))).status).toBe(502);
   });
 
   it("does not cache a failed listing", async () => {
-    const res = await proxyReturning(404).fetch(req("http://localhost/dists/"));
+    const res = await proxyReturning(404).fetch(...req("http://localhost/dists/"));
     expect(res.headers.get("cache-control")).toBe("no-store");
   });
 });
@@ -290,12 +312,12 @@ describe("WebListProxy — fetchHook", () => {
       },
     });
 
-    const hooked = await proxy.fetch(req("http://localhost/special"));
+    const hooked = await proxy.fetch(...req("http://localhost/special"));
     expect(hooked.status).toBe(299);
     expect(await hooked.text()).toBe("hooked!");
 
     // Non-matched paths still fall through normally.
-    const normal = await proxy.fetch(req("http://localhost/README"));
+    const normal = await proxy.fetch(...req("http://localhost/README"));
     expect(normal.status).toBe(200);
     expect(await normal.text()).toContain("file-content-of:");
   });
@@ -312,7 +334,33 @@ describe("WebListProxy — fetchHook", () => {
       },
     });
 
-    await proxy.fetch(req("http://localhost/dists/trixie/InRelease"));
+    await proxy.fetch(...req("http://localhost/dists/trixie/InRelease"));
     expect(captured).toBe("dists/trixie/InRelease");
+  });
+
+  it("receives the original request and an independent, verbatim rel", async () => {
+    const request = new Request(
+      "https://mirs.uk/debian-cd/not-the-relative-path?download=a%2Fb",
+      { headers: { "x-mdb-relay-host": "relay.example.com" } },
+    );
+    let seenPath: string | undefined;
+    let seenRequest: Request | undefined;
+    const proxy = new WebListProxy({
+      baseURL: "http://ftp.us.debian.org/debian/",
+      render: () => new Response("unused"),
+      fetchHook(path, original) {
+        seenPath = path;
+        seenRequest = original;
+        return new Response(null, { status: 204 });
+      },
+    });
+
+    const res = await proxy.fetch(request, "/empty//segment/%2fCase%2F");
+
+    expect(res.status).toBe(204);
+    expect(seenPath).toBe("/empty//segment/%2fCase%2F");
+    expect(seenRequest).toBe(request);
+    expect(seenRequest!.headers.get("x-mdb-relay-host")).toBe("relay.example.com");
+    expect(new URL(seenRequest!.url).search).toBe("?download=a%2Fb");
   });
 });

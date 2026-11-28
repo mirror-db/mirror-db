@@ -99,13 +99,15 @@ function makeProxy(opts: Parameters<typeof makeRepo>[0]) {
   return createAptProxy(makeRepo(opts));
 }
 
-const get = (path: string) =>
-  new Request(`https://mirs.uk/${path}`, { method: "GET" });
+const get = (path: string) => [
+  new Request(`https://mirs.uk/${path}`, { method: "GET" }),
+  path,
+] as const;
 
 describe("createAptProxy — file enforcement", () => {
   it("passes through unjudged while the repo is not ready", async () => {
     const proxy = makeProxy({ ready: false });
-    const res = await proxy.fetch(get("dists/trixie/does-not-exist"));
+    const res = await proxy.fetch(...get("dists/trixie/does-not-exist"));
 
     expect(res.status).toBe(200);
     expect(ezfetchMock).toHaveBeenCalled();
@@ -113,7 +115,7 @@ describe("createAptProxy — file enforcement", () => {
 
   it("keeps max-age=0 when no generation exists", async () => {
     const proxy = makeProxy({ ready: false });
-    const res = await proxy.fetch(get("dists/trixie/does-not-exist"));
+    const res = await proxy.fetch(...get("dists/trixie/does-not-exist"));
 
     expect(res.status).toBe(200);
     expect(res.headers.get("cache-control")).toBe("public, max-age=0");
@@ -122,7 +124,7 @@ describe("createAptProxy — file enforcement", () => {
   it("404s an unknown by-hash file once ready, without fetching", async () => {
     const proxy = makeProxy({ ready: true, hashes: [] });
     const res = await proxy.fetch(
-      get(`dists/trixie/main/binary-amd64/by-hash/SHA256/${"b".repeat(64)}`),
+      ...get(`dists/trixie/main/binary-amd64/by-hash/SHA256/${"b".repeat(64)}`),
     );
 
     expect(res.status).toBe(404);
@@ -133,7 +135,7 @@ describe("createAptProxy — file enforcement", () => {
     const sha512 = "c".repeat(128);
     const proxy = makeProxy({ ready: true, hashes: [sha512] });
     const res = await proxy.fetch(
-      get(`dists/trixie/main/binary-amd64/by-hash/SHA512/${sha512}`),
+      ...get(`dists/trixie/main/binary-amd64/by-hash/SHA512/${sha512}`),
     );
 
     expect(res.status).toBe(200);
@@ -147,7 +149,7 @@ describe("createAptProxy — file enforcement", () => {
     const sha1 = "d".repeat(40);
     const proxy = makeProxy({ ready: true, hashes: [sha1] });
     const res = await proxy.fetch(
-      get(`dists/trixie/main/binary-amd64/by-hash/SHA1/${sha1}`),
+      ...get(`dists/trixie/main/binary-amd64/by-hash/SHA1/${sha1}`),
     );
 
     expect(res.status).toBe(200);
@@ -156,7 +158,7 @@ describe("createAptProxy — file enforcement", () => {
 
   it("404s an unknown dists file once ready", async () => {
     const proxy = makeProxy({ ready: true, paths: ["dists/trixie/Release"] });
-    const res = await proxy.fetch(get("dists/trixie/ghost"));
+    const res = await proxy.fetch(...get("dists/trixie/ghost"));
 
     expect(res.status).toBe(404);
     expect(cachedfetchMock).not.toHaveBeenCalled();
@@ -166,7 +168,7 @@ describe("createAptProxy — file enforcement", () => {
     // Curated mirrors resolve only a subset of suites; a request for a suite the
     // index never touched (e.g. bullseye) must reach upstream, not 404.
     const proxy = makeProxy({ ready: true, paths: ["dists/trixie/Release"] });
-    const res = await proxy.fetch(get("dists/bullseye/InRelease"));
+    const res = await proxy.fetch(...get("dists/bullseye/InRelease"));
 
     expect(res.status).toBe(200);
     expect(ezfetchMock).toHaveBeenCalledTimes(1);
@@ -174,7 +176,7 @@ describe("createAptProxy — file enforcement", () => {
 
   it("always passes through pool/ paths (not in Release)", async () => {
     const proxy = makeProxy({ ready: true, paths: [] });
-    const res = await proxy.fetch(get("pool/main/n/nginx/nginx_1.0_amd64.deb"));
+    const res = await proxy.fetch(...get("pool/main/n/nginx/nginx_1.0_amd64.deb"));
 
     expect(res.status).toBe(200);
     expect(ezfetchMock).toHaveBeenCalledTimes(1);
@@ -186,7 +188,7 @@ describe("createAptProxy — cache-control", () => {
     const repo = makeRepo({ ready: true, hashes: [HASH] });
     const proxy = createAptProxy(repo);
     const res = await proxy.fetch(
-      get(`dists/trixie/main/binary-amd64/by-hash/SHA256/${HASH}`),
+      ...get(`dists/trixie/main/binary-amd64/by-hash/SHA256/${HASH}`),
     );
 
     expect(res.headers.get("cache-control")).toBe(
@@ -204,7 +206,7 @@ describe("createAptProxy — cache-control", () => {
     const proxy = makeProxy({ ready: true, hashes: [HASH] });
 
     const res = await proxy.fetch(
-      get(`dists/trixie/main/binary-amd64/by-hash/SHA256/${HASH}`),
+      ...get(`dists/trixie/main/binary-amd64/by-hash/SHA256/${HASH}`),
     );
 
     expect(res.status).toBe(304);
@@ -217,7 +219,7 @@ describe("createAptProxy — cache-control", () => {
     // bytes for ordinary HTTP caching.
     const proxy = makeProxy({ ready: false });
     const res = await proxy.fetch(
-      get(`dists/trixie/main/binary-amd64/by-hash/SHA256/${HASH}`),
+      ...get(`dists/trixie/main/binary-amd64/by-hash/SHA256/${HASH}`),
     );
 
     expect(cachedfetchMock).toHaveBeenCalled();
@@ -230,7 +232,7 @@ describe("createAptProxy — cache-control", () => {
   it("merges a by-hash declaration with the front middleware's no-vary", async () => {
     const proxy = makeProxy({ ready: true, hashes: [HASH] });
     const res = await proxy.fetch(
-      get(`dists/trixie/main/binary-amd64/by-hash/SHA256/${HASH}`),
+      ...get(`dists/trixie/main/binary-amd64/by-hash/SHA256/${HASH}`),
     );
 
     const merged = withRelayDirectives(res, ["no-vary"]);
@@ -254,7 +256,7 @@ describe("createAptProxy — cache-control", () => {
       paths: [path],
       validUntil: Date.now() + 3600_000,
     });
-    const res = await proxy.fetch(get(path));
+    const res = await proxy.fetch(...get(path));
 
     expect(ezfetchMock).toHaveBeenCalled();
     expect(res.headers.get("x-mdb-relay")).toBe("no-store");
@@ -271,7 +273,7 @@ describe("createAptProxy — cache-control", () => {
       ready: true,
       paths: ["dists/trixie/InRelease"],
     });
-    const res = await proxy.fetch(get("dists/trixie/InRelease"));
+    const res = await proxy.fetch(...get("dists/trixie/InRelease"));
 
     const merged = withRelayDirectives(res, ["no-vary"]);
     expect(merged.headers.get("x-mdb-relay")).toBe("no-store, no-vary");
@@ -282,7 +284,7 @@ describe("createAptProxy — cache-control", () => {
 
   it("does not mark pool payloads no-store", async () => {
     const proxy = makeProxy({ ready: true, paths: [] });
-    const res = await proxy.fetch(get("pool/main/n/nginx/nginx_1.0_amd64.deb"));
+    const res = await proxy.fetch(...get("pool/main/n/nginx/nginx_1.0_amd64.deb"));
 
     expect(ezfetchMock).toHaveBeenCalled();
     expect(res.headers.get("x-mdb-relay")).toBeNull();
@@ -296,7 +298,7 @@ describe("createAptProxy — cache-control", () => {
       }),
     );
     const proxy = makeProxy({ ready: true, paths: ["dists/trixie/Release"] });
-    const res = await proxy.fetch(get("dists/trixie/Release"));
+    const res = await proxy.fetch(...get("dists/trixie/Release"));
 
     expect(res.headers.has("set-cookie")).toBe(false);
   });
@@ -313,16 +315,16 @@ describe("createAptProxy — cache-control", () => {
       { prefetchRelease: true },
     );
 
-    const release = await proxy.fetch(get("dists/trixie/InRelease"));
+    const release = await proxy.fetch(...get("dists/trixie/InRelease"));
     // The upstream's own directive is sanitised away, then ours is merged in.
     expect(release.headers.get("x-mdb-relay")).toBe("no-store, prefetch");
 
-    const index = await proxy.fetch(get("dists/trixie/main/binary-amd64/Packages"));
+    const index = await proxy.fetch(...get("dists/trixie/main/binary-amd64/Packages"));
     expect(index.headers.get("x-mdb-relay")).toBe("no-store");
 
     // A failed release fetch is not an invitation to refresh it.
     ezfetchMock.mockImplementation(async () => new Response(null, { status: 404 }));
-    const missing = await proxy.fetch(get("dists/trixie/InRelease"));
+    const missing = await proxy.fetch(...get("dists/trixie/InRelease"));
     expect(missing.headers.get("x-mdb-relay")).toBe("no-store");
   });
 
@@ -335,7 +337,7 @@ describe("createAptProxy — cache-control", () => {
       { prefetchRelease: true },
     );
 
-    const res = await proxy.fetch(get("dists/trixie/InRelease"));
+    const res = await proxy.fetch(...get("dists/trixie/InRelease"));
 
     expect(res.status).toBe(304);
     expect(res.headers.get("x-mdb-relay")).toBe("no-store, prefetch");
@@ -345,7 +347,7 @@ describe("createAptProxy — cache-control", () => {
 describe("createAptProxy — directory listing", () => {
   it("renders root directory as HTML via defaultRender", async () => {
     const proxy = makeProxy({ ready: true, paths: ["dists/trixie/InRelease"] });
-    const res = await proxy.fetch(get(""));
+    const res = await proxy.fetch(...get(""));
 
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toContain("text/html");
@@ -357,6 +359,7 @@ describe("createAptProxy — directory listing", () => {
     const proxy = makeProxy({ ready: true, paths: ["dists/trixie/InRelease"] });
     const res = await proxy.fetch(
       new Request("https://mirs.uk/?format=json"),
+      "",
     );
 
     expect(res.headers.get("content-type")).toContain("application/json");
@@ -370,7 +373,7 @@ describe("createAptProxy — directory listing", () => {
       ready: true,
       paths: ["dists/trixie/InRelease"],
     });
-    const res = await proxy.fetch(get("dists"));
+    const res = await proxy.fetch(...get("dists"));
 
     // 308 keeps the method and body; the Location stays relative so the client
     // does not get pinned to the Worker's own origin (bypassing the relay).
@@ -380,15 +383,17 @@ describe("createAptProxy — directory listing", () => {
 });
 
 describe("createAptProxy — method forwarding", () => {
-  const head = (path: string) =>
-    new Request(`https://mirs.uk/${path}`, { method: "HEAD" });
+  const head = (path: string) => [
+    new Request(`https://mirs.uk/${path}`, { method: "HEAD" }),
+    path,
+  ] as const;
 
   it("forwards HEAD for an ordinary pool file and answers without a body", async () => {
     // A real HEAD upstream response is bodyless; this test owns method routing.
     ezfetchMock.mockResolvedValue(new Response(null, { headers: { "content-length": "4" } }));
     const proxy = makeProxy({ ready: true, paths: [] });
     const res = await proxy.fetch(
-      head("pool/main/n/nginx/nginx_1.0_amd64.deb"),
+      ...head("pool/main/n/nginx/nginx_1.0_amd64.deb"),
     );
 
     expect(ezfetchMock).toHaveBeenCalledTimes(1);
@@ -403,7 +408,7 @@ describe("createAptProxy — method forwarding", () => {
     cachedfetchMock.mockResolvedValue(new Response(null, { headers: { "content-length": "4" } }));
     const proxy = makeProxy({ ready: true, hashes: [HASH] });
     const res = await proxy.fetch(
-      head(`dists/trixie/main/binary-amd64/by-hash/SHA256/${HASH}`),
+      ...head(`dists/trixie/main/binary-amd64/by-hash/SHA256/${HASH}`),
     );
 
     expect(cachedfetchMock).toHaveBeenCalledTimes(1);
@@ -425,7 +430,7 @@ describe("createAptProxy — method forwarding", () => {
   it("asks for identity on a by-hash GET", async () => {
     const proxy = makeProxy({ ready: true, hashes: [HASH] });
     await proxy.fetch(
-      get(`dists/trixie/main/binary-amd64/by-hash/SHA256/${HASH}`),
+      ...get(`dists/trixie/main/binary-amd64/by-hash/SHA256/${HASH}`),
     );
 
     const [, init] = cachedfetchMock.mock.calls[0]!;
@@ -436,7 +441,7 @@ describe("createAptProxy — method forwarding", () => {
 
   it("leaves a GET without a method override", async () => {
     const proxy = makeProxy({ ready: true, paths: [] });
-    const res = await proxy.fetch(get("pool/main/n/nginx/nginx_1.0_amd64.deb"));
+    const res = await proxy.fetch(...get("pool/main/n/nginx/nginx_1.0_amd64.deb"));
 
     expect(ezfetchMock.mock.calls[0]![1]).toBeUndefined();
     expect(await res.text()).toBe("data");
@@ -455,6 +460,7 @@ describe("createAptProxy — method forwarding", () => {
         `https://mirs.uk/dists/trixie/main/binary-amd64/by-hash/SHA256/${HASH}`,
         { headers: { range: "bytes=2-6" } },
       ),
+      `dists/trixie/main/binary-amd64/by-hash/SHA256/${HASH}`,
     );
 
     expect(res.status).toBe(206);
@@ -477,6 +483,7 @@ describe("createAptProxy — method forwarding", () => {
       new Request("https://mirs.uk/pool/main/n/nginx/nginx_1.0_amd64.deb", {
         headers: { range: "bytes=2-6" },
       }),
+      "pool/main/n/nginx/nginx_1.0_amd64.deb",
     );
 
     expect(res.status).toBe(200);
@@ -495,6 +502,7 @@ describe("createAptProxy — method forwarding", () => {
         "https://mirs.uk/dists/trixie/main/binary-amd64/Packages.gz",
         { headers: { range: "bytes=0-3" } },
       ),
+      "dists/trixie/main/binary-amd64/Packages.gz",
     );
 
     expect(res.status).toBe(200);
@@ -509,7 +517,7 @@ describe("createAptProxy — tree coverage", () => {
   it("redirects a pool directory addressed without a trailing slash", async () => {
     const proxy = makeTreeProxy(["pool/main/n/nginx/nginx_1.0_amd64.deb"]);
 
-    const res = await proxy.fetch(get("pool/main/n/nginx"));
+    const res = await proxy.fetch(...get("pool/main/n/nginx"));
     expect(res.status).toBe(308);
     expect(res.headers.get("location")).toBe("/pool/main/n/nginx/");
     expect(ezfetchMock).not.toHaveBeenCalled();
@@ -518,7 +526,7 @@ describe("createAptProxy — tree coverage", () => {
   it("redirects the dists root the same way", async () => {
     const proxy = makeTreeProxy(["dists/trixie/InRelease"]);
 
-    const res = await proxy.fetch(get("dists"));
+    const res = await proxy.fetch(...get("dists"));
     expect(res.status).toBe(308);
     expect(res.headers.get("location")).toBe("/dists/");
   });
@@ -526,7 +534,7 @@ describe("createAptProxy — tree coverage", () => {
   it("leaves an unknown pool file to the ordinary file path", async () => {
     const proxy = makeTreeProxy(["pool/main/n/nginx/nginx_1.0_amd64.deb"]);
 
-    const res = await proxy.fetch(get("pool/main/x/other/other_1.0_amd64.deb"));
+    const res = await proxy.fetch(...get("pool/main/x/other/other_1.0_amd64.deb"));
     expect(res.status).toBe(200);
     expect(ezfetchMock).toHaveBeenCalledTimes(1);
   });
@@ -534,7 +542,7 @@ describe("createAptProxy — tree coverage", () => {
   it("404s an unknown path inside a known suite", async () => {
     const proxy = makeTreeProxy(["dists/trixie/InRelease"]);
 
-    const res = await proxy.fetch(get("dists/trixie/ghost"));
+    const res = await proxy.fetch(...get("dists/trixie/ghost"));
     expect(res.status).toBe(404);
     expect(ezfetchMock).not.toHaveBeenCalled();
   });
@@ -542,7 +550,7 @@ describe("createAptProxy — tree coverage", () => {
   it("lets a known suite's signed siblings pass through unjudged", async () => {
     const proxy = makeTreeProxy(["dists/trixie/InRelease"]);
 
-    const res = await proxy.fetch(get("dists/trixie/Release.gpg"));
+    const res = await proxy.fetch(...get("dists/trixie/Release.gpg"));
     expect(res.status).toBe(200);
     expect(ezfetchMock).toHaveBeenCalledTimes(1);
   });
@@ -552,7 +560,7 @@ describe("createAptProxy — tree coverage", () => {
     const proxy = makeTreeProxy(["dists/trixie/InRelease"], [fresh]);
 
     const res = await proxy.fetch(
-      get(`dists/trixie/main/binary-amd64/by-hash/SHA256/${fresh}`),
+      ...get(`dists/trixie/main/binary-amd64/by-hash/SHA256/${fresh}`),
     );
     expect(res.status).toBe(200);
   });
@@ -571,6 +579,7 @@ describe("createAptProxy — tree coverage", () => {
         `https://mirs.uk/dists/trixie/main/binary-amd64/by-hash/SHA256/${HASH}`,
         { headers: { range: "bytes=0-3" } },
       ),
+      `dists/trixie/main/binary-amd64/by-hash/SHA256/${HASH}`,
     );
 
     expect(res.status).toBe(206);
@@ -584,6 +593,7 @@ describe("createAptProxy — WebDAV", () => {
     const proxy = makeProxy({ ready: true, paths: [] });
     const res = await proxy.fetch(
       new Request("https://mirs.uk/", { method: "OPTIONS" }),
+      "",
     );
 
     expect(res.status).toBe(204);
@@ -594,6 +604,7 @@ describe("createAptProxy — WebDAV", () => {
     const proxy = makeProxy({ ready: true, paths: [] });
     const res = await proxy.fetch(
       new Request("https://mirs.uk/", { method: "PROPFIND", headers: { depth: "1" } }),
+      "",
     );
 
     expect(res.status).toBe(207);
@@ -605,6 +616,7 @@ describe("createAptProxy — WebDAV", () => {
     const proxy = makeProxy({ ready: true, paths: [] });
     const res = await proxy.fetch(
       new Request("https://mirs.uk/foo", { method: "PUT" }),
+      "foo",
     );
 
     expect(res.status).toBe(405);

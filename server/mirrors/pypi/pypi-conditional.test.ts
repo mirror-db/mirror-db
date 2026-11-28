@@ -33,7 +33,7 @@ describe("pypi simple index — real conditional passthrough", () => {
       return new Response(null, { status: 304, headers: { etag: '"index-1"' } });
     });
 
-    const res = await pypi.fetch(conditional('"index-1"'));
+    const res = await pypi.fetch(conditional('"index-1"'), { relativePath: "simple/" });
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(res.status).toBe(304);
@@ -45,7 +45,7 @@ describe("pypi simple index — real conditional passthrough", () => {
   it("does not fabricate a 304 — an upstream error is passed through", async () => {
     fetchMock.mockImplementation(async () => new Response("bad", { status: 502 }));
 
-    const res = await pypi.fetch(conditional('"index-1"'));
+    const res = await pypi.fetch(conditional('"index-1"'), { relativePath: "simple/" });
 
     expect(res.status).toBe(502);
     expect(res.headers.get("x-mdb-relay")).toBeNull();

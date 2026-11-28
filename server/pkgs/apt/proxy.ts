@@ -114,7 +114,7 @@ async function aptFetchHook(
       // generation only lists metadata it verified, and a real package body is
       // not something it can prove absent.
       if (!facts.paths.has(rel)) {
-        if (hasChildren(facts.paths, `${rel}/`)) return directoryRedirect(request, opts?.baseHref);
+        if (hasChildren(facts.paths, `${rel}/`)) return directoryRedirect(rel, opts?.baseHref);
         // A known suite's other signed names are not a 404: apt chooses between
         // `InRelease`, `Release` and `Release.gpg`, and a generation that only
         // verified one must not hide the fallbacks.
@@ -129,7 +129,7 @@ async function aptFetchHook(
       // to suites we actually indexed — paths under an un-indexed suite pass
       // through unjudged so a curated suite list never blocks reachable suites.
       if (!facts.paths.has(rel)) {
-        if (hasChildren(facts.paths, `${rel}/`)) return directoryRedirect(request, opts?.baseHref);
+        if (hasChildren(facts.paths, `${rel}/`)) return directoryRedirect(rel, opts?.baseHref);
         return notFound();
       }
     }
@@ -235,11 +235,10 @@ function hasChildren(paths: ReadonlySet<string>, prefix: string): boolean {
  * permanent `301` would also be cached by clients forever, outliving a relay
  * move).
  */
-function directoryRedirect(request: Request, baseHref?: string): Response {
-  const path = new URL(request.url).pathname.replace(/^\/+/, "");
+function directoryRedirect(rel: string, baseHref?: string): Response {
   const prefix = !baseHref ? "/" : baseHref.endsWith("/") ? baseHref : `${baseHref}/`;
   return new Response(null, {
     status: 308,
-    headers: { location: `${prefix}${path}/` },
+    headers: { location: `${prefix}${rel}/` },
   });
 }

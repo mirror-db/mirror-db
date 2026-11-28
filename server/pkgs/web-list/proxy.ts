@@ -12,8 +12,8 @@
  *   baseURL: "http://ftp.us.debian.org/debian/",
  *   render(entries, path) { return new Response(html) },
  * });
- * // Mount under a path prefix; strip the prefix before handing to fetch:
- * return proxy.fetch(request);
+ * // The router supplies the path within the mount separately:
+ * return proxy.fetch(request, mountRelativePath);
  * ```
  */
 
@@ -118,14 +118,11 @@ export class WebListProxy {
   }
 
   /**
-   * Handle an incoming request. The caller is responsible for stripping any
-   * mount prefix from the URL — this handler sees the **relative** path within
-   * the listing root.
-   *
-   * The request URL's `pathname` is used as the relative path: `""` or `"/"`
-   * means root, `"/dists/"` means the `dists/` subdirectory, etc.
+   * Handle an incoming request with its explicitly resolved mount-relative path.
+   * The original request still supplies the method, query and headers; `rel` is
+   * used verbatim, without stripping slashes or decoding escapes.
    */
-  async fetch(request: Request): Promise<Response> {
+  async fetch(request: Request, rel: string): Promise<Response> {
     const method = request.method.toUpperCase();
 
     if (!ALLOWED_METHODS.has(method)) {
@@ -137,8 +134,6 @@ export class WebListProxy {
     }
 
     const url = new URL(request.url);
-    // Relative path within the listing root (strip leading `/`).
-    const rel = url.pathname.replace(/^\/+/, "");
 
     // PROPFIND is always a directory operation — handle before the hook so
     // domain-specific file logic doesn't accidentally intercept it.

@@ -3,8 +3,8 @@
  *
  * - **Web list mirrors** — upstream serves Apache/nginx autoindex; we expose
  *   directory browsing (HTML, JSON, WebDAV) + file passthrough via WebListProxy.
- * - **Passthrough mirrors** — no directory listing, just forward all requests
- *   to upstream with shared caching + header sanitization.
+ * - **Passthrough mirrors** — no directory listing, just forward the resolved
+ *   mount-relative path to upstream with shared caching + header sanitization.
  */
 
 import { WebListProxy } from "@server/pkgs/web-list/proxy";
@@ -52,11 +52,8 @@ export function createWebListMirror(config: WebMirrorConfig): Mirror {
     path: config.name,
     ...(config.keepHTTP && { keepHTTP: true }),
     ...(config.policyTags && { policyTags: config.policyTags }),
-    fetch(request) {
-      const url = new URL(request.url);
-      const rel = url.pathname.slice(prefix.length);
-      const inner = new Request(new URL(`/${rel}${url.search}`, url.origin), request);
-      return proxy.fetch(inner);
+    fetch(request, context) {
+      return proxy.fetch(request, context.relativePath);
     },
   };
 }
@@ -66,14 +63,13 @@ export function createWebListMirror(config: WebMirrorConfig): Mirror {
  * upstream. No directory listing — just cached fetch + header sanitization.
  */
 export function createPassthroughMirror(config: WebMirrorConfig): Mirror {
-  const prefix = `/${config.name}`;
-  const proxy = upstreamProxy({ url: config.base, prefix });
+  const proxy = upstreamProxy({ url: config.base });
 
   return {
     name: config.name,
     path: config.name,
     ...(config.keepHTTP && { keepHTTP: true }),
     ...(config.policyTags && { policyTags: config.policyTags }),
-    fetch: (request) => proxy.apply(request),
+    fetch: (request, context) => proxy.apply(request, context),
   };
 }

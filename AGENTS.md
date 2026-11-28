@@ -12,14 +12,20 @@ challenges never reach clients.
 e.g. `dcr.mirs.uk` → Docker Hub) or `path` (single word, matched as the first
 URL segment, e.g. `mirs.uk/npm/...`), optional `keepHTTP` (serve over plain HTTP
 without redirect), optional `relayDirectives` (response-side `X-MDB-Relay`
-keywords; never part of the distributed manifest), `fetch(request)`, optional
-`status()`.
+keywords; never part of the distributed manifest), `fetch(request, context)`,
+optional `status()`. `MountContext.relativePath` excludes the mount name and
+query, adds no leading slash, and preserves pathname case, escaping and empty
+segments. The router computes it once; path mounts use the existing pathname
+split's remaining segments, while a subdomain mount receives its full path minus
+the URL's structural leading slash. Mirrors consume the original request plus
+this context instead of stripping their own prefix again.
 
 - [server/index.ts](server/index.ts) — entry. Parses subdomain from host header.
   Subdomain mirror wins; on bare `@` splits pathname, looks up first segment in
   `mirrorsByPath`, then the mount switches: `/speedtest/`, `/relaytest/`,
-  `/keys/`, `/api/`, `/scripts/`, `/conf/`. Every mirror response goes through
-  `serveMirror`, which applies the shared relay-control middleware
+  `/keys/`, `/api/`, `/scripts/`, `/conf/`. `serveMirror` passes the original
+  request and resolved mount context to the mirror; every response then goes
+  through the shared relay-control middleware
   ([server/relay-control.ts](server/relay-control.ts)). Inbound requests are
   normalised first: a request without a valid `X-MDB-Relay-Host` loses any
   `X-MDB-Relay` request header, so a direct client cannot inject response
@@ -460,31 +466,41 @@ through these, not bare `fetch`, so user-agent + rate-limiting are uniform.
 
 ## Upstream proxy builder — [server/mirrors/proxy/](server/mirrors/proxy/)
 
-Composable hook chain for non-OCI mirrors that just need prefix-strip + base-URL
-+ cache + sanitize. Used by `createPassthroughMirror` (web-mirrors) and npm.
+Composable hook chain for non-OCI mirrors that need mount-relative upstream URL
+mapping + cache + sanitize. Used by `createPassthroughMirror` (web-mirrors) and
+npm.
 
 - **`upstreamProxy(upstream)`** — factory returning a `ProxyRequest` pre-wired
-  with: `stripPrefix` → `setBaseUrl` → `filterHeaders` (Range + extras) →
-  `standardizeUserAgent` → `followRedirects`. Fetches via `cachedfetch`, which
-  owns response sanitising, so the factory adds no duplicate post-hook.
-- **`Upstream`** interface: `{ url, prefix?, passthroughHeaders? }`.
-- **`ProxyRequest`** class: `.pre(hook)` / `.post(hook)` / `.apply(req)`.
-  Pre-hooks transform the outbound Request; post-hooks transform the Response.
-  Post-hooks receive the **original** request (pre-rewrite), useful for URL
-  rewriting in response bodies.
-- Pre-hooks: `rewritePath(fn)`, `stripPrefix`, `setBaseUrl` (preserves query),
-  `stripSearch`, `filterHeaders`, `standardizeUserAgent`, `followRedirects`.
+  with: `setBaseUrl` → `filterHeaders` (Range + extras) →
+  `standardizeUserAgent` → `followRedirects`. `setBaseUrl` appends the resolved
+  `MountContext.relativePath` verbatim to the upstream base and preserves the
+  original query. Fetches via `cachedfetch`, which owns response sanitising, so
+  the factory adds no duplicate post-hook.
+- **`Upstream`** interface: `{ url, passthroughHeaders? }`.
+- **`ProxyRequest`** class: `.pre(hook)` / `.post(hook)` /
+  `.apply(req, context)`. Pre-hooks receive the outbound Request and mount
+  context; post-hooks transform the Response. Post-hooks receive the **original**
+  client request (pre-rewrite), useful for relay-aware URL rewriting in response
+  bodies. Within this chain, only the URL adapter rewrites the upstream URL;
+  header and redirect hooks may still construct a Request. Neither the mirror nor
+  the front door creates an inner Request just to strip a mount.
+- Pre-hooks: `setBaseUrl` (preserves query), `stripSearch`, `filterHeaders`,
+  `standardizeUserAgent`, `followRedirects`.
 - Post-hooks: `sanitize` (strips dangerous headers), `rewriteBody(fn)` (streaming
   text transform via `TransformStream`; skips non-text; deletes `content-length`).
 
 Example — npm mirror in full:
 ```ts
-const proxy = upstreamProxy({ url: UPSTREAM, prefix: PREFIX })
+const proxy = upstreamProxy({ url: UPSTREAM })
   .post(rewriteBody((body, req) => {
-    const mirrorBase = `${new URL(req.url).origin}${PREFIX}/`;
+    const mirrorBase = `${relayInfo(req).origin}/${PATH}/`;
     return body.replaceAll(`${UPSTREAM}/`, mirrorBase);
   }));
-export const npm: Mirror = { name: "npm", path: PATH, fetch: (r) => proxy.apply(r) };
+export const npm: Mirror = {
+  name: "npm",
+  path: PATH,
+  fetch: (request, context) => proxy.apply(request, context),
+};
 ```
 
 ## Web listing proxy — [server/pkgs/web-list/](server/pkgs/web-list/)
@@ -497,7 +513,10 @@ the APT mirror but reusable for any directory-listing upstream.
   extracting `<tr>/<th>/<td>/<a>` into a 2D cell array, guesses column semantics
   (Name/Last modified/Size) via regex, and cleans values into typed
   `WebListEntry` objects.
-- **`WebListProxy`** — unified request handler exposing three access modes:
+- **`WebListProxy`** — unified request handler exposing three access modes.
+  `fetch(request, rel)` receives the original request and an explicit,
+  already-resolved relative path; it never derives that path by stripping a
+  mount from `request.url` or rebuilds an inner Request:
   1. **JSON API**: `?format=json` on any directory → `{ path, entries }`.
   2. **Web listing**: directory GET → injected `render(entries, path)` callback
      (or use `defaultRender` for a minimal `<ul>` page).

@@ -2,8 +2,6 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   ProxyRequest,
-  rewritePath,
-  stripPrefix,
   setBaseUrl,
   stripSearch,
   filterHeaders,
@@ -26,78 +24,55 @@ vi.mock("@server/pkgs/fetch", () => ({
 }));
 
 const req = (url: string, init?: RequestInit) => new Request(url, init);
-
-describe("rewritePath", () => {
-  it("transforms pathname via callback", () => {
-    const hook = rewritePath((p) => `/library${p}`);
-    const r = hook(req("https://example.com/nginx/latest")) as Request;
-    expect(new URL(r.url).pathname).toBe("/library/nginx/latest");
-  });
-
-  it("preserves query string", () => {
-    const hook = rewritePath((p) => p.replace("/old", "/new"));
-    const r = hook(req("https://example.com/old/path?q=1")) as Request;
-    const u = new URL(r.url);
-    expect(u.pathname).toBe("/new/path");
-    expect(u.search).toBe("?q=1");
-  });
-});
-
-describe("stripPrefix", () => {
-  it("removes prefix from pathname", () => {
-    const hook = stripPrefix("/npm");
-    const r = hook(req("https://mirs.uk/npm/react")) as Request;
-    expect(new URL(r.url).pathname).toBe("/react");
-  });
-
-  it("only removes first occurrence", () => {
-    const hook = stripPrefix("/ab");
-    const r = hook(req("https://x.com/ab/cd/ab/ef")) as Request;
-    expect(new URL(r.url).pathname).toBe("/cd/ab/ef");
-  });
-
-  it("preserves query string", () => {
-    const hook = stripPrefix("/api");
-    const r = hook(req("https://x.com/api/search?q=hello")) as Request;
-    const u = new URL(r.url);
-    expect(u.pathname).toBe("/search");
-    expect(u.search).toBe("?q=hello");
-  });
-});
+const mount = (relativePath = "") => ({ relativePath });
 
 describe("setBaseUrl", () => {
-  it("replaces origin, keeps pathname and query", () => {
+  it("maps the explicit relative path and preserves the original query", () => {
     const hook = setBaseUrl("https://registry.npmjs.org");
-    const r = hook(req("https://mirs.uk/react?version=latest")) as Request;
+    const r = hook(
+      req("https://mirs.uk/npm/ignored?version=latest"),
+      mount("react"),
+    ) as Request;
     const u = new URL(r.url);
     expect(u.origin).toBe("https://registry.npmjs.org");
     expect(u.pathname).toBe("/react");
     expect(u.search).toBe("?version=latest");
   });
 
-  it("joins base path with request path", () => {
+  it("joins a base path with the relative path", () => {
     const hook = setBaseUrl("https://upstream.com/prefix");
-    const r = hook(req("https://mirs.uk/sub/path")) as Request;
+    const r = hook(req("https://mirs.uk/mount/ignored"), mount("sub/path")) as Request;
     expect(new URL(r.url).pathname).toBe("/prefix/sub/path");
   });
 
   it("accepts URL object", () => {
     const hook = setBaseUrl(new URL("https://upstream.com"));
-    const r = hook(req("https://mirs.uk/path")) as Request;
+    const r = hook(req("https://mirs.uk/path"), mount("path")) as Request;
     expect(new URL(r.url).origin).toBe("https://upstream.com");
+  });
+
+  it.each([
+    ["", "https://upstream.com/base/"],
+    ["nested/path", "https://upstream.com/base/nested/path"],
+    ["/empty//segment", "https://upstream.com/base//empty//segment"],
+    ["escaped%2fCase%2F", "https://upstream.com/base/escaped%2fCase%2F"],
+  ])("preserves relative path %s verbatim", async (relativePath, expected) => {
+    const hook = setBaseUrl("https://upstream.com/base/");
+    const r = await hook(req("https://mirs.uk/mount/a-different-path"), mount(relativePath));
+    expect(r.url).toBe(expected);
   });
 });
 
 describe("stripSearch", () => {
   it("removes query string", () => {
-    const r = stripSearch(req("https://x.com/path?foo=bar&baz=1")) as Request;
+    const r = stripSearch(req("https://x.com/path?foo=bar&baz=1"), mount()) as Request;
     const u = new URL(r.url);
     expect(u.search).toBe("");
     expect(u.pathname).toBe("/path");
   });
 
   it("no-op when no query", () => {
-    const r = stripSearch(req("https://x.com/path")) as Request;
+    const r = stripSearch(req("https://x.com/path"), mount()) as Request;
     expect(new URL(r.url).search).toBe("");
   });
 });
@@ -109,6 +84,7 @@ describe("filterHeaders", () => {
       req("https://x.com/", {
         headers: { Range: "bytes=0-99", Accept: "text/html", Cookie: "secret" },
       }),
+      mount(),
     ) as Request;
     expect(r.headers.get("range")).toBe("bytes=0-99");
     expect(r.headers.get("accept")).toBe("text/html");
@@ -119,6 +95,7 @@ describe("filterHeaders", () => {
     const hook = filterHeaders(["RANGE"]);
     const r = hook(
       req("https://x.com/", { headers: { range: "bytes=0-10" } }),
+      mount(),
     ) as Request;
     expect(r.headers.get("range")).toBe("bytes=0-10");
   });
@@ -130,6 +107,7 @@ describe("filterHeaders", () => {
         method: "HEAD",
         headers: { range: "bytes=0-10" },
       }),
+      mount(),
     ) as Request;
     expect(r.method).toBe("HEAD");
   });
@@ -137,13 +115,14 @@ describe("filterHeaders", () => {
 
 describe("standardizeUserAgent", () => {
   it("adds user-agent if absent", () => {
-    const r = standardizeUserAgent(req("https://x.com/")) as Request;
+    const r = standardizeUserAgent(req("https://x.com/"), mount()) as Request;
     expect(r.headers.get("user-agent")).toContain("mirror-db");
   });
 
   it("preserves existing user-agent", () => {
     const r = standardizeUserAgent(
       req("https://x.com/", { headers: { "user-agent": "custom/1.0" } }),
+      mount(),
     ) as Request;
     expect(r.headers.get("user-agent")).toBe("custom/1.0");
   });
@@ -151,7 +130,7 @@ describe("standardizeUserAgent", () => {
 
 describe("followRedirects", () => {
   it("sets redirect to follow", () => {
-    const r = followRedirects(req("https://x.com/")) as Request;
+    const r = followRedirects(req("https://x.com/"), mount()) as Request;
     expect(r.redirect).toBe("follow");
   });
 });
@@ -225,7 +204,7 @@ describe("rewriteBody", () => {
 describe("ProxyRequest", () => {
   it("applies pre hooks then fetches then post hooks", async () => {
     const p = new ProxyRequest();
-    p.pre(stripPrefix("/mirror"));
+    p.pre((request) => request);
     p.pre(setBaseUrl("https://upstream.com"));
     p.post((_, resp) => {
       const headers = new Headers(resp.headers);
@@ -233,7 +212,7 @@ describe("ProxyRequest", () => {
       return new Response(resp.body, { status: resp.status, headers });
     });
 
-    const resp = await p.apply(req("https://mirs.uk/mirror/data?q=1"));
+    const resp = await p.apply(req("https://mirs.uk/mirror/ignored?q=1"), mount("data"));
     expect(resp.headers.get("x-proxied")).toBe("true");
     // cachedfetch mock returns `upstream:{pathname}`
     expect(await resp.text()).toBe("upstream:/data");
@@ -241,9 +220,9 @@ describe("ProxyRequest", () => {
 
   it("clone produces independent copy", () => {
     const a = new ProxyRequest();
-    a.pre(stripPrefix("/a"));
+    a.pre((request) => request);
     const b = a.clone();
-    b.pre(stripPrefix("/b"));
+    b.pre((request) => request);
     expect(a.prehooks).toHaveLength(1);
     expect(b.prehooks).toHaveLength(2);
   });
@@ -251,25 +230,29 @@ describe("ProxyRequest", () => {
 
 describe("upstreamProxy", () => {
   it("builds a ProxyRequest with standard hooks", async () => {
-    const p = upstreamProxy({ url: "https://registry.npmjs.org", prefix: "/npm" });
+    const p = upstreamProxy({ url: "https://registry.npmjs.org" });
     const resp = await p.apply(
-      req("https://mirs.uk/npm/react?v=18", {
+      req("https://mirs.uk/npm/ignored?v=18", {
         headers: { Range: "bytes=0-99", Cookie: "secret", Accept: "text/html" },
       }),
+      mount("react"),
     );
     // Mock returns pathname from the final request after hooks
     expect(await resp.text()).toBe("upstream:/react");
   });
 
-  it("works without prefix", async () => {
+  it("maps any explicit relative path without inspecting the mount URL", async () => {
     const p = upstreamProxy({ url: "https://upstream.com" });
-    const resp = await p.apply(req("https://mirs.uk/some/path"));
+    const resp = await p.apply(
+      req("https://mirs.uk/not-the-mount/path"),
+      mount("some/path"),
+    );
     expect(await resp.text()).toBe("upstream:/some/path");
   });
 
   it("HEAD request preserves method through full chain", async () => {
     const p = upstreamProxy({ url: "https://upstream.com" });
-    
+
     // Capture the request that reaches cachedfetch
     let capturedMethod: string | null = null;
     const origPre = p.prehooks;
@@ -280,8 +263,8 @@ describe("upstreamProxy", () => {
         return r;
       },
     ];
-    
-    await p.apply(req("https://mirs.uk/path", { method: "HEAD" }));
+
+    await p.apply(req("https://mirs.uk/path", { method: "HEAD" }), mount("path"));
     expect(capturedMethod).toBe("HEAD");
   });
 
@@ -304,6 +287,7 @@ describe("upstreamProxy", () => {
       req("https://mirs.uk/path", {
         headers: { Authorization: "Bearer token", Cookie: "nope", Range: "bytes=0-1" },
       }),
+      mount("path"),
     );
     expect(capturedHeaders!.get("authorization")).toBe("Bearer token");
     expect(capturedHeaders!.get("range")).toBe("bytes=0-1");

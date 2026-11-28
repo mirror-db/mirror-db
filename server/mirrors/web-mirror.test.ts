@@ -5,13 +5,7 @@ import type { Mirror } from "@server/types";
 
 import { webMirrors } from "./web-mirrors";
 
-/**
- * The listing layer rebuilds its upstream Request from the *client's* request.
- * Whether that keeps the client's headers (`x-mdb-relay-host` above all) depends
- * on the construction used, and the deployed Worker has been observed dropping
- * them — so this drives a real mount end to end and asserts what reaches the
- * upstream fetch.
- */
+/** Drive a real mount end to end and assert what reaches the upstream fetch. */
 describe("file-tree mirrors", () => {
   const byName = new Map<string, Mirror>(webMirrors.map((m) => [m.name, m]));
 
@@ -54,6 +48,7 @@ describe("file-tree mirrors", () => {
         new Request(`https://${env.BASE_DOMAIN}/debian-cd/?format=json`, {
           headers: { "x-mdb-relay-host": "relay.example.com" },
         }),
+        { relativePath: "" },
       );
       status = res.status;
     } finally {
@@ -63,11 +58,8 @@ describe("file-tree mirrors", () => {
 
     expect(status).toBe(200);
     expect(requested.length).toBeGreaterThan(0);
-    // The mount prefix is stripped before the upstream join.
     expect(requested[0].url).toBe("https://cdimage.debian.org/debian-cd/");
-    // KNOWN-OPEN: the relay host is expected to arrive here too, but the
-    // Workers runtime currently strips ingress request headers when the inner
-    // Request is rebuilt. Tracked in docs/adr/0002.
+    // Relay host is internal request context, not an upstream request header.
     expect(requested[0].headers.get("x-mdb-relay-host")).toBeNull();
   });
 });
@@ -165,7 +157,10 @@ describe("pigsty apt mirror", () => {
   ])("forwards %s to %s", async (path, upstream) => {
     capture();
 
-    const res = await mirror().fetch(new Request(`https://mirs.uk${path}`));
+    const res = await mirror().fetch(
+      new Request(`https://mirs.uk${path}`),
+      { relativePath: path.slice("/pigsty/".length) },
+    );
 
     expect(res.status).toBe(200);
     expect(sent.map((r) => r.url)).toEqual([upstream]);
@@ -176,11 +171,34 @@ describe("pigsty apt mirror", () => {
 
     await mirror().fetch(
       new Request("https://mirs.uk/pigsty/infra/dists/generic/Release?x=1&y=2"),
+      { relativePath: "infra/dists/generic/Release" },
     );
 
     expect(sent[0].url).toBe(
       "https://repo.pigsty.io/apt/infra/dists/generic/Release?x=1&y=2",
     );
+  });
+
+  it.each([
+    ["/pigsty", "", "https://repo.pigsty.io/apt/"],
+    ["/pigsty/", "", "https://repo.pigsty.io/apt/"],
+    [
+      "/pigsty//empty///segment/%2fCase%2F?download=a%2Fb",
+      "/empty///segment/%2fCase%2F",
+      "https://repo.pigsty.io/apt//empty///segment/%2fCase%2F?download=a%2Fb",
+    ],
+  ])("maps %s without normalising its relative path", async (path, relativePath, upstream) => {
+    capture();
+
+    await mirror().fetch(
+      new Request(`https://mirs.uk${path}`, {
+        headers: { "x-mdb-relay-host": "relay.example.com" },
+      }),
+      { relativePath },
+    );
+
+    expect(sent.map((r) => r.url)).toEqual([upstream]);
+    expect(sent[0].headers.get("x-mdb-relay-host")).toBeNull();
   });
 
   it("passes Range through to the upstream", async () => {
@@ -190,6 +208,7 @@ describe("pigsty apt mirror", () => {
       new Request("https://mirs.uk/pigsty/infra/pool/main/p/x/x.deb", {
         headers: { Range: "bytes=0-1023" },
       }),
+      { relativePath: "infra/pool/main/p/x/x.deb" },
     );
 
     expect(res.status).toBe(200);
@@ -221,6 +240,9 @@ describe("gh-proxy mirror", () => {
           new Request(
             "https://mirs.uk/gh-proxy/https://github.com/owner/repo/releases/download/v1.0.0/file.tar.gz",
           ),
+          {
+            relativePath: "https://github.com/owner/repo/releases/download/v1.0.0/file.tar.gz",
+          },
         );
       status = res.status;
     } finally {

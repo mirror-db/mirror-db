@@ -20,7 +20,6 @@ const PYPI_ORIGIN = "https://pypi.org";
 const FILES_ORIGIN = "https://files.pythonhosted.org";
 
 const PATH = "pypi";
-const PREFIX = `/${PATH}/`;
 
 /** Request headers a conditional revalidation needs to survive the hop. */
 const CONDITIONAL_HEADERS = ["if-none-match", "if-modified-since"] as const;
@@ -28,10 +27,7 @@ const CONDITIONAL_HEADERS = ["if-none-match", "if-modified-since"] as const;
 export const pypi: Mirror = {
   name: "pypi",
   path: PATH,
-  async fetch(request) {
-    const url = new URL(request.url);
-    const rel = url.pathname.slice(PREFIX.length);
-
+  async fetch(request, { relativePath: rel }) {
     // simple/ — package index
     if (rel === "simple" || rel === "simple/") {
       // The root index is the one page whose refresh benefits every client;

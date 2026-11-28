@@ -55,6 +55,7 @@ describe("createAptProxy — real ezfetch method forwarding", () => {
       new Request("https://mirs.uk/pool/main/n/nginx/nginx_1.0_amd64.deb", {
         method: "HEAD",
       }),
+      "pool/main/n/nginx/nginx_1.0_amd64.deb",
     );
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
@@ -71,6 +72,7 @@ describe("createAptProxy — real ezfetch method forwarding", () => {
 
     const res = await makeProxy().fetch(
       new Request("https://mirs.uk/pool/main/n/nginx/nginx_1.0_amd64.deb"),
+      "pool/main/n/nginx/nginx_1.0_amd64.deb",
     );
 
     const sent = fetchMock.mock.calls[0]![0] as Request;
@@ -93,6 +95,7 @@ describe("createAptProxy — real cachedfetch Range handling", () => {
         `https://mirs.uk/dists/trixie/main/binary-amd64/by-hash/SHA256/${HASH}`,
         { headers: { range: "bytes=2-6" } },
       ),
+      `dists/trixie/main/binary-amd64/by-hash/SHA256/${HASH}`,
     );
 
     expect(res.status).toBe(206);
@@ -119,6 +122,7 @@ describe("createAptProxy — real cachedfetch Range handling", () => {
       new Request("https://mirs.uk/pool/main/n/nginx/nginx_1.0_amd64.deb", {
         headers: { range: "bytes=2-3" },
       }),
+      "pool/main/n/nginx/nginx_1.0_amd64.deb",
     );
 
     expect(res.status).toBe(200);

@@ -16,7 +16,6 @@
 
 import { Release } from "apt-parser";
 import pLimit from "p-limit";
-import urlJoin from "url-join";
 
 import { cachedfetch, ezfetch } from "@server/pkgs/fetch";
 import {
@@ -145,9 +144,9 @@ export class AptSnapshotIndex implements AptRepository {
     this.clock = opts.now ?? Date.now;
   }
 
-  /** Resolve a repo-relative path against the upstream base. */
+  /** Append a repo-relative path verbatim to the slash-terminated base. */
   url(rel: string): string {
-    return urlJoin(this.base, rel);
+    return this.base + rel;
   }
 
   /** True once a generation was published. */

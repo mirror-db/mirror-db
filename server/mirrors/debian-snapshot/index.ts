@@ -35,7 +35,6 @@ import { declarePathFact, immutablePathFact } from "@server/relay-path";
 import type { Mirror } from "@server/types";
 
 export const UPSTREAM = "https://snapshot.debian.org/";
-export const PREFIX = "/debian-snapshot/";
 
 /** Every archive the upstream serves. */
 export const ARCHIVES = new Set([
@@ -155,11 +154,8 @@ export function createDebianSnapshot(opts: DebianSnapshotOptions = {}): Mirror {
   return {
     name: "debian-snapshot",
     path: "debian-snapshot",
-    async fetch(request) {
+    async fetch(request, { relativePath: rel }) {
       const url = new URL(request.url);
-      if (!url.pathname.startsWith(PREFIX)) return notFound();
-
-      const rel = url.pathname.slice(PREFIX.length);
       const target = resolveTarget(rel, url.search);
       if (!target) return notFound();
 

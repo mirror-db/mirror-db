@@ -2,12 +2,13 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   ARCHIVES,
-  PREFIX,
   parseTimestamp,
   resolveTarget,
   UPSTREAM,
 } from "./index";
 import { createDebianSnapshot, type SnapshotCache } from "./index";
+
+const PREFIX = "/debian-snapshot/";
 
 /** A Cache stub that records what was written. */
 class FakeCache implements SnapshotCache {
@@ -41,7 +42,10 @@ function harness(handler: (url: string, init?: RequestInit) => Promise<Response>
     now: () => Date.UTC(2026, 0, 1),
   });
   const get = (path: string, init?: RequestInit) =>
-    mirror.fetch(new Request(`https://mirs.uk${PREFIX}${path}`, init));
+    mirror.fetch(
+      new Request(`https://mirs.uk${PREFIX}${path}`, init),
+      { relativePath: path.split("?", 1)[0]! },
+    );
   return { cache, fetchImpl, get };
 }
 
@@ -189,6 +193,16 @@ describe("debian-snapshot mirror", () => {
     expect(res.headers.get("x-mdb-relay")).toBeNull();
   });
 
+  it("keeps query, empty segments and percent escapes out of mount stripping", async () => {
+    const { get, fetchImpl } = harness(async () => ok("payload"));
+    const rel = "archive/debian/20240101T000000Z/pool/a%2Fb//bash_5.2.deb";
+
+    const res = await get(`${rel}?download=a%2Fb`);
+
+    expect(res.status).toBe(200);
+    expect(fetchImpl.mock.calls[0][0].url).toBe(`${UPSTREAM}${rel}?download=a%2Fb`);
+  });
+
   it("forwards Range and keeps the partial response out of the cache", async () => {
     const { get, fetchImpl, cache } = harness(
       async () =>
@@ -247,6 +261,7 @@ describe("debian-snapshot mirror", () => {
       new Request(
         `https://mirs.uk${PREFIX}archive/debian/20240101T000000Z/pool/main/b/big/big_1.deb`,
       ),
+      { relativePath: "archive/debian/20240101T000000Z/pool/main/b/big/big_1.deb" },
     );
     expect(cache.puts).toBe(0);
   });

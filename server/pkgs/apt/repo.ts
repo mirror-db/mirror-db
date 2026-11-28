@@ -17,7 +17,6 @@ import { Release } from "apt-parser";
 
 import { cachedfetch } from "@server/pkgs/fetch";
 import { WebListFs, type WebListFetch } from "@server/pkgs/web-list";
-import urlJoin from "url-join";
 
 import type { AptRepository, AptRepositoryFacts } from "./repository";
 import { analyzeApt, toSuiteMeta, type AptMirrorStatus } from "./status";
@@ -239,9 +238,9 @@ export class AptRepo implements AptRepository {
     return null;
   }
 
-  /** Resolve a repo-relative path against the upstream base. */
+  /** Append a repo-relative path verbatim to the slash-terminated base. */
   url(rel: string): string {
-    return urlJoin(this.base, rel);
+    return this.base + rel;
   }
 }
 

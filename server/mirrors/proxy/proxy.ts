@@ -2,35 +2,31 @@ import urlJoin from "url-join";
 import { cachedfetch, sanitizeResponse } from "@server/pkgs/fetch";
 import { MdbUserAgent } from "@server/pkgs/fetch/const";
 import { GlobalPassthroughHeaders } from "./const";
+import type { MountContext } from "@server/types";
 
 export interface Upstream {
   /** Upstream base URL, e.g. "https://registry.npmjs.org" */
   url: string;
-  /** Path prefix to strip from incoming request before forwarding */
-  prefix?: string;
   /** Extra headers to pass through beyond GlobalPassthroughHeaders */
   passthroughHeaders?: string[];
 }
 
-export type PreProxyHook = (req: Request) => Request | Promise<Request>;
+export type PreProxyHook = (
+  req: Request,
+  context: MountContext,
+) => Request | Promise<Request>;
 export type PostProxyHook = (req: Request, resp: Response) => Response | Promise<Response>;
 
 // --- Pre hooks ---
 
-export const rewritePath = (fn: (pathname: string) => string): PreProxyHook => (req) => {
-  const url = new URL(req.url);
-  url.pathname = fn(url.pathname);
-  return new Request(url.toString(), req);
-};
-
-export const stripPrefix = (prefix: string): PreProxyHook =>
-  rewritePath((p) => p.replace(prefix, ""));
-
-export const setBaseUrl = (baseUrl: string | URL): PreProxyHook => (req) => {
-  const base = typeof baseUrl === "string" ? baseUrl : baseUrl.toString();
-  const { pathname, search } = new URL(req.url);
-  return new Request(urlJoin(base, pathname) + search, req);
-};
+export const setBaseUrl = (baseUrl: string | URL): PreProxyHook =>
+  (req, { relativePath }) => {
+    const base = typeof baseUrl === "string" ? baseUrl : baseUrl.toString();
+    const { search } = new URL(req.url);
+    // The base's trailing slash belongs to the upstream URL, not MountContext.
+    // Append the relative path verbatim so an initial empty segment survives too.
+    return new Request(urlJoin(base, "/") + relativePath + search, req);
+  };
 
 export const stripSearch: PreProxyHook = (req) => {
   const url = new URL(req.url);
@@ -140,10 +136,10 @@ export class ProxyRequest {
     return this;
   }
 
-  async apply(req: Request): Promise<Response> {
+  async apply(req: Request, context: MountContext): Promise<Response> {
     const original = req;
     for (const hook of this.prehooks) {
-      req = await hook(req);
+      req = await hook(req, context);
     }
 
     let resp = await cachedfetch(req);
@@ -158,7 +154,6 @@ export class ProxyRequest {
 
 export const upstreamProxy = (upstream: Upstream) => {
   const p = new ProxyRequest();
-  if (upstream.prefix) p.pre(stripPrefix(upstream.prefix));
   p.pre(setBaseUrl(upstream.url));
   p.pre(filterHeaders([...GlobalPassthroughHeaders, ...(upstream.passthroughHeaders ?? [])]));
   p.pre(standardizeUserAgent);

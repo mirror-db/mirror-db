@@ -14,8 +14,9 @@ const mockCachedfetch = cachedfetch as ReturnType<typeof vi.fn>;
 const mockMdbfetch = mdbfetch as ReturnType<typeof vi.fn>;
 const mockSanitize = sanitizeResponse as ReturnType<typeof vi.fn>;
 
-function makeRequest(path: string): Request {
-  return new Request(`https://mirs.uk${path}`);
+function makeRequest(path: string) {
+  const relativePath = path.replace(/^\/pypi\/?/, "").split("?", 1)[0]!;
+  return [new Request(`https://mirs.uk${path}`), { relativePath }] as const;
 }
 
 beforeEach(() => {
@@ -34,7 +35,7 @@ describe("pypi simple/ rewriting (HTMLRewriter)", () => {
       new Response(html, { headers: { "content-type": "text/html" } }),
     );
 
-    const res = await pypi.fetch(makeRequest("/pypi/simple/"));
+    const res = await pypi.fetch(...makeRequest("/pypi/simple/"));
     const body = await res.text();
 
     expect(body).toContain('href="requests/"');
@@ -51,7 +52,7 @@ describe("pypi simple/ rewriting (HTMLRewriter)", () => {
       new Response(html, { headers: { "content-type": "text/html" } }),
     );
 
-    const res = await pypi.fetch(makeRequest("/pypi/simple/requests/"));
+    const res = await pypi.fetch(...makeRequest("/pypi/simple/requests/"));
     const body = await res.text();
 
     expect(body).toContain('href="../../packages/ab/cd/requests-2.31.0.tar.gz#sha256=abc123"');
@@ -62,7 +63,7 @@ describe("pypi simple/ rewriting (HTMLRewriter)", () => {
   it("passes through non-200 simple responses", async () => {
     mockCachedfetch.mockResolvedValue(new Response(null, { status: 404 }));
 
-    const res = await pypi.fetch(makeRequest("/pypi/simple/nonexistent/"));
+    const res = await pypi.fetch(...makeRequest("/pypi/simple/nonexistent/"));
     expect(res.status).toBe(404);
   });
 });
@@ -75,7 +76,7 @@ describe("pypi prefetch boundary", () => {
       mockCachedfetch.mockResolvedValue(
         new Response(simpleIndex, { headers: { "content-type": "text/html" } }),
       );
-      const res = await pypi.fetch(makeRequest(path));
+      const res = await pypi.fetch(...makeRequest(path));
       expect(res.headers.get("x-mdb-relay"), path).toBe("prefetch");
     }
   });
@@ -92,14 +93,14 @@ describe("pypi prefetch boundary", () => {
       mockCachedfetch.mockResolvedValue(
         new Response(html, { headers: { "content-type": "text/html" } }),
       );
-      const res = await pypi.fetch(makeRequest(path));
+      const res = await pypi.fetch(...makeRequest(path));
       expect(res.headers.get("x-mdb-relay"), path).toBeNull();
     }
   });
 
   it("does not advertise prefetch on a failed index fetch", async () => {
     mockCachedfetch.mockResolvedValue(new Response(null, { status: 502 }));
-    const res = await pypi.fetch(makeRequest("/pypi/simple/"));
+    const res = await pypi.fetch(...makeRequest("/pypi/simple/"));
     expect(res.headers.get("x-mdb-relay")).toBeNull();
   });
 
@@ -114,6 +115,7 @@ describe("pypi prefetch boundary", () => {
       new Request("https://mirs.uk/pypi/simple/", {
         headers: { "if-none-match": '"index-1"' },
       }),
+      { relativePath: "simple/" },
     );
 
     expect(res.status).toBe(304);
@@ -130,6 +132,7 @@ describe("pypi prefetch boundary", () => {
       new Request("https://mirs.uk/pypi/simple/", {
         headers: { "if-none-match": '"old"' },
       }),
+      { relativePath: "simple/" },
     );
 
     expect(res.status).toBe(200);

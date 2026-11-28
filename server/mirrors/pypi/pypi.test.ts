@@ -13,8 +13,9 @@ import { cachedfetch, sanitizeResponse } from "@server/pkgs/fetch";
 const mockCachedfetch = cachedfetch as ReturnType<typeof vi.fn>;
 const mockSanitize = sanitizeResponse as ReturnType<typeof vi.fn>;
 
-function makeRequest(path: string): Request {
-  return new Request(`https://mirs.uk${path}`);
+function makeRequest(path: string) {
+  const relativePath = path.replace(/^\/pypi\/?/, "").split("?", 1)[0]!;
+  return [new Request(`https://mirs.uk${path}`), { relativePath }] as const;
 }
 
 beforeEach(() => {
@@ -32,7 +33,7 @@ describe("pypi mirror", () => {
     const json = { info: { name: "requests" } };
     mockCachedfetch.mockResolvedValue(new Response(JSON.stringify(json)));
 
-    const res = await pypi.fetch(makeRequest("/pypi/pypi/requests/json"));
+    const res = await pypi.fetch(...makeRequest("/pypi/pypi/requests/json"));
 
     expect(mockCachedfetch).toHaveBeenCalledWith("https://pypi.org", ["pypi/requests/json"]);
     expect(res.status).toBe(200);
@@ -42,7 +43,7 @@ describe("pypi mirror", () => {
     mockCachedfetch.mockResolvedValue(new Response("file-bytes"));
 
     const res = await pypi.fetch(
-      makeRequest("/pypi/packages/ab/cd/requests-2.31.0.tar.gz"),
+      ...makeRequest("/pypi/packages/ab/cd/requests-2.31.0.tar.gz"),
     );
 
     expect(mockCachedfetch).toHaveBeenCalledWith(
@@ -52,8 +53,21 @@ describe("pypi mirror", () => {
     expect(res.status).toBe(200);
   });
 
+  it("uses the explicit relative path without decoding or normalising it", async () => {
+    mockCachedfetch.mockResolvedValue(new Response("file-bytes"));
+    const [request] = makeRequest("/pypi/not-the-relative-path");
+    const relativePath = "packages/a%2Fb//requests-2.31.0.tar.gz";
+
+    await pypi.fetch(request, { relativePath });
+
+    expect(mockCachedfetch).toHaveBeenCalledWith(
+      "https://files.pythonhosted.org",
+      [relativePath],
+    );
+  });
+
   it("returns 404 for unknown paths", async () => {
-    const res = await pypi.fetch(makeRequest("/pypi/unknown/path"));
+    const res = await pypi.fetch(...makeRequest("/pypi/unknown/path"));
     expect(res.status).toBe(404);
   });
 });

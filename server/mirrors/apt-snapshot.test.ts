@@ -5,6 +5,8 @@ import { withRelayDirectives } from "@server/relay-control";
 import { aptConfigs } from "./apt-mirrors";
 import { createAptMirror } from "./apt-mirror";
 import { digestHex } from "@server/pkgs/apt/metadata";
+import { createAptProxy } from "@server/pkgs/apt/proxy";
+import { AptSnapshotIndex } from "@server/pkgs/apt/snapshot";
 import type { AptMirrorStatus } from "@server/pkgs/apt/status";
 import type { WebListFetch } from "@server/pkgs/web-list";
 
@@ -85,7 +87,10 @@ async function makeMirror(fetchImpl: WebListFetch = async (input) => respond(inp
   });
 }
 
-const req = (path: string, init?: RequestInit) => new Request(`${MOUNT}${path}`, init);
+const req = (path: string, init?: RequestInit) => [
+  new Request(`${MOUNT}${path}`, init),
+  { relativePath: path.split("?", 1)[0]! },
+] as const;
 
 beforeEach(() => {
   routes.clear();
@@ -123,10 +128,30 @@ describe("snapshot APT mounts — configuration", () => {
   });
 });
 
+describe("AptSnapshotIndex upstream paths", () => {
+  it("forwards the first empty segment, later empty segments and escapes upstream", async () => {
+    const index = new AptSnapshotIndex({
+      mirror: "hashicorp",
+      base: "https://up.example/repo",
+      suites: ["bookworm"],
+    });
+    vi.spyOn(index, "facts").mockResolvedValue(null);
+    const proxy = createAptProxy(index);
+    const rel = "/empty//x%2fCase%2F";
+
+    await proxy.fetch(new Request(`https://mirs.uk/hashicorp${rel}`), rel);
+
+    expect(ezfetchMock).toHaveBeenCalledWith(
+      `${BASE}/empty//x%2fCase%2F`,
+      undefined,
+    );
+  });
+});
+
 describe("snapshot APT mounts — synthetic directories", () => {
   it("renders the mount root as HTML", async () => {
     const mirror = await makeMirror();
-    const res = await mirror.fetch(req(""));
+    const res = await mirror.fetch(...req(""));
 
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toContain("text/html");
@@ -135,17 +160,17 @@ describe("snapshot APT mounts — synthetic directories", () => {
 
   it("answers the JSON mode at every level", async () => {
     const mirror = await makeMirror();
-    const root: any = await (await mirror.fetch(req("?format=json"))).json();
+    const root: any = await (await mirror.fetch(...req("?format=json"))).json();
     expect(root.path).toBe("");
     expect(root.entries.map((e: any) => e.name)).toEqual(["dists", "pool"]);
 
     const suite: any = await (
-      await mirror.fetch(req("dists/bookworm/?format=json"))
+      await mirror.fetch(...req("dists/bookworm/?format=json"))
     ).json();
     expect(suite.entries.map((e: any) => e.name)).toContain("InRelease");
 
     const pool: any = await (
-      await mirror.fetch(req("pool/main/t/terraform/?format=json"))
+      await mirror.fetch(...req("pool/main/t/terraform/?format=json"))
     ).json();
     expect(pool.entries).toEqual([
       expect.objectContaining({ name: "terraform_1.0_amd64.deb", size: 2048 }),
@@ -154,7 +179,7 @@ describe("snapshot APT mounts — synthetic directories", () => {
 
   it("answers PROPFIND with the same entries", async () => {
     const mirror = await makeMirror();
-    const res = await mirror.fetch(req("", { method: "PROPFIND", headers: { depth: "1" } }));
+    const res = await mirror.fetch(...req("", { method: "PROPFIND", headers: { depth: "1" } }));
 
     expect(res.status).toBe(207);
     const xml = await res.text();
@@ -165,7 +190,7 @@ describe("snapshot APT mounts — synthetic directories", () => {
 
   it("404s a directory the metadata does not define", async () => {
     const mirror = await makeMirror();
-    const res = await mirror.fetch(req("pool/nope/?format=json"));
+    const res = await mirror.fetch(...req("pool/nope/?format=json"));
     expect(res.status).toBe(404);
   });
 
@@ -178,7 +203,7 @@ describe("snapshot APT mounts — synthetic directories", () => {
       ["Release", "unsigned-release", "no-store, prefetch"],
       ["Release.gpg", "detached-signature", "no-store"],
     ] as const) {
-      const res = await mirror.fetch(req(`dists/bookworm/${name}`));
+      const res = await mirror.fetch(...req(`dists/bookworm/${name}`));
       expect(res.status, name).toBe(200);
       expect(await res.text(), name).toBe(body);
       // Still a mutable dists object: the relay must not store it, and only the
@@ -189,14 +214,17 @@ describe("snapshot APT mounts — synthetic directories", () => {
 
   it("still 404s an unknown path inside a known suite", async () => {
     const mirror = await makeMirror();
-    const res = await mirror.fetch(req("dists/bookworm/ghost"));
+    const res = await mirror.fetch(...req("dists/bookworm/ghost"));
 
     expect(res.status).toBe(404);
   });
 
   it("redirects the mount root without a trailing slash", async () => {
     const mirror = await makeMirror();
-    const res = await mirror.fetch(new Request("https://mirs.uk/hashicorp"));
+    const res = await mirror.fetch(
+      new Request("https://mirs.uk/hashicorp"),
+      { relativePath: "" },
+    );
 
     expect(res.status).toBe(308);
     expect(res.headers.get("location")).toBe("/hashicorp/");
@@ -204,7 +232,7 @@ describe("snapshot APT mounts — synthetic directories", () => {
 
   it("redirects a pool directory without a trailing slash", async () => {
     const mirror = await makeMirror();
-    const res = await mirror.fetch(req("pool/main/t/terraform"));
+    const res = await mirror.fetch(...req("pool/main/t/terraform"));
 
     expect(res.status).toBe(308);
     expect(res.headers.get("location")).toBe("/hashicorp/pool/main/t/terraform/");
@@ -214,7 +242,7 @@ describe("snapshot APT mounts — synthetic directories", () => {
 describe("snapshot APT mounts — fixed index endpoint", () => {
   it("serves the generation as JSON with a strong ETag", async () => {
     const mirror = await makeMirror();
-    const res = await mirror.fetch(req(".mdb/apt-index.json"));
+    const res = await mirror.fetch(...req(".mdb/apt-index.json"));
 
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toBe("application/json");
@@ -245,8 +273,8 @@ describe("snapshot APT mounts — fixed index endpoint", () => {
 
   it("answers HEAD with headers and no body", async () => {
     const mirror = await makeMirror();
-    const get = await mirror.fetch(req(".mdb/apt-index.json"));
-    const head = await mirror.fetch(req(".mdb/apt-index.json", { method: "HEAD" }));
+    const get = await mirror.fetch(...req(".mdb/apt-index.json"));
+    const head = await mirror.fetch(...req(".mdb/apt-index.json", { method: "HEAD" }));
 
     expect(head.status).toBe(200);
     expect(head.headers.get("etag")).toBe(get.headers.get("etag"));
@@ -255,11 +283,11 @@ describe("snapshot APT mounts — fixed index endpoint", () => {
 
   it("honours If-None-Match with 304", async () => {
     const mirror = await makeMirror();
-    const get = await mirror.fetch(req(".mdb/apt-index.json"));
+    const get = await mirror.fetch(...req(".mdb/apt-index.json"));
     const etag = get.headers.get("etag")!;
 
     const cached = await mirror.fetch(
-      req(".mdb/apt-index.json", { headers: { "if-none-match": etag } }),
+      ...req(".mdb/apt-index.json", { headers: { "if-none-match": etag } }),
     );
     expect(cached.status).toBe(304);
     expect(cached.headers.get("etag")).toBe(etag);
@@ -267,7 +295,7 @@ describe("snapshot APT mounts — fixed index endpoint", () => {
 
   it("404s other paths under .mdb/", async () => {
     const mirror = await makeMirror();
-    const res = await mirror.fetch(req(".mdb/other.json"));
+    const res = await mirror.fetch(...req(".mdb/other.json"));
     expect(res.status).toBe(404);
   });
 
@@ -279,11 +307,11 @@ describe("snapshot APT mounts — fixed index endpoint", () => {
       snapshot: { fetchImpl: async () => new Response(null, { status: 404 }) },
     });
 
-    const endpoint = await mirror.fetch(req(".mdb/apt-index.json"));
+    const endpoint = await mirror.fetch(...req(".mdb/apt-index.json"));
     expect(endpoint.status).toBe(502);
     expect(await endpoint.text()).toContain("unavailable");
 
-    const directory = await mirror.fetch(req("?format=json"));
+    const directory = await mirror.fetch(...req("?format=json"));
     expect(directory.status).toBe(502);
   });
 });
@@ -323,9 +351,9 @@ describe("snapshot APT mounts — status", () => {
     expect(cachedfetchMock).not.toHaveBeenCalled();
     expect(ezfetchMock).not.toHaveBeenCalled();
 
-    const endpoint = await mirror.fetch(req(".mdb/apt-index.json"));
+    const endpoint = await mirror.fetch(...req(".mdb/apt-index.json"));
     const document: any = await endpoint.json();
-    const listing = await mirror.fetch(req("?format=json"));
+    const listing = await mirror.fetch(...req("?format=json"));
     expect(listing.status).toBe(200);
     expect(upstream).toHaveBeenCalledTimes(generationFetches);
 
@@ -354,7 +382,7 @@ describe("snapshot APT mounts — status", () => {
 describe("snapshot APT mounts — file passthrough and relay directives", () => {
   it("marks Release/InRelease no-store + prefetch", async () => {
     const mirror = await makeMirror();
-    const res = await mirror.fetch(req("dists/bookworm/InRelease"));
+    const res = await mirror.fetch(...req("dists/bookworm/InRelease"));
 
     expect(res.status).toBe(200);
     expect(res.headers.get("x-mdb-relay")).toBe("no-store, prefetch");
@@ -370,10 +398,10 @@ describe("snapshot APT mounts — file passthrough and relay directives", () => 
   it("does not prefetch Packages or pool payloads", async () => {
     const mirror = await makeMirror();
 
-    const index = await mirror.fetch(req("dists/bookworm/main/binary-amd64/Packages"));
+    const index = await mirror.fetch(...req("dists/bookworm/main/binary-amd64/Packages"));
     expect(index.headers.get("x-mdb-relay")).toBe("no-store");
 
-    const pool = await mirror.fetch(req("pool/main/t/terraform/terraform_1.0_amd64.deb"));
+    const pool = await mirror.fetch(...req("pool/main/t/terraform/terraform_1.0_amd64.deb"));
     expect(pool.headers.get("x-mdb-relay")).toBeNull();
     expect(await pool.text()).toBe("deb-bytes");
   });

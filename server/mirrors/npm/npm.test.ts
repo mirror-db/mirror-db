@@ -10,8 +10,12 @@ import { cachedfetch } from "@server/pkgs/fetch";
 
 const mockCachedfetch = cachedfetch as ReturnType<typeof vi.fn>;
 
-function makeRequest(path: string, headers?: Record<string, string>): Request {
-  return new Request(`https://mirs.uk${path}`, { headers });
+function makeRequest(path: string, headers?: Record<string, string>) {
+  const relativePath = path.replace(/^\/npm\/?/, "").split("?", 1)[0]!;
+  return [
+    new Request(`https://mirs.uk${path}`, { headers }),
+    { relativePath },
+  ] as const;
 }
 
 /** Extract the URL string from the first argument of a cachedfetch call. */
@@ -49,12 +53,15 @@ describe("npm mirror", () => {
     );
 
     const res = await npm.fetch(
-      makeRequest("/npm/lodash", { "x-mdb-relay-host": "relay.example.com" }),
+      ...makeRequest("/npm/lodash", { "x-mdb-relay-host": "relay.example.com" }),
     );
     const body = (await res.json()) as any;
     expect(body.versions["4.17.21"].dist.tarball).toBe(
       "https://relay.example.com/npm/lodash/-/lodash-4.17.21.tgz",
     );
+    // The post hook needs the original relay context; it is not upstream data.
+    const upstream = mockCachedfetch.mock.calls[0][0] as Request;
+    expect(upstream.headers.get("x-mdb-relay-host")).toBeNull();
   });
 
   it("rewrites tarball URLs in JSON metadata", async () => {
@@ -73,7 +80,7 @@ describe("npm mirror", () => {
       new Response(meta, { headers: { "content-type": "application/json" } }),
     );
 
-    const res = await npm.fetch(makeRequest("/npm/lodash"));
+    const res = await npm.fetch(...makeRequest("/npm/lodash"));
     const body = await res.text();
     const parsed = JSON.parse(body);
 
@@ -98,7 +105,7 @@ describe("npm mirror", () => {
       new Response(meta, { headers: { "content-type": "application/json" } }),
     );
 
-    const res = await npm.fetch(makeRequest("/npm/@babel/core"));
+    const res = await npm.fetch(...makeRequest("/npm/@babel/core"));
     const body = await res.text();
     const parsed = JSON.parse(body);
 
@@ -114,7 +121,7 @@ describe("npm mirror", () => {
       }),
     );
 
-    const res = await npm.fetch(makeRequest("/npm/lodash/-/lodash-4.17.21.tgz"));
+    const res = await npm.fetch(...makeRequest("/npm/lodash/-/lodash-4.17.21.tgz"));
     expect(await res.text()).toBe("binary-data");
     expect(fetchedUrl()).toBe(
       "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
@@ -127,9 +134,29 @@ describe("npm mirror", () => {
       new Response(results, { headers: { "content-type": "application/json" } }),
     );
 
-    await npm.fetch(makeRequest("/npm/-/v1/search?text=lodash"));
+    await npm.fetch(...makeRequest("/npm/-/v1/search?text=lodash"));
     expect(fetchedUrl()).toBe(
       "https://registry.npmjs.org/-/v1/search?text=lodash",
     );
+  });
+
+  it.each([
+    ["", "https://registry.npmjs.org/?download=a%2Fb"],
+    ["nested/package", "https://registry.npmjs.org/nested/package?download=a%2Fb"],
+    [
+      "/empty///segment/%2fCase%2F",
+      "https://registry.npmjs.org//empty///segment/%2fCase%2F?download=a%2Fb",
+    ],
+  ])("maps explicit rel %s without reading it from the request URL", async (relativePath, expected) => {
+    mockCachedfetch.mockResolvedValue(
+      new Response("binary", { headers: { "content-type": "application/octet-stream" } }),
+    );
+
+    await npm.fetch(
+      makeRequest("/npm/not-the-relative-path?download=a%2Fb")[0],
+      { relativePath },
+    );
+
+    expect(fetchedUrl()).toBe(expected);
   });
 });

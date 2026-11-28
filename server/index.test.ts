@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { env } from "@server/test-stubs/cloudflare-workers";
+import { mirrorsByPath, mirrorsBySubdomain } from "./mirrors";
 
 /**
  * Routing at the front door.
@@ -82,6 +83,47 @@ describe("front door — host routing", () => {
     );
     expect(res.status).toBe(404);
     expect(await res.text()).toContain("is not a mirror on this service");
+  });
+});
+
+describe("front door — mount context", () => {
+  it.each([
+    ["/npm", ""],
+    ["/npm/", ""],
+    ["/npm/@Scope/pkg", "@Scope/pkg"],
+    ["/npm//empty///segments/?download=a%2Fb", "/empty///segments/"],
+    ["/npm/%2fCase%2FStill", "%2fCase%2FStill"],
+  ])("resolves %s without rewriting its path", async (path, relativePath) => {
+    const worker = await loadWorker();
+    const mirror = mirrorsByPath.get("npm")!;
+    const fetch = vi.spyOn(mirror, "fetch").mockResolvedValue(
+      new Response(null, { status: 204 }),
+    );
+    try {
+      const request = req(path);
+      await worker.fetch(request);
+      // The mirror receives the same request and the router's only path split.
+      expect(fetch).toHaveBeenCalledWith(request, { relativePath });
+    } finally {
+      fetch.mockRestore();
+    }
+  });
+
+  it("gives a subdomain mirror its full path without an added slash", async () => {
+    const worker = await loadWorker();
+    const mirror = mirrorsBySubdomain.get("dcr")!;
+    const fetch = vi.spyOn(mirror, "fetch").mockResolvedValue(
+      new Response(null, { status: 204 }),
+    );
+    try {
+      const request = new Request("https://dcr.mirs.uk/v2//Thing%2F?x=1", {
+        headers: { host: "dcr.mirs.uk" },
+      }) as any;
+      await worker.fetch(request);
+      expect(fetch).toHaveBeenCalledWith(request, { relativePath: "v2//Thing%2F" });
+    } finally {
+      fetch.mockRestore();
+    }
   });
 });
 

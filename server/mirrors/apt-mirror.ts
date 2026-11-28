@@ -1,6 +1,6 @@
 /**
  * Factory for simple APT mirrors that follow the common pattern: an
- * AptRepository selected by mode + createAptProxy + prefix stripping + status.
+ * AptRepository selected by mode + createAptProxy + mount context + status.
  *
  * Mirrors needing extra logic (curated suites that deserve individual files,
  * custom auth) still live under their own subdirectory.
@@ -107,7 +107,7 @@ export function createAptMirror(config: AptMirrorConfig): Mirror {
     // `/pool/.../pkg.deb` do not change with request headers, so the relay can
     // keep one variant per URL. `Vary` is still delivered unchanged.
     relayDirectives: ["no-vary"],
-    async fetch(request) {
+    async fetch(request, { relativePath: rel }) {
       const url = new URL(request.url);
 
       // The mount itself is a directory; a request without the trailing slash
@@ -120,8 +120,6 @@ export function createAptMirror(config: AptMirrorConfig): Mirror {
         });
       }
 
-      const rel = url.pathname.slice(prefix.length);
-
       if (index && (rel === INDEX_PATH || rel.startsWith(".mdb/"))) {
         if (rel !== INDEX_PATH) {
           return new Response("Not Found", {
@@ -133,8 +131,7 @@ export function createAptMirror(config: AptMirrorConfig): Mirror {
         return snapshot ? aptIndexResponse(snapshot, request) : aptIndexUnavailable(index.lastError);
       }
 
-      const inner = new Request(new URL(`/${rel}${url.search}`, url.origin), request);
-      return proxy.fetch(inner);
+      return proxy.fetch(request, rel);
     },
     async status() {
       const facts = await repository.facts();

@@ -36,6 +36,15 @@ The URL location a mirror occupies. The **mount name** is the mirror's name.
 A path suffix may not reuse another switch's name (`keys`, `api`, `scripts`,
 `speedtest`, `conf`).
 
+### Mount context
+
+The original client request and the path resolved within its mirror's mount. The
+mount-relative path excludes the mount name and query, has no artificially added
+leading slash, and retains the original pathname's case, escaping and empty
+segments. The original request remains the source of the method, headers, query
+and relay context; consumers use the resolved path rather than stripping a mount
+from the URL again.
+
 ### Source configuration
 
 A deb822 description of an APT source, identifying its repository URI, suites,

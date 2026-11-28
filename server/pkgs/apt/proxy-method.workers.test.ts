@@ -45,6 +45,7 @@ describe("createAptProxy — real cachedfetch HEAD forwarding", () => {
         `https://mirs.uk/dists/trixie/main/binary-amd64/by-hash/SHA256/${HASH}`,
         { method: "HEAD" },
       ),
+      `dists/trixie/main/binary-amd64/by-hash/SHA256/${HASH}`,
     );
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
