@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { createAptProxy } from "./proxy";
-import { AptRepo } from "./repo";
+import type { AptRepositoryFacts } from "./repository";
 
 /**
  * Method forwarding through the **real** `ezfetch` (no module mock): the init
@@ -28,15 +28,20 @@ afterEach(() => {
 const HASH = "a".repeat(64);
 
 function makeProxy(hashes: string[] = []): ReturnType<typeof createAptProxy> {
-  const repo = new AptRepo({ base: "https://up.example/debian/" });
-  repo.state = "ready";
-  repo.knownPaths = new Set();
-  repo.knownHashes = new Set(hashes);
-  repo.knownSuites = new Set();
-  repo.validUntil = Date.now() + 3_600_000;
-  // Keep the hand-set index: a real resolve would hit the stub again.
-  repo.awaitResolved = async () => {};
-  return createAptProxy(repo);
+  const base = "https://up.example/debian/";
+  const facts: AptRepositoryFacts = {
+    paths: new Set(),
+    hashes: new Set(hashes),
+    suites: new Set(),
+    validUntil: Date.now() + 3_600_000,
+    coverage: "metadata-only",
+    status: { health: "healthy" },
+  };
+  return createAptProxy({
+    base,
+    url: (rel) => new URL(rel, base).href,
+    facts: async () => facts,
+  });
 }
 
 describe("createAptProxy — real ezfetch method forwarding", () => {

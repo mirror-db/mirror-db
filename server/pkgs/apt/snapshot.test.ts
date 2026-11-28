@@ -108,6 +108,7 @@ function makeIndex(
   up: Upstream,
   suites: string[],
   limits?: ConstructorParameters<typeof AptSnapshotIndex>[0]["limits"],
+  now?: ConstructorParameters<typeof AptSnapshotIndex>[0]["now"],
 ): AptSnapshotIndex {
   return new AptSnapshotIndex({
     mirror: "test",
@@ -115,6 +116,7 @@ function makeIndex(
     suites,
     fetchImpl: up.fetch,
     limits,
+    now,
   });
 }
 
@@ -283,19 +285,20 @@ describe("AptSnapshotIndex — verification and atomicity", () => {
       { name: "main/binary-amd64/Packages", bytes: new TextEncoder().encode(plain) },
     ]);
 
-    const index = makeIndex(up, ["bookworm"]);
+    let now = Date.now();
+    const index = makeIndex(up, ["bookworm"], undefined, () => now);
     const first = await index.awaitSnapshot();
     expect(first).not.toBeNull();
 
     // Same declared hash, different bytes: verification must fail.
     up.add(path, new TextEncoder().encode(plain.replace("pool/a.deb", "pool/b.deb")));
-    (index.snapshot as unknown as { expiresAt: number }).expiresAt = 0;
-    (index as unknown as { lastAttempt: number }).lastAttempt = 0;
+    now = first!.expiresAt + 1;
 
     const second = await index.awaitSnapshot();
 
     expect(second).toBe(first);
-    expect(index.state).toBe("ready");
+    expect(await index.facts()).toBe(first!.repositoryFacts);
+    expect(index.ready).toBe(true);
     expect(index.lastError).toMatch(/size mismatch|sha256 mismatch/);
   });
 
@@ -584,7 +587,7 @@ describe("AptSnapshotIndex — release validation", () => {
 
     const index = makeIndex(up, ["bookworm"]);
     await expect(index.build()).rejects.toThrow(/dists\/bookworm\/InRelease/);
-    expect(index.snapshot).toBeNull();
+    expect(index.ready).toBe(false);
   });
 
   it("rejects an empty release body and keeps the previous generation", async () => {
@@ -594,16 +597,17 @@ describe("AptSnapshotIndex — release validation", () => {
       { name: "main/binary-amd64/Packages", bytes },
     ]);
 
-    const index = makeIndex(up, ["bookworm"]);
+    let now = Date.now();
+    const index = makeIndex(up, ["bookworm"], undefined, () => now);
     const first = await index.awaitSnapshot();
     expect(first).not.toBeNull();
 
     up.add("dists/bookworm/InRelease", "");
-    (index.snapshot as unknown as { expiresAt: number }).expiresAt = 0;
-    (index as unknown as { lastAttempt: number }).lastAttempt = 0;
+    now = first!.expiresAt + 1;
 
     const second = await index.awaitSnapshot();
     expect(second).toBe(first);
+    expect(await index.facts()).toBe(first!.repositoryFacts);
     expect(index.lastError).toMatch(/is empty/);
   });
 
@@ -670,7 +674,7 @@ describe("AptSnapshotIndex — transient versus absent", () => {
     await expect(index.build()).rejects.toThrow(/answered HTTP 50/);
     // The healthy suite's work is discarded with the generation.
     await expect(index.awaitSnapshot()).resolves.toBeNull();
-    expect(index.state).toBe("idle");
+    expect(index.ready).toBe(false);
   });
 
   it("rejects the whole generation on a network error", async () => {

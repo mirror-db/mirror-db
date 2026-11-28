@@ -14,6 +14,8 @@
 import { WebListError } from "@server/pkgs/web-list/web-list";
 import type { WebListEntry } from "@server/pkgs/web-list/types";
 
+import type { AptRepositoryFacts } from "./repository";
+import type { AptMirrorStatus } from "./status";
 import { StanzaStreamParser, type Stanza } from "./stanza";
 
 // ── Limits ──────────────────────────────────────────────────────────────────
@@ -460,6 +462,8 @@ export class AptSnapshot {
   /** Every digest named by a pinned release, any algorithm, lower-case hex. */
   readonly knownHashes: ReadonlySet<string>;
   readonly contentLength: number;
+  /** Facts shared by proxy, listing and status consumers of this generation. */
+  readonly repositoryFacts: AptRepositoryFacts;
 
   constructor(
     readonly mirror: string,
@@ -471,12 +475,21 @@ export class AptSnapshot {
     readonly body: string,
     readonly etag: string,
     knownHashes: readonly string[] = [],
+    status: AptMirrorStatus = { health: "healthy" },
   ) {
     for (const file of files) this.sizes.set(file.path, file.size);
     this.tree = [...new Set([...files.map((f) => f.path), ...knownPaths])].sort();
     this.knownPaths = new Set(this.tree);
     this.knownHashes = new Set(knownHashes);
     this.contentLength = new TextEncoder().encode(body).byteLength;
+    this.repositoryFacts = {
+      paths: this.knownPaths,
+      hashes: this.knownHashes,
+      suites: new Set(suites.map((suite) => suite.suite)),
+      validUntil: expiresAt,
+      coverage: "tree",
+      status,
+    };
   }
 
   /** True when any known path sits under `prefix` (i.e. `prefix` is a directory). */

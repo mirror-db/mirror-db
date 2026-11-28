@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { createAptProxy } from "./proxy";
-import { AptRepo } from "./repo";
+import type { AptRepositoryFacts } from "./repository";
 
 /**
  * The by-hash branch goes through the **real** `cachedfetch`, so this has to run
@@ -18,14 +18,20 @@ afterEach(() => {
 });
 
 function makeProxy(): ReturnType<typeof createAptProxy> {
-  const repo = new AptRepo({ base: "https://up.example/debian/" });
-  repo.state = "ready";
-  repo.knownPaths = new Set([`dists/trixie/main/binary-amd64/by-hash/SHA256/${HASH}`]);
-  repo.knownHashes = new Set([HASH]);
-  repo.knownSuites = new Set(["trixie"]);
-  repo.validUntil = Date.now() + 3_600_000;
-  repo.awaitResolved = async () => {};
-  return createAptProxy(repo);
+  const base = "https://up.example/debian/";
+  const facts: AptRepositoryFacts = {
+    paths: new Set([`dists/trixie/main/binary-amd64/by-hash/SHA256/${HASH}`]),
+    hashes: new Set([HASH]),
+    suites: new Set(["trixie"]),
+    validUntil: Date.now() + 3_600_000,
+    coverage: "metadata-only",
+    status: { health: "healthy" },
+  };
+  return createAptProxy({
+    base,
+    url: (rel) => new URL(rel, base).href,
+    facts: async () => facts,
+  });
 }
 
 describe("createAptProxy — real cachedfetch HEAD forwarding", () => {

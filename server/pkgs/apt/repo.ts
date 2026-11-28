@@ -19,6 +19,7 @@ import { cachedfetch } from "@server/pkgs/fetch";
 import { WebListFs, type WebListFetch } from "@server/pkgs/web-list";
 import urlJoin from "url-join";
 
+import type { AptRepository, AptRepositoryFacts } from "./repository";
 import { analyzeApt, toSuiteMeta, type AptMirrorStatus } from "./status";
 
 export type RepoState = "idle" | "resolving" | "ready";
@@ -37,19 +38,13 @@ export const DEFAULT_TTL_MS = 60 * 60 * 1000; // 1 hour
 /** Throttle for retrying a resolve that produced nothing (avoid hammering upstream). */
 const RETRY_COOLDOWN_MS = 60 * 1000;
 
-export class AptRepo {
+export class AptRepo implements AptRepository {
   readonly base: string;
   private readonly configuredSuites: string[];
   private readonly fs: WebListFs;
 
-  state: RepoState = "idle";
-  knownPaths = new Set<string>();
-  knownHashes = new Set<string>();
-  /** Suites the index actually resolved — the scope enforcement is authoritative over. */
-  knownSuites = new Set<string>();
-  /** Parsed `Release` per resolved suite — drives {@link status}. */
-  suites: Release[] = [];
-  validUntil = 0;
+  private state: RepoState = "idle";
+  private generation: AptRepositoryFacts | null = null;
   private lastAttempt = 0;
   /** The in-flight resolve, shared so concurrent callers dedup onto one run. */
   private inflight: Promise<void> | null = null;
@@ -66,7 +61,7 @@ export class AptRepo {
   }
 
   isExpired(): boolean {
-    return Date.now() >= this.validUntil;
+    return Date.now() >= (this.generation?.validUntil ?? 0);
   }
 
   /**
@@ -170,29 +165,33 @@ export class AptRepo {
       return;
     }
 
-    this.knownPaths = knownPaths;
-    this.knownHashes = knownHashes;
-    this.knownSuites = knownSuites;
-    this.suites = resolved;
-    this.validUntil =
-      validUntil === Infinity ? Date.now() + DEFAULT_TTL_MS : validUntil;
+    const status: AptMirrorStatus = {
+      health: "healthy",
+      aptstatus: {
+        ...analyzeApt(resolved),
+        suites: resolved.map(toSuiteMeta),
+      },
+    };
+    this.generation = {
+      paths: knownPaths,
+      hashes: knownHashes,
+      suites: knownSuites,
+      validUntil: validUntil === Infinity ? Date.now() + DEFAULT_TTL_MS : validUntil,
+      coverage: "metadata-only",
+      status,
+    };
     this.state = "ready";
   }
 
-  /**
-   * Snapshot the mirror's health + file statistics. Before the first resolve
-   * `aptstatus` is omitted (`health: "initializing"`); once `ready` it carries
-   * the stats derived from the parsed suite indexes.
-   */
+  /** Wait for a usable generation and return the facts published with it. */
+  async facts(): Promise<AptRepositoryFacts | null> {
+    await this.awaitResolved();
+    return this.generation;
+  }
+
+  /** Return the health summary belonging to the current generation. */
   status(): AptMirrorStatus {
-    if (this.state !== "ready") return { health: "initializing" };
-    return {
-      health: "healthy",
-      aptstatus: {
-        ...analyzeApt(this.suites),
-        suites: this.suites.map(toSuiteMeta),
-      },
-    };
+    return this.generation?.status ?? { health: "initializing" };
   }
 
   /**

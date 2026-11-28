@@ -38,42 +38,47 @@ beforeEach(() => cachedfetchMock.mockReset());
 
 const BASE = "https://up.example/debian/";
 
-describe("AptRepo.resolve", () => {
-  it("builds the index from the configured suites", async () => {
+describe("AptRepo facts", () => {
+  it("builds a generation from the configured suites", async () => {
     mockUpstream(["trixie"]);
     const repo = new AptRepo({ base: BASE, suites: ["trixie", "bogus"] });
 
-    await repo.resolve();
+    const facts = await repo.facts();
 
     expect(repo.ready).toBe(true);
-    expect(repo.knownPaths.has("dists/trixie/InRelease")).toBe(true);
-    expect(repo.knownPaths.has("dists/trixie/main/binary-amd64/Packages")).toBe(true);
-    expect(repo.knownHashes.has(HASH_A)).toBe(true);
-    expect(repo.validUntil).toBe(Date.parse(VALID_UNTIL));
+    expect(facts).not.toBeNull();
+    expect(facts!.paths.has("dists/trixie/InRelease")).toBe(true);
+    expect(facts!.paths.has("dists/trixie/main/binary-amd64/Packages")).toBe(true);
+    expect(facts!.hashes.has(HASH_A)).toBe(true);
+    expect(facts!.validUntil).toBe(Date.parse(VALID_UNTIL));
+    expect(facts!.coverage).toBe("metadata-only");
     // The unreachable suite contributes nothing.
-    expect(repo.knownPaths.has("dists/bogus/InRelease")).toBe(false);
+    expect(facts!.paths.has("dists/bogus/InRelease")).toBe(false);
+    expect(repo.status()).toBe(facts!.status);
+    expect(repo.status().aptstatus?.suites[0]).toMatchObject({ suite: "trixie" });
   });
 
-  it("stays idle (no enforcement) when nothing resolves", async () => {
+  it("returns no facts and initializing status when nothing resolves", async () => {
     mockUpstream([]); // every suite 404s
     const repo = new AptRepo({ base: BASE, suites: ["trixie"] });
 
-    await repo.resolve();
+    await expect(repo.facts()).resolves.toBeNull();
 
     expect(repo.ready).toBe(false);
-    expect(repo.knownPaths.size).toBe(0);
+    expect(repo.status()).toEqual({ health: "initializing" });
   });
 
-  it("ensureResolved runs in the background and flips to ready", async () => {
+  it("ensureResolved runs in the background and publishes facts", async () => {
     mockUpstream(["trixie"]);
     const repo = new AptRepo({ base: BASE, suites: ["trixie"] });
 
     const jobs: Promise<unknown>[] = [];
     repo.ensureResolved((p) => jobs.push(p));
-    expect(repo.state).toBe("resolving");
+    expect(repo.status()).toEqual({ health: "initializing" });
 
     await Promise.all(jobs);
     expect(repo.ready).toBe(true);
+    expect(await repo.facts()).not.toBeNull();
   });
 
   it("normalizes a base without a trailing slash", () => {

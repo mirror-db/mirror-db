@@ -5,6 +5,8 @@ import { withRelayDirectives } from "@server/relay-control";
 import { aptConfigs } from "./apt-mirrors";
 import { createAptMirror } from "./apt-mirror";
 import { digestHex } from "@server/pkgs/apt/metadata";
+import type { AptMirrorStatus } from "@server/pkgs/apt/status";
+import type { WebListFetch } from "@server/pkgs/web-list";
 
 /**
  * Snapshot-backed APT mounts, end to end: an upstream with files but no
@@ -60,7 +62,7 @@ const packages = [
   "",
 ].join("\n");
 
-async function makeMirror() {
+async function makeMirror(fetchImpl: WebListFetch = async (input) => respond(input)) {
   const encoded = new TextEncoder().encode(packages);
   routes.set(`${BASE}dists/bookworm/InRelease`, [
     "Suite: bookworm",
@@ -79,7 +81,7 @@ async function makeMirror() {
     name: "hashicorp",
     base: BASE,
     suites: ["bookworm"],
-    snapshot: { fetchImpl: async (input) => respond(input) },
+    snapshot: { fetchImpl },
   });
 }
 
@@ -283,6 +285,69 @@ describe("snapshot APT mounts — fixed index endpoint", () => {
 
     const directory = await mirror.fetch(req("?format=json"));
     expect(directory.status).toBe(502);
+  });
+});
+
+describe("snapshot APT mounts — status", () => {
+  it("uses the serving generation without a second Release parser or fetch", async () => {
+    const upstream = vi.fn<WebListFetch>(async (input) => respond(input));
+    const mirror = await makeMirror(upstream);
+
+    const status = (await mirror.status!()) as AptMirrorStatus;
+    expect(status).toMatchObject({
+      health: "healthy",
+      aptstatus: {
+        stats: {
+          files: 1,
+          size: new TextEncoder().encode(packages).byteLength,
+          deduplicatedFiles: 1,
+          deduplicatedSize: new TextEncoder().encode(packages).byteLength,
+        },
+        suitesStats: {
+          bookworm: { files: 1, size: new TextEncoder().encode(packages).byteLength },
+        },
+      },
+    });
+    // Release statistics describe metadata only, not the referenced .deb body.
+    expect(status.aptstatus?.stats.size).not.toBe(2048);
+    expect(status.aptstatus?.suites[0]).toMatchObject({
+      suite: "bookworm",
+      codename: "bookworm",
+    });
+    expect(status.aptstatus?.suites[0]).not.toHaveProperty("sha256");
+    expect(status.aptstatus?.suites[0]).not.toHaveProperty("raw");
+
+    const generationFetches = upstream.mock.calls.length;
+    expect(upstream.mock.calls.filter(([input]) => String(input).endsWith("/InRelease")))
+      .toHaveLength(1);
+    expect(cachedfetchMock).not.toHaveBeenCalled();
+    expect(ezfetchMock).not.toHaveBeenCalled();
+
+    const endpoint = await mirror.fetch(req(".mdb/apt-index.json"));
+    const document: any = await endpoint.json();
+    const listing = await mirror.fetch(req("?format=json"));
+    expect(listing.status).toBe(200);
+    expect(upstream).toHaveBeenCalledTimes(generationFetches);
+
+    const suiteDate = status.aptstatus?.suites[0]?.date;
+    expect(suiteDate).toBeInstanceOf(Date);
+    expect((suiteDate as Date).toISOString()).toBe(document.suites[0].date);
+    expect(await mirror.status!()).toBe(status);
+    expect(upstream).toHaveBeenCalledTimes(generationFetches);
+  });
+
+  it("reports initializing when no generation has ever been published", async () => {
+    const upstream = vi.fn<WebListFetch>(async () => new Response(null, { status: 404 }));
+    const mirror = createAptMirror({
+      name: "hashicorp",
+      base: BASE,
+      suites: ["bookworm"],
+      snapshot: { fetchImpl: upstream },
+    });
+
+    await expect(mirror.status!()).resolves.toEqual({ health: "initializing" });
+    expect(cachedfetchMock).not.toHaveBeenCalled();
+    expect(ezfetchMock).not.toHaveBeenCalled();
   });
 });
 

@@ -2,8 +2,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { withRelayDirectives } from "@server/relay-control";
 
-import { AptRepo } from "./repo";
 import { createAptProxy } from "./proxy";
+import type { AptRepositoryFacts } from "./repository";
 
 const HASH = "a".repeat(64);
 const BASE = "https://up.example/debian/";
@@ -62,31 +62,37 @@ beforeEach(() => {
   ezfetchMock.mockImplementation(ok);
 });
 
-/** A repo with a hand-set index for direct enforcement testing. */
+/** A repository fake implementing the same facts seam as both real sources. */
 function makeRepo(opts: {
   ready: boolean;
   paths?: string[];
   hashes?: string[];
   suites?: string[];
   validUntil?: number;
-}): AptRepo {
-  const repo = new AptRepo({ base: BASE });
-  repo.state = opts.ready ? "ready" : "idle";
-  repo.knownPaths = new Set(opts.paths ?? []);
-  repo.knownHashes = new Set(opts.hashes ?? []);
-  // Default the resolved-suite set to whatever the seeded paths imply, so most
-  // tests don't have to spell it out; an explicit list overrides.
-  repo.knownSuites = new Set(
-    opts.suites ??
-      (opts.paths ?? [])
-        .filter((p) => p.startsWith("dists/"))
-        .map((p) => p.slice("dists/".length).split("/")[0]),
-  );
-  repo.validUntil = opts.validUntil ?? Date.now() + 3_600_000;
-  // Prevent the proxy's awaitResolved from triggering a real resolve that would
-  // mutate the hand-set state.
-  repo.awaitResolved = async () => {};
-  return repo;
+  coverage?: AptRepositoryFacts["coverage"];
+}) {
+  const facts: AptRepositoryFacts | null = opts.ready
+    ? {
+        paths: new Set(opts.paths ?? []),
+        hashes: new Set(opts.hashes ?? []),
+        // Default the resolved-suite set to whatever the paths imply, so most
+        // tests don't have to spell it out; an explicit list overrides.
+        suites: new Set(
+          opts.suites ??
+            (opts.paths ?? [])
+              .filter((path) => path.startsWith("dists/"))
+              .map((path) => path.slice("dists/".length).split("/")[0]!),
+        ),
+        validUntil: opts.validUntil ?? Date.now() + 3_600_000,
+        coverage: opts.coverage ?? "metadata-only",
+        status: { health: "healthy" },
+      }
+    : null;
+  return {
+    base: BASE,
+    url: (rel: string) => new URL(rel, BASE).href,
+    facts: vi.fn(async () => facts),
+  };
 }
 
 function makeProxy(opts: Parameters<typeof makeRepo>[0]) {
@@ -103,6 +109,14 @@ describe("createAptProxy — file enforcement", () => {
 
     expect(res.status).toBe(200);
     expect(ezfetchMock).toHaveBeenCalled();
+  });
+
+  it("keeps max-age=0 when no generation exists", async () => {
+    const proxy = makeProxy({ ready: false });
+    const res = await proxy.fetch(get("dists/trixie/does-not-exist"));
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get("cache-control")).toBe("public, max-age=0");
   });
 
   it("404s an unknown by-hash file once ready, without fetching", async () => {
@@ -169,7 +183,8 @@ describe("createAptProxy — file enforcement", () => {
 
 describe("createAptProxy — cache-control", () => {
   it("caches a known by-hash file as immutable and declares the by-hash digest", async () => {
-    const proxy = makeProxy({ ready: true, hashes: [HASH] });
+    const repo = makeRepo({ ready: true, hashes: [HASH] });
+    const proxy = createAptProxy(repo);
     const res = await proxy.fetch(
       get(`dists/trixie/main/binary-amd64/by-hash/SHA256/${HASH}`),
     );
@@ -179,6 +194,7 @@ describe("createAptProxy — cache-control", () => {
     );
     // The path names the bytes and the hash, so no revalidation is needed.
     expect(res.headers.get("x-mdb-relay")).toBe(`immutable, sha256=${HASH}`);
+    expect(repo.facts).toHaveBeenCalledTimes(1);
   });
 
   it("declares a by-hash digest on a 304 revalidation too", async () => {
@@ -197,13 +213,17 @@ describe("createAptProxy — cache-control", () => {
 
   it("declares nothing on an unverified by-hash path (no index yet)", async () => {
     // Nothing authoritative has loaded: the proxy passes the request through
-    // unjudged, so it must not call the object immutable.
+    // unjudged and makes no relay declaration. The path still names immutable
+    // bytes for ordinary HTTP caching.
     const proxy = makeProxy({ ready: false });
     const res = await proxy.fetch(
       get(`dists/trixie/main/binary-amd64/by-hash/SHA256/${HASH}`),
     );
 
     expect(cachedfetchMock).toHaveBeenCalled();
+    expect(res.headers.get("cache-control")).toBe(
+      "public, max-age=31536000, immutable",
+    );
     expect(res.headers.get("x-mdb-relay")).toBeNull();
   });
 
@@ -482,21 +502,12 @@ describe("createAptProxy — method forwarding", () => {
   });
 });
 
-describe("createAptProxy — snapshot facts", () => {
-  const knownSets = (paths: string[], hashes: string[] = []) => async () => ({
-    paths: new Set(paths),
-    hashes: new Set(hashes),
-    suites: new Set(
-      paths
-        .filter((path) => path.startsWith("dists/"))
-        .map((path) => path.slice("dists/".length).split("/")[0]!),
-    ),
-  });
+describe("createAptProxy — tree coverage", () => {
+  const makeTreeProxy = (paths: string[], hashes: string[] = []) =>
+    makeProxy({ ready: true, coverage: "tree", paths, hashes });
 
   it("redirects a pool directory addressed without a trailing slash", async () => {
-    const proxy = createAptProxy(makeRepo({ ready: false }), {
-      known: knownSets(["pool/main/n/nginx/nginx_1.0_amd64.deb"]),
-    });
+    const proxy = makeTreeProxy(["pool/main/n/nginx/nginx_1.0_amd64.deb"]);
 
     const res = await proxy.fetch(get("pool/main/n/nginx"));
     expect(res.status).toBe(308);
@@ -505,9 +516,7 @@ describe("createAptProxy — snapshot facts", () => {
   });
 
   it("redirects the dists root the same way", async () => {
-    const proxy = createAptProxy(makeRepo({ ready: false }), {
-      known: knownSets(["dists/trixie/InRelease"]),
-    });
+    const proxy = makeTreeProxy(["dists/trixie/InRelease"]);
 
     const res = await proxy.fetch(get("dists"));
     expect(res.status).toBe(308);
@@ -515,26 +524,32 @@ describe("createAptProxy — snapshot facts", () => {
   });
 
   it("leaves an unknown pool file to the ordinary file path", async () => {
-    const proxy = createAptProxy(makeRepo({ ready: false }), {
-      known: knownSets(["pool/main/n/nginx/nginx_1.0_amd64.deb"]),
-    });
+    const proxy = makeTreeProxy(["pool/main/n/nginx/nginx_1.0_amd64.deb"]);
 
     const res = await proxy.fetch(get("pool/main/x/other/other_1.0_amd64.deb"));
     expect(res.status).toBe(200);
     expect(ezfetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it("prefers the snapshot hashes over a stale repo index", async () => {
-    const fresh = "f".repeat(64);
-    const proxy = createAptProxy(makeRepo({ ready: true, hashes: [] }), {
-      known: knownSets(["dists/trixie/InRelease"], [fresh]),
-    });
+  it("404s an unknown path inside a known suite", async () => {
+    const proxy = makeTreeProxy(["dists/trixie/InRelease"]);
 
-    // Without `known` the same request 404s — the repo never saw this hash.
-    const stale = await createAptProxy(makeRepo({ ready: true, hashes: [] })).fetch(
-      get(`dists/trixie/main/binary-amd64/by-hash/SHA256/${fresh}`),
-    );
-    expect(stale.status).toBe(404);
+    const res = await proxy.fetch(get("dists/trixie/ghost"));
+    expect(res.status).toBe(404);
+    expect(ezfetchMock).not.toHaveBeenCalled();
+  });
+
+  it("lets a known suite's signed siblings pass through unjudged", async () => {
+    const proxy = makeTreeProxy(["dists/trixie/InRelease"]);
+
+    const res = await proxy.fetch(get("dists/trixie/Release.gpg"));
+    expect(res.status).toBe(200);
+    expect(ezfetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses the current tree generation's hashes", async () => {
+    const fresh = "f".repeat(64);
+    const proxy = makeTreeProxy(["dists/trixie/InRelease"], [fresh]);
 
     const res = await proxy.fetch(
       get(`dists/trixie/main/binary-amd64/by-hash/SHA256/${fresh}`),
@@ -549,9 +564,7 @@ describe("createAptProxy — snapshot facts", () => {
         headers: { "content-range": "bytes 0-3/8", "content-length": "4" },
       }),
     );
-    const proxy = createAptProxy(makeRepo({ ready: false }), {
-      known: knownSets(["dists/trixie/InRelease"], [HASH]),
-    });
+    const proxy = makeTreeProxy(["dists/trixie/InRelease"], [HASH]);
 
     const res = await proxy.fetch(
       new Request(

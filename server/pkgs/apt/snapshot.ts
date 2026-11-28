@@ -16,6 +16,7 @@
 
 import { Release } from "apt-parser";
 import pLimit from "p-limit";
+import urlJoin from "url-join";
 
 import { cachedfetch, ezfetch } from "@server/pkgs/fetch";
 import {
@@ -45,6 +46,8 @@ import {
   type AptSnapshotSuite,
 } from "./metadata";
 import { DEFAULT_TTL_MS, stripClearsign } from "./repo";
+import type { AptRepository, AptRepositoryFacts } from "./repository";
+import { analyzeApt, toSuiteMeta, type AptMirrorStatus } from "./status";
 
 export type SnapshotState = "idle" | "building" | "ready";
 
@@ -111,13 +114,13 @@ const kindOf = (base: string): "packages" | "sources" =>
  * Isolate-scoped snapshot holder. Mirrors `AptRepo`: one resolve in flight,
  * state flips only after a complete generation exists.
  */
-export class AptSnapshotIndex {
+export class AptSnapshotIndex implements AptRepository {
   readonly base: string;
   readonly mirror: string;
   readonly limits: AptSnapshotLimits;
 
-  state: SnapshotState = "idle";
-  snapshot: AptSnapshot | null = null;
+  private state: SnapshotState = "idle";
+  private snapshot: AptSnapshot | null = null;
   /** Last build failure, surfaced by the endpoint and the 502 listing. */
   lastError: string | null = null;
   /** Counters for the last successfully published generation. */
@@ -140,6 +143,11 @@ export class AptSnapshotIndex {
       Math.max(1, Math.min(opts.concurrency ?? GROUP_CONCURRENCY, GROUP_CONCURRENCY)),
     );
     this.clock = opts.now ?? Date.now;
+  }
+
+  /** Resolve a repo-relative path against the upstream base. */
+  url(rel: string): string {
+    return urlJoin(this.base, rel);
   }
 
   /** True once a generation was published. */
@@ -165,6 +173,11 @@ export class AptSnapshotIndex {
     }
     await this.kick();
     return this.snapshot;
+  }
+
+  /** Return the facts atomically published with the current generation. */
+  async facts(): Promise<AptRepositoryFacts | null> {
+    return (await this.awaitSnapshot())?.repositoryFacts ?? null;
   }
 
   /** Start a build (or join the running one). Never rejects. */
@@ -201,6 +214,7 @@ export class AptSnapshotIndex {
     const knownPaths = new Set<string>();
     const knownHashes = new Set<string>();
     const suites: AptSnapshotSuite[] = [];
+    const releases: Release[] = [];
 
     // Suites and, inside a suite, index groups are independent. Fetch them
     // concurrently so a repository with many components/architectures is
@@ -212,7 +226,11 @@ export class AptSnapshotIndex {
         this.buildSuite(suite, table, budget, dedupe, knownPaths, knownHashes),
       ),
     );
-    for (const result of results) if (result) suites.push(result);
+    for (const result of results) {
+      if (!result) continue;
+      suites.push(result.suite);
+      releases.push(result.release);
+    }
 
     if (suites.length === 0) {
       throw new AptGenerationError("no suite release resolved");
@@ -237,6 +255,15 @@ export class AptSnapshotIndex {
     const etag = await aptIndexEtag(this.mirror, suites, files);
 
     this.lastStats = dedupe.snapshot();
+    // Keep only the lightweight health summary in the published generation;
+    // parsed Releases and their checksum trees are build-local state.
+    const status: AptMirrorStatus = {
+      health: "healthy",
+      aptstatus: {
+        ...analyzeApt(releases),
+        suites: releases.map(toSuiteMeta),
+      },
+    };
 
     return new AptSnapshot(
       this.mirror,
@@ -248,6 +275,7 @@ export class AptSnapshotIndex {
       body,
       etag,
       [...knownHashes],
+      status,
     );
   }
 
@@ -259,7 +287,7 @@ export class AptSnapshotIndex {
     dedupe: IndexDedupe,
     knownPaths: Set<string>,
     knownHashes: Set<string>,
-  ): Promise<AptSnapshotSuite | null> {
+  ): Promise<{ suite: AptSnapshotSuite; release: Release } | null> {
     const release = await this.fetchRelease(suite);
     if (!release) {
       console.log(`APT SNAPSHOT skip mirror=${this.mirror} suite=${suite}: no release`);
@@ -344,12 +372,12 @@ export class AptSnapshotIndex {
         .map((group) => this.buildGroup(suite, group, table, budget, dedupe, parsed)),
     );
 
-    const result: AptSnapshotSuite = { suite, releasePath };
-    if (parsed.date) result.date = parsed.date;
-    if (parsed.validUntil) result.validUntil = parsed.validUntil;
-    if (sha256) result.sha256 = sha256;
-    if (sha1) result.sha1 = sha1;
-    return result;
+    const summary: AptSnapshotSuite = { suite, releasePath };
+    if (parsed.date) summary.date = parsed.date;
+    if (parsed.validUntil) summary.validUntil = parsed.validUntil;
+    if (sha256) summary.sha256 = sha256;
+    if (sha1) summary.sha1 = sha1;
+    return { suite: summary, release: parsed };
   }
 
   /**

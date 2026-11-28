@@ -26,7 +26,7 @@ import {
   type WebListSource,
 } from "@server/pkgs/web-list";
 
-import type { AptRepo } from "./repo";
+import type { AptRepository } from "./repository";
 
 /** Matches a content-addressed `by-hash/<algo>/<hash>` path; group 1 is the algorithm, group 2 the hash. */
 const BY_HASH = /\/by-hash\/(MD5Sum|SHA1|SHA256|SHA512)\/([0-9a-f]{32,128})$/i;
@@ -78,28 +78,11 @@ const RELEASE_PATH_RE = /^dists\/[^/]+\/(?:InRelease|Release)$/;
 
 const notFound = (): Response => new Response(null, { status: 404 });
 
-/** Path/hash facts one published APT metadata generation provides. */
-export interface AptKnownSets {
-  paths: ReadonlySet<string>;
-  hashes: ReadonlySet<string>;
-  /** Suites the generation pinned. */
-  suites: ReadonlySet<string>;
-  /** When the generation stops being fresh (`expiresAt`), for cache-control. */
-  validUntil?: number;
-}
-
 export interface CreateAptProxyOptions {
   /** Mount prefix for WebDAV hrefs (e.g. `/debian/`). Defaults to `/`. */
   baseHref?: string;
   /** Directory source override; omitted mirrors read upstream autoindex. */
   source?: WebListSource;
-  /**
-   * Authoritative path/hash sets for a snapshot mirror. Resolved per request so
-   * enforcement always uses the generation currently published, never a
-   * separately resolved (and possibly older) `AptRepo` index. `null` means no
-   * generation exists yet; the request is then unjudged.
-   */
-  known?: () => Promise<AptKnownSets | null>;
   /**
    * Add `X-MDB-Relay: prefetch` to `Release`/`InRelease` responses. Only
    * mirrors whose metadata the Worker keeps a snapshot of need this; pool
@@ -112,7 +95,7 @@ export interface CreateAptProxyOptions {
  * Create a {@link WebListProxy} wired to an APT repo's upstream, with the
  * APT-specific enforcement logic as its `fetchHook`.
  */
-export function createAptProxy(repo: AptRepo, opts?: CreateAptProxyOptions): WebListProxy {
+export function createAptProxy(repo: AptRepository, opts?: CreateAptProxyOptions): WebListProxy {
   return new WebListProxy({
     baseURL: repo.base,
     baseHref: opts?.baseHref,
@@ -131,7 +114,7 @@ export function createAptProxy(repo: AptRepo, opts?: CreateAptProxyOptions): Web
  */
 async function aptFetchHook(
   rel: string,
-  repo: AptRepo,
+  repo: AptRepository,
   request: Request,
   opts?: CreateAptProxyOptions,
 ): Promise<Response | null> {
@@ -142,50 +125,37 @@ async function aptFetchHook(
   const hash = byHash?.[2]?.toLowerCase() ?? null;
   const hashAlgorithm = byHash?.[1]?.toUpperCase() ?? null;
 
-  // Whose facts govern existence: a snapshot mirror's current generation, or
-  // the mirror's own resolved index. Nothing authoritative → unjudged passthrough.
-  let known: AptKnownSets | null = null;
-  if (opts?.known) {
-    known = await opts.known();
-  } else {
-    // Block until the index is populated so enforcement decisions use real data.
-    await repo.awaitResolved();
-    if (repo.ready) {
-      known = {
-        paths: repo.knownPaths,
-        hashes: repo.knownHashes,
-        suites: repo.knownSuites,
-      };
-    }
-  }
+  // One call yields one coherent generation for existence, freshness and relay
+  // decisions. No generation means the request stays unjudged.
+  const facts = await repo.facts();
 
-  if (known) {
+  if (facts) {
     if (hash !== null) {
       // Content-addressed: unknown means the release never named it.
-      if (!known.hashes.has(hash)) return notFound();
-    } else if (opts?.known) {
+      if (!facts.hashes.has(hash)) return notFound();
+    } else if (facts.coverage === "tree") {
       // Snapshot mounts know the whole tree, including `pool/`. Any directory
       // addressed without its trailing slash redirects, so a browser or WebDAV
       // client sees one URL per directory. Unknown paths stay unjudged: the
       // generation only lists metadata it verified, and a real package body is
       // not something it can prove absent.
-      if (!known.paths.has(rel)) {
-        if (hasChildren(known.paths, `${rel}/`)) return directoryRedirect(request, opts?.baseHref);
+      if (!facts.paths.has(rel)) {
+        if (hasChildren(facts.paths, `${rel}/`)) return directoryRedirect(request, opts?.baseHref);
         // A known suite's other signed names are not a 404: apt chooses between
         // `InRelease`, `Release` and `Release.gpg`, and a generation that only
         // verified one must not hide the fallbacks.
-        const signedSibling = SIGNED_SIBLING.test(rel) && isInKnownSuite(known.suites, rel);
-        if (!signedSibling && (rel === "dists" || isInKnownSuite(known.suites, rel))) {
+        const signedSibling = SIGNED_SIBLING.test(rel) && isInKnownSuite(facts.suites, rel);
+        if (!signedSibling && (rel === "dists" || isInKnownSuite(facts.suites, rel))) {
           return notFound();
         }
       }
-    } else if (rel === "dists" || isInKnownSuite(known.suites, rel)) {
+    } else if (rel === "dists" || isInKnownSuite(facts.suites, rel)) {
       // Curated mirrors only resolve a subset of suites; the index has no
       // knowledge of the rest. Enforcement applies only to the `dists` root and
       // to suites we actually indexed — paths under an un-indexed suite pass
       // through unjudged so a curated suite list never blocks reachable suites.
-      if (!known.paths.has(rel)) {
-        if (hasChildren(known.paths, `${rel}/`)) return directoryRedirect(request, opts?.baseHref);
+      if (!facts.paths.has(rel)) {
+        if (hasChildren(facts.paths, `${rel}/`)) return directoryRedirect(request, opts?.baseHref);
         return notFound();
       }
     }
@@ -226,7 +196,7 @@ async function aptFetchHook(
     cacheControl:
       hash !== null
         ? IMMUTABLE_CACHE_CONTROL
-        : sourceCacheControl(known?.validUntil ?? repo.validUntil),
+        : sourceCacheControl(facts?.validUntil ?? 0),
   });
 
   // The same generation hazard applies to the relay's default request cache:
@@ -241,8 +211,8 @@ async function aptFetchHook(
   if (
     hash !== null &&
     hashAlgorithm !== null &&
-    known !== null &&
-    known.hashes.has(hash) &&
+    facts !== null &&
+    facts.hashes.has(hash) &&
     DECLARABLE_STATUSES.has(sanitized.status)
   ) {
     directives.push(...byHashRelayDirectives(hashAlgorithm, hash));

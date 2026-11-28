@@ -209,16 +209,26 @@ Five APT mounts point at upstreams with a real archive but no autoindex
 (`syncthing-pkgs`, `hashicorp`, `mise`, `opentofu`, `github-cli`). They set
 `snapshot: true` and must declare a non-empty `suites` list — there is no
 listing to discover suites from, so construction fails without one. Every other
-APT mount keeps the plain proxy path.
+APT mount keeps the plain proxy path. Each mount constructs either `AptRepo`
+(directory discovery, `metadata-only` coverage) or `AptSnapshotIndex` (snapshot
+build, `tree` coverage) as its single `AptRepository`. `createAptProxy` calls
+`facts()` once per file request and uses that generation for existence,
+`by-hash` and `Cache-Control`. Without facts the request stays unjudged: an
+ordinary non-`by-hash` file gets `max-age=0`, while a `by-hash` response keeps
+its one-year immutable `Cache-Control` but makes no relay immutable or digest
+declaration. `Mirror.status()` reads the same facts and returns their
+precomputed health summary, or `initializing` when no generation has ever
+published.
 
 - **One builder, one contract.** [snapshot.ts](server/pkgs/apt/snapshot.ts)
   pins each suite's `InRelease` (else `Release`), registers every file the
   release names, then downloads and parses only `Packages`/`Sources`. It
   prefers `by-hash` over the mutable path and verifies every fetched index
   against the release's size and SHA-256/SHA-1. No package body is ever
-  fetched. The full generation is published by one reference swap; any failure,
-  limit overflow, path escape or conflicting digest rejects it and the previous
-  generation keeps serving.
+  fetched. Its health summary is computed from the same pinned releases and
+  retains no parsed release or checksum tree. The full generation is published
+  by one reference swap; any failure, limit overflow, path escape or conflicting
+  digest rejects it and the previous generation keeps serving.
 - **Bound 8 / 64 / 50 000.** One `Packages`/`Sources` may expand to 8 MiB
   decompressed, one mirror generation may parse 64 MiB (counted once per
   identical content — the Release digest is the identity, so a file repeated
@@ -241,10 +251,11 @@ APT mount keeps the plain proxy path.
 - **Stable content ETag.** The validator hashes the document minus
   `generated_at`/`expires_at`, so a rebuild of unchanged upstream metadata keeps
   the same ETag while the times still appear in the body.
-- **Same generation for both consumers.** `knownPaths` and `knownHashes` come
-  from the published generation and decide existence and `by-hash` acceptance.
-  The generation's own expiry drives both the endpoint's `Cache-Control` and
-  the relay's index refresh (see prefetch below).
+- **Same generation for every consumer.** Proxy facts, synthetic listings, the
+  fixed endpoint and status all come from the published snapshot; status never
+  resolves another repository or re-parses a release. The generation's own expiry
+  drives both the endpoint's `Cache-Control` and the relay's index refresh (see
+  prefetch below).
 - **Release siblings stay reachable.** An `InRelease` generation lists only the
   signed name it actually verified; `Release` and `Release.gpg` in the same
   known suite are still passed through, because apt chooses between them. An

@@ -208,6 +208,14 @@ without demand. It is never persisted or reconstructed by scanning an upstream.
 A refresh is driven by the resource's freshness; `no-store` still forbids an
 ordinary cached response even when a prefetch lease exists.
 
+### Repository facts
+
+The paths, content hashes, suites, validity period, coverage and lightweight
+health summary of one APT repository generation. Coverage determines which
+absences are authoritative and which paths remain unjudged. Proxy, listing and
+status consumers all read the same generation; without a published generation,
+its paths remain unjudged and its health is initializing.
+
 ### Metadata index
 
 One coherent, Worker-parsed snapshot of an APT repository's metadata. It relates

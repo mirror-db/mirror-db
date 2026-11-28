@@ -1,12 +1,13 @@
 /**
- * Factory for simple APT mirrors that follow the common pattern:
- * AptRepo + createAptProxy + prefix stripping + status endpoint.
+ * Factory for simple APT mirrors that follow the common pattern: an
+ * AptRepository selected by mode + createAptProxy + prefix stripping + status.
  *
  * Mirrors needing extra logic (curated suites that deserve individual files,
  * custom auth) still live under their own subdirectory.
  */
 
 import { AptRepo } from "@server/pkgs/apt/repo";
+import type { AptRepository } from "@server/pkgs/apt/repository";
 import { createAptProxy } from "@server/pkgs/apt/proxy";
 import {
   AptSnapshotIndex,
@@ -50,7 +51,8 @@ const INDEX_PATH = ".mdb/apt-index.json";
 
 /**
  * Create a path-routed APT mirror from a minimal config. Each mirror gets its
- * own isolate-scoped `AptRepo` resolved lazily on the first request.
+ * own isolate-scoped `AptRepository`: `AptRepo` for directory discovery or
+ * `AptSnapshotIndex` in snapshot mode, initialized lazily on first use.
  */
 export function createAptMirror(config: AptMirrorConfig): Mirror {
   const prefix = `/${config.name}/`;
@@ -67,11 +69,6 @@ export function createAptMirror(config: AptMirrorConfig): Mirror {
     );
   }
 
-  const repo = new AptRepo({
-    base: config.base,
-    suites: config.suites,
-  });
-
   const index = snapshotConfig
     ? new AptSnapshotIndex({
         mirror: config.name,
@@ -81,35 +78,24 @@ export function createAptMirror(config: AptMirrorConfig): Mirror {
         limits: snapshotConfig.limits,
       })
     : null;
+  const repository: AptRepository = index ?? new AptRepo({
+    base: config.base,
+    suites: config.suites,
+  });
 
   // A snapshot mirror synthesises listings but still streams file bodies from
   // upstream through the same WebListFs the proxy would have built.
   const source = index
     ? new SnapshotListSource(
         index,
-        new WebListFs(repo.base, { fetchImpl: snapshotConfig?.fetchImpl }),
+        new WebListFs(repository.base, { fetchImpl: snapshotConfig?.fetchImpl }),
       )
     : undefined;
 
-  const proxy = createAptProxy(repo, {
+  const proxy = createAptProxy(repository, {
     baseHref: prefix,
     source,
     prefetchRelease: index !== null,
-    // Existence decisions come from the generation currently published, not
-    // from `AptRepo`, which resolved its own copy of the Release files and may
-    // lag behind a newly rotated by-hash index.
-    known: index
-      ? async () => {
-          const snapshot = await index.awaitSnapshot();
-          if (!snapshot) return null;
-          return {
-            paths: snapshot.knownPaths,
-            hashes: snapshot.knownHashes,
-            suites: new Set(snapshot.suites.map((suite) => suite.suite)),
-            validUntil: snapshot.expiresAt,
-          };
-        }
-      : undefined,
   });
 
   return {
@@ -151,8 +137,8 @@ export function createAptMirror(config: AptMirrorConfig): Mirror {
       return proxy.fetch(inner);
     },
     async status() {
-      await repo.awaitResolved();
-      return repo.status();
+      const facts = await repository.facts();
+      return facts?.status ?? { health: "initializing" as const };
     },
   };
 }
